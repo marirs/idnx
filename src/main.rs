@@ -1,4 +1,5 @@
 mod engine;
+mod fingerprint;
 mod net;
 mod output;
 
@@ -175,6 +176,9 @@ async fn main() {
     )
     .await;
 
-    // Display output table
+    // 1. Render Network Topology Tree
+    output::tree::print_topology_tree(&target_cidr, local_info_opt.as_ref(), &summary);
+
+    // 2. Render Detailed Results Table
     output::terminal::print_scan_results(&summary);
 }

@@ -9,6 +9,7 @@ pub enum DeviceRole {
     GenericHost,
 }
 
+#[allow(dead_code)]
 impl DeviceRole {
     pub fn icon(&self) -> &'static str {
         match self {
