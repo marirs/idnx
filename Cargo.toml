@@ -1,0 +1,11 @@
+[package]
+name = "idnx"
+version = "0.1.0"
+edition = "2024"
+description = "Network Identification & Deep eXploration Tool"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.43", features = ["full"] }
+colored = "3.0"
+ipnet = "2.11"
