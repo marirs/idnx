@@ -10,9 +10,10 @@ This document outlines the milestones and release goals for the **idNX** project
 - [x] Initial Cargo project scaffolding & repository structure.
 - [x] High-visibility ASCII art terminal banner integration.
 - [x] CLI argument parsing (`clap` derive) for CIDR targets, ports, timeouts, concurrency.
-- [ ] High-concurrency async TCP connect port scanner (`tokio`).
-- [ ] Active host discovery (ICMP echo / TCP SYN-connect sweep).
-- [ ] Responsive terminal status output (`indicatif` progress bars).
+- [x] Active local network & interface auto-detection (runs default subnet if `--scan` has no arguments).
+- [x] High-concurrency async TCP connect port scanner (`tokio`).
+- [x] Active host discovery (TCP connect / RST alive detection).
+- [x] Responsive terminal status output & formatted table (`indicatif` & `comfy-table`).
 
 ### Milestone 2: Infrastructure Fingerprinting & UPnP
 - [ ] Gateway detection (detect default gateway via routing table/socket).
