@@ -1,6 +1,6 @@
 use crate::engine::deep::ChildNetworkResult;
 use crate::engine::scanner::{HostResult, ScanSummary};
-use crate::fingerprint::classifier::{classify_host, DeviceRole};
+use crate::fingerprint::classifier::{DeviceRole, classify_host};
 use crate::net::interface::LocalNetworkInfo;
 use colored::Colorize;
 use ipnet::Ipv4Net;
@@ -23,9 +23,14 @@ pub fn print_topology_tree(
     println!(
         "\n{} {}\n",
         "🌐 Network Topology Tree:".bold(),
-        format!("{}{} [{} hosts active]", target_cidr, iface_desc, summary.active_hosts.len())
-            .cyan()
-            .bold()
+        format!(
+            "{}{} [{} hosts active]",
+            target_cidr,
+            iface_desc,
+            summary.active_hosts.len()
+        )
+        .cyan()
+        .bold()
     );
 
     let local_ip = local_info_opt.map(|info| info.ip);
@@ -71,7 +76,11 @@ pub fn print_topology_tree(
 
     for (cat_idx, (icon, cat_name, hosts)) in categories.iter().enumerate() {
         let is_last_cat = cat_idx == total_cats - 1;
-        let cat_branch = if is_last_cat { "└──" } else { "├──" };
+        let cat_branch = if is_last_cat {
+            "└──"
+        } else {
+            "├──"
+        };
         let indent = if is_last_cat { "    " } else { "│   " };
 
         println!(
@@ -84,7 +93,11 @@ pub fn print_topology_tree(
         let total_hosts = hosts.len();
         for (h_idx, host) in hosts.iter().enumerate() {
             let is_last_host = h_idx == total_hosts - 1;
-            let host_branch = if is_last_host { "└──" } else { "├──" };
+            let host_branch = if is_last_host {
+                "└──"
+            } else {
+                "├──"
+            };
             let sub_indent = if is_last_host { "    " } else { "│   " };
 
             // Build node label
@@ -156,9 +169,16 @@ pub fn print_topology_tree(
 
     // Render physical unmanaged switches if provided
     if has_switches_section {
-        println!("└── 🔀 {}", "Physical Switches (Unmanaged Layer 2)".bold().yellow());
+        println!(
+            "└── 🔀 {}",
+            "Physical Switches (Unmanaged Layer 2)".bold().yellow()
+        );
         for (i, sw) in physical_switches.iter().enumerate() {
-            let branch = if i == physical_switches.len() - 1 { "    └──" } else { "    ├──" };
+            let branch = if i == physical_switches.len() - 1 {
+                "    └──"
+            } else {
+                "    ├──"
+            };
             println!("{} {}", branch, sw.blue().bold());
         }
     }

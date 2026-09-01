@@ -162,13 +162,9 @@ pub async fn trigger_kernel_arp_sweep(cidr: Ipv4Net, concurrency: usize) {
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             // Send to port 5353 (mDNS)
-            let _ = sock
-                .send_to(payload, SocketAddrV4::new(ip, 5353))
-                .await;
+            let _ = sock.send_to(payload, SocketAddrV4::new(ip, 5353)).await;
             // Also send to port 137 (NetBIOS)
-            let _ = sock
-                .send_to(payload, SocketAddrV4::new(ip, 137))
-                .await;
+            let _ = sock.send_to(payload, SocketAddrV4::new(ip, 137)).await;
         }));
     }
 

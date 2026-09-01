@@ -45,7 +45,10 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
     let has_ssh = host.open_ports.iter().any(|p| p.port == 22);
-    let has_http_or_https = host.open_ports.iter().any(|p| p.port == 80 || p.port == 443);
+    let has_http_or_https = host
+        .open_ports
+        .iter()
+        .any(|p| p.port == 80 || p.port == 443);
     let octets = host.ip.octets();
     let last_octet = octets[3];
 

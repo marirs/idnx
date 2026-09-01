@@ -1,4 +1,4 @@
-use crate::engine::scanner::{scan_subnet, ScanSummary};
+use crate::engine::scanner::{ScanSummary, scan_subnet};
 use ipnet::Ipv4Net;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -37,7 +37,8 @@ pub async fn explore_downstream_networks(
     seen.insert(*parent_cidr);
 
     // Query UPnP / SSDP devices on the network
-    let _upnp_devices = crate::probes::upnp::discover_upnp_devices(Duration::from_millis(500)).await;
+    let _upnp_devices =
+        crate::probes::upnp::discover_upnp_devices(Duration::from_millis(500)).await;
 
     // 1. Add any explicitly specified subnets
     if let Some(extra) = extra_subnets_opt {
@@ -71,7 +72,8 @@ pub async fn explore_downstream_networks(
         let is_reachable = {
             let mut reachable = false;
             for &p in &[80, 443, 53, 22, 8080] {
-                let probe = crate::engine::scanner::probe_tcp_port(gateway_ip, p, timeout_duration).await;
+                let probe =
+                    crate::engine::scanner::probe_tcp_port(gateway_ip, p, timeout_duration).await;
                 if probe.status == crate::engine::scanner::PortStatus::Open
                     || probe.status == crate::engine::scanner::PortStatus::Closed
                 {
@@ -84,15 +86,8 @@ pub async fn explore_downstream_networks(
 
         // If gateway is reachable, perform sweep of the discovered child subnet
         if is_reachable {
-            let summary = scan_subnet(
-                subnet,
-                ports,
-                None,
-                concurrency,
-                timeout_duration,
-                None,
-            )
-            .await;
+            let summary =
+                scan_subnet(subnet, ports, None, concurrency, timeout_duration, None).await;
 
             if !summary.active_hosts.is_empty() {
                 discovered_networks.push(ChildNetworkResult {

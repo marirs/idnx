@@ -117,12 +117,12 @@ async fn main() {
     // Determine target CIDR network
     let (target_cidr, local_info_opt) =
         match net::interface::resolve_target(cli.scan.as_deref(), cli.interface.as_deref()) {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            eprintln!("{} Target resolution failed: {}", "[!]".red().bold(), e);
-            std::process::exit(1);
-        }
-    };
+            Ok(resolved) => resolved,
+            Err(e) => {
+                eprintln!("{} Target resolution failed: {}", "[!]".red().bold(), e);
+                std::process::exit(1);
+            }
+        };
 
     if let Some(ref info) = local_info_opt {
         println!(
@@ -142,10 +142,11 @@ async fn main() {
         }
     };
 
-    let iface_filter = cli
-        .interface
-        .as_deref()
-        .or_else(|| local_info_opt.as_ref().map(|info| info.interface_name.as_str()));
+    let iface_filter = cli.interface.as_deref().or_else(|| {
+        local_info_opt
+            .as_ref()
+            .map(|info| info.interface_name.as_str())
+    });
 
     println!(
         "{} Target: {} ({} hosts) | Ports: {} probed | Concurrency: {} | Timeout: {}ms",
@@ -206,7 +207,12 @@ async fn main() {
     let physical_switches: Vec<&str> = cli
         .switches
         .as_deref()
-        .map(|s| s.split(',').map(|item| item.trim()).filter(|item| !item.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     // 1. Render Network Topology Tree

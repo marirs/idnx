@@ -38,7 +38,7 @@ pub fn lookup_mac(mac_str: &str) -> OuiInfo {
             return OuiInfo {
                 vendor: None,
                 is_randomized: false,
-            }
+            };
         }
     };
 
@@ -163,7 +163,12 @@ mod tests {
     #[test]
     fn test_database_is_strictly_sorted() {
         for window in OUI_DATABASE.windows(2) {
-            assert!(window[0].0 < window[1].0, "OUI database must be strictly sorted: {:?} >= {:?}", window[0].0, window[1].0);
+            assert!(
+                window[0].0 < window[1].0,
+                "OUI database must be strictly sorted: {:?} >= {:?}",
+                window[0].0,
+                window[1].0
+            );
         }
     }
 }

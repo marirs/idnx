@@ -1,4 +1,4 @@
-use get_if_addrs::{get_if_addrs, IfAddr};
+use get_if_addrs::{IfAddr, get_if_addrs};
 use ipnet::Ipv4Net;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::str::FromStr;
@@ -34,7 +34,12 @@ pub fn get_interface_by_name(name: &str) -> Result<LocalNetworkInfo, String> {
     let all = list_ipv4_interfaces()?;
     all.into_iter()
         .find(|iface| iface.interface_name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("Interface '{}' not found or has no active IPv4 address.", name))
+        .ok_or_else(|| {
+            format!(
+                "Interface '{}' not found or has no active IPv4 address.",
+                name
+            )
+        })
 }
 
 /// Detects the primary local network information (active interface, IP, netmask, and CIDR subnet).
@@ -72,7 +77,8 @@ pub fn detect_local_network() -> Result<LocalNetworkInfo, String> {
 
 /// Lists all non-loopback IPv4 network interfaces
 pub fn list_ipv4_interfaces() -> Result<Vec<LocalNetworkInfo>, String> {
-    let ifaddrs = get_if_addrs().map_err(|e| format!("Failed to read network interfaces: {}", e))?;
+    let ifaddrs =
+        get_if_addrs().map_err(|e| format!("Failed to read network interfaces: {}", e))?;
     let mut results = Vec::new();
 
     for iface in ifaddrs {
@@ -160,8 +166,8 @@ pub fn resolve_target(
 
 /// Queries the OS kernel for the default outbound IP address via a dummy UDP socket connect.
 fn get_outbound_ip() -> Result<Ipv4Addr, String> {
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
+    let socket =
+        UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
 
     socket
         .connect("8.8.8.8:80")

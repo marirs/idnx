@@ -1,4 +1,4 @@
-use crate::net::arp::{read_system_arp_table, trigger_kernel_arp_sweep, ArpEntry};
+use crate::net::arp::{ArpEntry, read_system_arp_table, trigger_kernel_arp_sweep};
 use indicatif::ProgressBar;
 use ipnet::Ipv4Net;
 use std::collections::{HashMap, HashSet};
@@ -115,7 +115,10 @@ pub fn parse_ports(input: &str) -> Result<Vec<u16>, String> {
                 .map_err(|_| format!("Invalid end port in range: {}", part))?;
 
             if start > end {
-                return Err(format!("Port range start cannot be greater than end: {}", part));
+                return Err(format!(
+                    "Port range start cannot be greater than end: {}",
+                    part
+                ));
             }
 
             for p in start..=end {
