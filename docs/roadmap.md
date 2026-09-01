@@ -61,12 +61,20 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 7: AI Agent & LLM Runtime Fingerprinting (v0.2.2) -> [ACTIVE - NEXT UP]
-- [ ] Local LLM runtime detector (Ollama `11434`, LM Studio `1234`, vLLM `8000`, LocalAI `8080`, Text-generation-webui `5000`).
-- [ ] Active model inventory extractor (`/v1/models` and `/api/tags` to identify loaded models like `llama3.2`, `deepseek-r1`).
-- [ ] Model Context Protocol (MCP) server detector (JSON-RPC 2.0 / SSE endpoint discovery).
-- [ ] AgentPin standard prober (`.well-known/agent-identity.json`).
-- [ ] Dedicated topology category: `🤖 AI Agents & LLM Runtimes` in ASCII tree, tables, and JSON/YAML exports.
+### Milestone 7: AI Agent & LLM Runtime Fingerprinting (v0.2.2) -> [COMPLETED]
+- [x] Local LLM runtime detector (Ollama `11434`, LM Studio `1234`, vLLM `8000`, LocalAI `8080`, Text-generation-webui `5000`).
+- [x] Active model inventory extractor (`/v1/models` and `/api/tags` to identify loaded models like `llama3.2`, `deepseek-r1`, `qwen2.5-coder`).
+- [x] Model Context Protocol (MCP) server detector (JSON-RPC 2.0 / SSE endpoint discovery on `/sse`).
+- [x] AgentPin standard prober (`.well-known/agent-identity.json`).
+- [x] Dedicated topology category: `🤖 AI Agents & LLM Runtimes` in ASCII tree, tables, HTML graph, and JSON/YAML/XML/CSV exports.
+
+---
+
+### Milestone 8: Container & Orchestrator Topology Mapping (v0.2.3) -> [PLANNED]
+- [ ] Docker, Podman, and containerd runtime socket / port detection.
+- [ ] Kubernetes Node & Kubelet (`10250`, `10255`) infrastructure probing.
+- [ ] Virtualized container bridge subnet identification (`cni0`, `docker0`).
+- [ ] Cloud metadata instance identity probing (AWS/GCP/Azure/DigitalOcean link-local `169.254.169.254`).
 
 ---
 

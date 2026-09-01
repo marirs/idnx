@@ -33,6 +33,7 @@ pub struct HostResult {
     pub open_ports: Vec<PortInfo>,
     pub min_latency: Option<Duration>,
     pub ipv6_addrs: Vec<std::net::Ipv6Addr>,
+    pub ai_runtime: Option<crate::probes::ai::AiRuntimeInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,12 +73,14 @@ pub fn lookup_service(port: u16) -> &'static str {
         5678 => "mikrotik-mndp",
         5900 => "vnc",
         6379 => "redis",
+        1234 => "lmstudio/llm",
         8000 => "http-alt",
         8080 => "http-proxy",
         8291 => "mikrotik-winbox",
         8443 => "https-alt",
         8888 => "http-alt",
         9000 => "http-alt",
+        11434 => "ollama/llm",
         27017 => "mongodb",
         _ => "unknown",
     }
@@ -88,8 +91,8 @@ pub fn parse_ports(input: &str) -> Result<Vec<u16>, String> {
     let input = input.trim();
     if input.eq_ignore_ascii_case("common") || input.eq_ignore_ascii_case("default") {
         return Ok(vec![
-            21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 161, 443, 445, 993, 995, 1433, 1521,
-            1900, 3306, 3389, 5432, 5678, 5900, 6379, 8080, 8291, 8443,
+            21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 161, 443, 445, 993, 995, 1234, 1433,
+            1521, 1900, 3306, 3389, 5432, 5678, 5900, 6379, 8080, 8291, 8443, 11434,
         ]);
     }
 
@@ -371,6 +374,7 @@ pub async fn scan_subnet(
                 open_ports: Vec::new(),
                 min_latency: None,
                 ipv6_addrs: Vec::new(),
+                ai_runtime: None,
             },
         );
     }
@@ -388,6 +392,7 @@ pub async fn scan_subnet(
                     open_ports: Vec::new(),
                     min_latency: None,
                     ipv6_addrs: Vec::new(),
+                    ai_runtime: None,
                 });
 
                 entry.is_alive = true;
@@ -439,6 +444,7 @@ pub async fn scan_subnet(
                     open_ports: Vec::new(),
                     min_latency: None,
                     ipv6_addrs: Vec::new(),
+                    ai_runtime: None,
                 });
             }
         }
@@ -550,6 +556,20 @@ pub async fn scan_subnet(
         {
             host.hostname = Some(cn);
         }
+
+        // Probe AI Agent & Local LLM Runtimes (Ollama 11434, LM Studio 1234, vLLM 8000, LocalAI 8080, MCP)
+        let open_port_nums: Vec<u16> = host.open_ports.iter().map(|p| p.port).collect();
+        if open_port_nums.iter().any(|&p| matches!(p, 11434 | 1234 | 8000 | 8080 | 5000 | 3000 | 80 | 443))
+            && let Some(ai_info) = crate::probes::ai::probe_ai_runtime(host.ip, &open_port_nums, Duration::from_millis(400)).await
+        {
+            if host.hostname.is_none()
+                || host.hostname.as_deref() == Some("?")
+                || host.hostname.as_deref() == Some("-")
+            {
+                host.hostname = Some(ai_info.summary_label());
+            }
+            host.ai_runtime = Some(ai_info);
+        }
     }
 
     // 7. Dual-Stack IPv6 NDP Neighbor Harvesting & Correlation
@@ -605,7 +625,7 @@ impl ScannerBuilder {
         Self {
             target: None,
             interface: None,
-            ports: parse_ports("21,22,23,25,53,80,161,443,445,8080,8443").unwrap(),
+            ports: parse_ports("21,22,23,25,53,80,161,443,445,1234,8080,8443,11434").unwrap(),
             concurrency: 256,
             timeout: Duration::from_millis(800),
             enable_deep: true,

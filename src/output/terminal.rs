@@ -112,7 +112,7 @@ fn add_host_row(table: &mut Table, network_label: &str, host: &crate::engine::sc
         .fg(TableColor::Green)
         .add_attribute(Attribute::Bold);
 
-    let ports_desc = if host.open_ports.is_empty() {
+    let mut ports_desc = if host.open_ports.is_empty() {
         "Host responsive (stealth / no open target ports)".to_string()
     } else {
         host.open_ports
@@ -121,6 +121,10 @@ fn add_host_row(table: &mut Table, network_label: &str, host: &crate::engine::sc
             .collect::<Vec<_>>()
             .join(", ")
     };
+
+    if let Some(ref ai) = host.ai_runtime {
+        ports_desc = format!("🤖 {}\n{}", ai.summary_label(), ports_desc);
+    }
 
     let ports_cell = Cell::new(ports_desc).fg(if host.open_ports.is_empty() {
         TableColor::DarkGrey

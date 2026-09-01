@@ -196,6 +196,7 @@ pub async fn explore_downstream_networks(
                                     open_ports: Vec::new(),
                                     min_latency: None,
                                     ipv6_addrs: Vec::new(),
+                                    ai_runtime: None,
                                 });
                             }
                         }

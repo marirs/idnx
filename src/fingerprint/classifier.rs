@@ -6,6 +6,7 @@ pub enum DeviceRole {
     Switch,
     Workstation,
     SmartDevice,
+    AiAgentRuntime,
     GenericHost,
 }
 
@@ -17,6 +18,7 @@ impl DeviceRole {
             DeviceRole::Switch => "🔀",
             DeviceRole::Workstation => "💻",
             DeviceRole::SmartDevice => "🔌",
+            DeviceRole::AiAgentRuntime => "🤖",
             DeviceRole::GenericHost => "❓",
         }
     }
@@ -27,6 +29,7 @@ impl DeviceRole {
             DeviceRole::Switch => "Managed Switches & Infrastructure",
             DeviceRole::Workstation => "Workstations, Laptops & Servers",
             DeviceRole::SmartDevice => "IoT & Connected Smart Devices",
+            DeviceRole::AiAgentRuntime => "AI Agents & LLM Runtimes",
             DeviceRole::GenericHost => "Other Active Hosts",
         }
     }
@@ -69,7 +72,18 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         return DeviceRole::GatewayRouter;
     }
 
-    // 2. Switch Identification
+    // 2. AI Agents & Local LLM Runtimes (Ollama 11434, LM Studio 1234, vLLM, AgentPin, MCP)
+    if host.ai_runtime.is_some()
+        || host.open_ports.iter().any(|p| p.port == 11434 || p.port == 1234)
+        || hostname_lower.contains("ollama")
+        || hostname_lower.contains("vllm")
+        || hostname_lower.contains("lmstudio")
+        || hostname_lower.contains("agent")
+    {
+        return DeviceRole::AiAgentRuntime;
+    }
+
+    // 3. Switch Identification
     if hostname_lower.contains("switch")
         || hostname_lower.contains("sw-")
         || hostname_lower.contains("bridge")
@@ -160,6 +174,7 @@ mod tests {
             open_ports: Vec::new(),
             min_latency: None,
             ipv6_addrs: Vec::new(),
+            ai_runtime: None,
         };
         assert_eq!(classify_host(&host, true), DeviceRole::GatewayRouter);
     }
@@ -175,6 +190,7 @@ mod tests {
             open_ports: Vec::new(),
             min_latency: None,
             ipv6_addrs: Vec::new(),
+            ai_runtime: None,
         };
         assert_eq!(classify_host(&host, false), DeviceRole::Workstation);
     }
@@ -190,6 +206,7 @@ mod tests {
             open_ports: Vec::new(),
             min_latency: None,
             ipv6_addrs: Vec::new(),
+            ai_runtime: None,
         };
         assert_eq!(classify_host(&host, false), DeviceRole::SmartDevice);
     }
@@ -211,7 +228,30 @@ mod tests {
             }],
             min_latency: None,
             ipv6_addrs: Vec::new(),
+            ai_runtime: None,
         };
         assert_eq!(classify_host(&host, false), DeviceRole::Workstation);
+    }
+
+    #[test]
+    fn test_classify_ai_agent_runtime() {
+        use crate::engine::scanner::{PortInfo, PortStatus};
+        let host = HostResult {
+            ip: Ipv4Addr::new(192, 168, 1, 55),
+            is_alive: true,
+            hostname: Some("ollama-cluster".to_string()),
+            mac_address: None,
+            vendor: None,
+            open_ports: vec![PortInfo {
+                port: 11434,
+                status: PortStatus::Open,
+                latency: None,
+                service: "http",
+            }],
+            min_latency: None,
+            ipv6_addrs: Vec::new(),
+            ai_runtime: None,
+        };
+        assert_eq!(classify_host(&host, false), DeviceRole::AiAgentRuntime);
     }
 }

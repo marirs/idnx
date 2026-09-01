@@ -60,7 +60,8 @@ While traditional network scanners (such as Nmap, Angry IP, or Advanced IP Scann
   - **MikroTik MNDP:** RouterOS Identity, Board Name (e.g. `RB5009`, `hEX`), Version, MAC.
 - **🛰️ UPnP / SSDP Hardware Interrogation:** Extracts manufacturer, model name, and descriptions from consumer and enterprise gateways.
 - **🔍 Link Negotiation Detection:** Reports real-time physical link speed (Gbps / Mbps / Wi-Fi generation, frequency, and channel width).
-- **🌳 Unified Topology Tree & Table:** Synchronized hierarchical view showing Gateways, Workstations, Smart Devices, and Cascaded Subnets.
+- **🤖 AI Agent & LLM Runtime Fingerprinting:** Interrogates local inference engines (Ollama, LM Studio, vLLM, LocalAI), extracts active model catalogues (`/v1/models`, `/api/tags`), detects Model Context Protocol (MCP) servers, and maps AgentPin identities (`.well-known/agent-identity.json`).
+- **🌳 Unified Topology Tree & Table:** Synchronized hierarchical view showing Gateways, AI Agents & LLMs, Workstations, Smart Devices, and Cascaded Subnets.
 - **💾 Multi-Format Export:** Export complete network inventories to **JSON**, **YAML**, **XML**, **CSV**, or formatted plain **Text** with automatic `idnx_YYYYMMDD.<ext>` timestamping.
 - **📦 Dual Library + CLI Binary:** Use as a standalone CLI or embed as a Rust crate in custom automation and future UI applications.
 
@@ -171,7 +172,18 @@ idnx --update-oui
 ```
 > **What it does:** Downloads and compiles the latest IEEE OUI vendor registry to `~/.cache/idnx/oui.txt`, automatically overriding the built-in static table with tens of thousands of newly registered device manufacturers.
 
-### 9. Interface & Network Inspection
+### 9. AI Agent & Local LLM Runtime Discovery
+`idnx` automatically probes common local AI ports (`11434`, `1234`, `8000`, `8080`) to discover running inference engines, active model catalogues, Model Context Protocol (MCP) streaming endpoints, and AgentPin manifests:
+```bash
+# Standard scan automatically identifies Ollama, LM Studio, vLLM, and loaded models
+idnx
+
+# Targeted scan against local AI cluster nodes
+idnx --scan 192.168.1.50-60 --ports 1234,11434,8000
+```
+> **Output:** Discovered AI hosts are highlighted under `🤖 AI Agents & LLM Runtimes` with active models displayed directly in the tree and table (e.g. `[Ollama v0.5.4] 🧠 Models: deepseek-r1:7b, llama3.2:latest`).
+
+### 10. Interface & Network Inspection
 Quickly inspect all detected network interfaces on the local host without scanning:
 ```bash
 idnx --list-interfaces
@@ -186,7 +198,7 @@ idnx --list-interfaces
 
 ```toml
 [dependencies]
-idnx = "0.2.1"
+idnx = "0.2.2"
 ```
 
 Use the ergonomic `ScannerBuilder` to configure and execute network scans:

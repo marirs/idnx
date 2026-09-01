@@ -47,6 +47,8 @@ pub struct ExportHost {
     pub hostname: Option<String>,
     pub mac_address: Option<String>,
     pub vendor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_runtime: Option<crate::probes::ai::AiRuntimeInfo>,
     pub status: String,
     pub open_ports: Vec<String>,
     pub latency_ms: Option<f64>,
@@ -75,6 +77,7 @@ pub fn build_export_data(
             hostname: h.hostname.clone(),
             mac_address: h.mac_address.clone(),
             vendor: h.vendor.clone(),
+            ai_runtime: h.ai_runtime.clone(),
             status: if h.is_alive {
                 "UP".to_string()
             } else {
@@ -101,6 +104,7 @@ pub fn build_export_data(
                 hostname: h.hostname.clone(),
                 mac_address: h.mac_address.clone(),
                 vendor: h.vendor.clone(),
+                ai_runtime: h.ai_runtime.clone(),
                 status: if h.is_alive {
                     "UP".to_string()
                 } else {
@@ -263,6 +267,7 @@ mod tests {
                 }],
                 min_latency: Some(Duration::from_millis(5)),
                 ipv6_addrs: Vec::new(),
+                ai_runtime: None,
             }],
             elapsed: Duration::from_secs(1),
         };

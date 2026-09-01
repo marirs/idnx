@@ -38,6 +38,7 @@ pub fn print_topology_tree(
     // Group hosts by role
     let mut gateways = Vec::new();
     let mut switches = Vec::new();
+    let mut ai_agents = Vec::new();
     let mut workstations = Vec::new();
     let mut smart_devices = Vec::new();
     let mut generic_hosts = Vec::new();
@@ -48,6 +49,7 @@ pub fn print_topology_tree(
         match role {
             DeviceRole::GatewayRouter => gateways.push(host),
             DeviceRole::Switch => switches.push(host),
+            DeviceRole::AiAgentRuntime => ai_agents.push(host),
             DeviceRole::Workstation => workstations.push(host),
             DeviceRole::SmartDevice => smart_devices.push(host),
             DeviceRole::GenericHost => generic_hosts.push(host),
@@ -60,6 +62,9 @@ pub fn print_topology_tree(
     }
     if !switches.is_empty() {
         categories.push(("🔀", "Managed Switches & Infrastructure", switches));
+    }
+    if !ai_agents.is_empty() {
+        categories.push(("🤖", "AI Agents & LLM Runtimes", ai_agents));
     }
     if !workstations.is_empty() {
         categories.push(("💻", "Workstations, Laptops & Servers", workstations));
@@ -156,6 +161,26 @@ pub fn print_topology_tree(
                     sub_indent,
                     services_summary.join(", ").dimmed()
                 );
+            }
+
+            // AI Agent details (models & manifest info)
+            if let Some(ref ai) = host.ai_runtime {
+                if !ai.models.is_empty() {
+                    println!(
+                        "{}{}└── 🧠 Models: {}",
+                        indent,
+                        sub_indent,
+                        ai.models.join(", ").magenta().bold()
+                    );
+                }
+                if let Some(ref desc) = ai.agent_description {
+                    println!(
+                        "{}{}└── 📋 Info: {}",
+                        indent,
+                        sub_indent,
+                        desc.cyan().italic()
+                    );
+                }
             }
         }
     }

@@ -180,6 +180,7 @@ fn build_host_node(host: &HostResult) -> GraphNode {
     let (color, category, radius) = match role {
         DeviceRole::GatewayRouter => ("#3b82f6", "Gateway Router", 24.0),
         DeviceRole::Switch => ("#f59e0b", "Switch", 22.0),
+        DeviceRole::AiAgentRuntime => ("#8b5cf6", "AI Agent / LLM Runtime", 22.0),
         DeviceRole::Workstation => ("#10b981", "Workstation / PC", 18.0),
         DeviceRole::SmartDevice => ("#06b6d4", "Smart IoT Device", 16.0),
         DeviceRole::GenericHost => {
@@ -205,6 +206,11 @@ fn build_host_node(host: &HostResult) -> GraphNode {
         .map(|p| format!("{}/{} ({:?})", p.port, p.service, p.status))
         .collect();
 
+    let details = host
+        .ai_runtime
+        .as_ref()
+        .map(|ai| format!("AI Runtime: {}", ai.summary_label()));
+
     GraphNode {
         id: format!("host_{}", host.ip),
         label,
@@ -216,7 +222,7 @@ fn build_host_node(host: &HostResult) -> GraphNode {
         vendor: host.vendor.clone(),
         hostname: host.hostname.clone(),
         ports: ports_list,
-        details: None,
+        details,
         color: color.to_string(),
         radius,
     }
