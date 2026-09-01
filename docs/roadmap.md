@@ -43,11 +43,11 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 5: Recursive Pivot & Deep Fingerprinting -> [ACTIVE - NEXT UP]
-- [ ] Recursive exploration scheduler (`--recursive` flag to queue discovered subnets).
+### Milestone 5: Recursive Pivot & Deep Fingerprinting -> [ACTIVE]
+- [x] Ergonomic `ScannerBuilder` API (fluent builder pattern for embedding `idnx` in Rust applications).
+- [x] Clean-Room Protocol Probes (targeted handshake triggers: TLS ClientHello for X.509 cert extraction, SMB Negotiate for Windows domain/hostname).
+- [x] Interactive Network Topology Graph Export (`--export-graph topology.html` standalone force-directed visualization).
 - [ ] Updatable 2-Tier OUI Engine (`idnx update-oui` fetching master OUI database to `~/.cache/idnx/oui.bin`).
-- [ ] Clean-Room Protocol Probes (targeted handshake triggers: TLS ClientHello for X.509 cert extraction, SMB Negotiate for Windows domain/hostname).
-- [ ] Network topology graph export (`--format json`, `--export-graph topology.html` / SVG).
 
 ---
 

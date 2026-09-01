@@ -84,6 +84,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_snmp: bool,
 
+    /// Export interactive HTML topology graph (e.g. --export-graph topology.html)
+    #[arg(long = "export-graph")]
+    export_graph: Option<String>,
+
     /// List all local network interfaces and exit
     #[arg(long, default_value_t = false)]
     list_interfaces: bool,
@@ -343,6 +347,29 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("\n{} Export failed: {}", "[!]".red().bold(), e);
+            }
+        }
+    }
+
+    // 4. Export interactive HTML graph if requested
+    if let Some(ref graph_path) = cli.export_graph {
+        let p = std::path::Path::new(graph_path);
+        match output::graph::export_interactive_topology_html(
+            &target_cidr,
+            &summary,
+            &child_networks,
+            &physical_switches,
+            p,
+        ) {
+            Ok(_) => {
+                println!(
+                    "{} Interactive topology graph exported to: {}",
+                    "[+]".green().bold(),
+                    graph_path.cyan().bold()
+                );
+            }
+            Err(e) => {
+                eprintln!("{} Graph export failed: {}", "[!]".red().bold(), e);
             }
         }
     }

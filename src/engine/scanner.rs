@@ -513,6 +513,41 @@ pub async fn scan_subnet(
         }
     }
 
+    // 6. Targeted Deep Protocol Fingerprinting (TLS X.509 Certificate & SMB Negotiate)
+    for host in host_results.values_mut() {
+        // Probe SMB if port 445 or 139 is open
+        let has_smb = host.open_ports.iter().any(|p| p.port == 445 || p.port == 139);
+        if has_smb
+            && let Some(smb_info) = crate::probes::smb::probe_smb(host.ip, 445, Duration::from_millis(400)).await
+            && let Some(comp_name) = smb_info.dns_computer_name.or(smb_info.computer_name)
+        {
+            let domain_tag = smb_info
+                .domain_name
+                .map(|d| format!(".{}", d))
+                .unwrap_or_default();
+            host.hostname = Some(format!("{}{}", comp_name, domain_tag));
+        }
+
+        // Probe TLS X.509 Certificate if port 443 or 8443 is open
+        let tls_port = host
+            .open_ports
+            .iter()
+            .find(|p| p.port == 443 || p.port == 8443)
+            .map(|p| p.port);
+
+        let is_hostname_missing = host.hostname.is_none()
+            || host.hostname.as_deref() == Some("?")
+            || host.hostname.as_deref() == Some("-");
+
+        if let Some(p) = tls_port
+            && is_hostname_missing
+            && let Some(tls_info) = crate::probes::tls::probe_tls_certificate(host.ip, p, Duration::from_millis(400)).await
+            && let Some(cn) = tls_info.common_name
+        {
+            host.hostname = Some(cn);
+        }
+    }
+
     let mut active_hosts: Vec<HostResult> = host_results.into_values().collect();
     active_hosts.sort_by_key(|h| h.ip);
 
@@ -520,6 +555,179 @@ pub async fn scan_subnet(
         total_hosts,
         active_hosts,
         elapsed: start_time.elapsed(),
+    }
+}
+
+/// Fluent builder for constructing and running network scans ergonomically in library code
+#[derive(Debug, Clone)]
+pub struct ScannerBuilder {
+    target: Option<Ipv4Net>,
+    interface: Option<String>,
+    ports: Vec<u16>,
+    concurrency: usize,
+    timeout: Duration,
+    enable_deep: bool,
+    subnets: Option<String>,
+    snmp_config: Option<crate::engine::deep::SnmpProbeConfig>,
+}
+
+impl Default for ScannerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScannerBuilder {
+    pub fn new() -> Self {
+        Self {
+            target: None,
+            interface: None,
+            ports: parse_ports("21,22,23,25,53,80,161,443,445,8080,8443").unwrap(),
+            concurrency: 256,
+            timeout: Duration::from_millis(800),
+            enable_deep: true,
+            subnets: None,
+            snmp_config: Some(crate::engine::deep::SnmpProbeConfig::default()),
+        }
+    }
+
+    /// Sets the target by parsing a CIDR, IP address, or "auto"
+    pub fn target(mut self, target: &str) -> Result<Self, String> {
+        let (cidr, info) =
+            crate::net::interface::resolve_target(Some(target), self.interface.as_deref())?;
+        self.target = Some(cidr);
+        if let Some(inf) = info {
+            self.interface = Some(inf.interface_name);
+        }
+        Ok(self)
+    }
+
+    /// Sets the target explicitly as an Ipv4Net CIDR
+    pub fn target_cidr(mut self, cidr: Ipv4Net) -> Self {
+        self.target = Some(cidr);
+        self
+    }
+
+    /// Explicitly binds the scan to a specific network interface (e.g. "en0", "eth0")
+    pub fn interface(mut self, iface: impl Into<String>) -> Self {
+        self.interface = Some(iface.into());
+        self
+    }
+
+    /// Configures the list of TCP ports to probe
+    pub fn ports(mut self, ports: &[u16]) -> Self {
+        self.ports = ports.to_vec();
+        self
+    }
+
+    /// Configures ports from a string (e.g. "22,80,443" or "common")
+    pub fn ports_str(mut self, ports_str: &str) -> Result<Self, String> {
+        self.ports = parse_ports(ports_str)?;
+        Ok(self)
+    }
+
+    /// Sets the concurrency limit for parallel socket connections
+    pub fn concurrency(mut self, limit: usize) -> Self {
+        self.concurrency = limit;
+        self
+    }
+
+    /// Sets the per-host timeout duration
+    pub fn timeout(mut self, d: Duration) -> Self {
+        self.timeout = d;
+        self
+    }
+
+    /// Sets the per-host timeout in milliseconds
+    pub fn timeout_millis(mut self, ms: u64) -> Self {
+        self.timeout = Duration::from_millis(ms);
+        self
+    }
+
+    /// Enables or disables downstream multi-tier exploration
+    pub fn deep(mut self, enable: bool) -> Self {
+        self.enable_deep = enable;
+        self
+    }
+
+    /// Comma-separated list of extra child subnets to sweep
+    pub fn extra_subnets(mut self, subnets: impl Into<String>) -> Self {
+        self.subnets = Some(subnets.into());
+        self
+    }
+
+    /// Configures SNMP probing parameters
+    pub fn snmp_config(mut self, cfg: Option<crate::engine::deep::SnmpProbeConfig>) -> Self {
+        self.snmp_config = cfg;
+        self
+    }
+
+    /// Builds the configured `Scanner` instance
+    pub fn build(self) -> Result<Scanner, String> {
+        let target = match self.target {
+            Some(t) => t,
+            None => {
+                let info = crate::net::interface::detect_local_network()?;
+                info.cidr
+            }
+        };
+        Ok(Scanner {
+            target,
+            interface: self.interface,
+            ports: self.ports,
+            concurrency: self.concurrency,
+            timeout: self.timeout,
+            enable_deep: self.enable_deep,
+            subnets: self.subnets,
+            snmp_config: self.snmp_config,
+        })
+    }
+}
+
+/// Configured scanner ready to execute scans
+#[derive(Debug, Clone)]
+pub struct Scanner {
+    pub target: Ipv4Net,
+    pub interface: Option<String>,
+    pub ports: Vec<u16>,
+    pub concurrency: usize,
+    pub timeout: Duration,
+    pub enable_deep: bool,
+    pub subnets: Option<String>,
+    pub snmp_config: Option<crate::engine::deep::SnmpProbeConfig>,
+}
+
+impl Scanner {
+    /// Executes a standard subnet scan on the target CIDR
+    pub async fn scan(&self) -> ScanSummary {
+        scan_subnet(
+            self.target,
+            &self.ports,
+            self.interface.as_deref(),
+            self.concurrency,
+            self.timeout,
+            None,
+        )
+        .await
+    }
+
+    /// Executes a deep multi-tier infrastructure scan including downstream routers and SNMP tables
+    pub async fn scan_deep(&self) -> (ScanSummary, Vec<crate::engine::deep::ChildNetworkResult>) {
+        let summary = self.scan().await;
+        let children = if self.enable_deep || self.subnets.is_some() {
+            crate::engine::deep::explore_downstream_networks(
+                &self.target,
+                self.subnets.as_deref(),
+                &self.ports,
+                self.concurrency,
+                self.timeout,
+                self.snmp_config.as_ref(),
+            )
+            .await
+        } else {
+            Vec::new()
+        };
+        (summary, children)
     }
 }
 
@@ -539,5 +747,24 @@ mod tests {
         assert!(parsed.contains(&22));
         assert!(parsed.contains(&80));
         assert!(parsed.contains(&443));
+    }
+
+    #[test]
+    fn test_scanner_builder_configuration() {
+        let cidr: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        let scanner = ScannerBuilder::new()
+            .target_cidr(cidr)
+            .ports(&[80, 443])
+            .concurrency(128)
+            .timeout_millis(500)
+            .deep(false)
+            .build()
+            .expect("Failed to build scanner");
+
+        assert_eq!(scanner.target, cidr);
+        assert_eq!(scanner.ports, vec![80, 443]);
+        assert_eq!(scanner.concurrency, 128);
+        assert_eq!(scanner.timeout, Duration::from_millis(500));
+        assert!(!scanner.enable_deep);
     }
 }
