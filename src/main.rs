@@ -56,10 +56,6 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_deep: bool,
 
-    /// SNMP community strings for deep exploration (comma-separated)
-    #[arg(long, default_value = "public,private")]
-    snmp_communities: String,
-
     /// Comma-separated list of child/downstream subnets to explore (e.g. 192.168.58.0/24)
     #[arg(long)]
     subnets: Option<String>,
@@ -75,6 +71,18 @@ struct Cli {
     /// Custom output file path (defaults to idnx_YYYYMMDD.<ext>)
     #[arg(long = "output-file")]
     output_file: Option<String>,
+
+    /// SNMP community strings to probe (comma-separated, default: "public,private")
+    #[arg(long, default_value = "public,private")]
+    snmp_communities: String,
+
+    /// SNMP target UDP port (default: 161)
+    #[arg(long, default_value_t = 161)]
+    snmp_port: u16,
+
+    /// Disable SNMP deep exploration
+    #[arg(long, default_value_t = false)]
+    no_snmp: bool,
 
     /// List all local network interfaces and exit
     #[arg(long, default_value_t = false)]
@@ -262,18 +270,32 @@ async fn main() {
     )
     .await;
 
+    let snmp_comms: Vec<String> = cli
+        .snmp_communities
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     // Explore downstream child networks by default (unless --no-deep specified)
     let child_networks = if !cli.no_deep || cli.subnets.is_some() {
         println!(
-            "{} Probing downstream networks and cascaded subnets...",
+            "{} Probing downstream networks and cascaded subnets (SNMP OID MIB-II active)...",
             "[*]".blue().bold()
         );
+        let snmp_cfg = engine::deep::SnmpProbeConfig {
+            enabled: !cli.no_snmp,
+            communities: snmp_comms,
+            port: cli.snmp_port,
+        };
+
         engine::deep::explore_downstream_networks(
             &target_cidr,
             cli.subnets.as_deref(),
             &ports,
             cli.concurrency,
             timeout_duration,
+            Some(&snmp_cfg),
         )
         .await
     } else {

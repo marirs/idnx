@@ -34,16 +34,16 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 3: Deep SNMP Harvester -> [ACTIVE - NEXT UP]
-- [ ] Async SNMP v1/v2c client (compact UDP BER encoder/decoder).
-- [ ] Community string sweep (`public`, `private`, user-defined lists).
-- [ ] Interface IP Table (`ipAddrTable`) walking for multi-homed VLAN detection.
-- [ ] Routing Table (`ipRouteTable` / `inetCidrRouteTable`) extraction to uncover remote subnets.
-- [ ] Remote ARP Cache (`ipNetToMediaTable`) harvesting for silent / firewalled stealth devices.
+### Milestone 3: Deep SNMP Harvester -> [COMPLETED]
+- [x] Async SNMP v1/v2c client (compact UDP BER encoder/decoder).
+- [x] Community string sweep (`public`, `private`, user-defined lists).
+- [x] Interface IP Table (`ipAddrTable`) walking for multi-homed VLAN detection.
+- [x] Routing Table (`ipRouteTable` / `inetCidrRouteTable`) extraction to uncover remote subnets.
+- [x] Remote ARP Cache (`ipNetToMediaTable`) harvesting for silent / firewalled stealth devices.
 
 ---
 
-### Milestone 5: Recursive Pivot & Deep Fingerprinting -> [PLANNED]
+### Milestone 5: Recursive Pivot & Deep Fingerprinting -> [ACTIVE - NEXT UP]
 - [ ] Recursive exploration scheduler (`--recursive` flag to queue discovered subnets).
 - [ ] Updatable 2-Tier OUI Engine (`idnx update-oui` fetching master OUI database to `~/.cache/idnx/oui.bin`).
 - [ ] Clean-Room Protocol Probes (targeted handshake triggers: TLS ClientHello for X.509 cert extraction, SMB Negotiate for Windows domain/hostname).

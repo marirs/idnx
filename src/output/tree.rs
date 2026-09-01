@@ -206,7 +206,9 @@ pub fn print_topology_tree(
             for (gw_idx, gw) in switch_gws.iter().enumerate() {
                 let is_last_gw = gw_idx == switch_gws.len() - 1 && !has_endpoints;
                 let gw_branch = if is_last_gw { "└──" } else { "├──" };
-                let gw_name = if gw.open_ports.iter().any(|p| p.port == 23) {
+                let gw_name = if let Some(ref sys) = child.snmp_system_name {
+                    sys.as_str()
+                } else if gw.open_ports.iter().any(|p| p.port == 23) {
                     "Managed Switch Gateway"
                 } else if gw.open_ports.iter().any(|p| p.port == 53) {
                     "Subnet Gateway Router"
@@ -223,14 +225,20 @@ pub fn print_topology_tree(
                 } else {
                     String::new()
                 };
+                let descr_tag = if let Some(ref d) = child.snmp_system_descr {
+                    format!(" ({})", d.dimmed())
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{}{}    {} 🔀 {} [{}]{}",
+                    "{}{}    {} 🔀 {} [{}]{}{}",
                     indent,
                     sub_indent,
                     gw_branch,
                     gw.ip.to_string().cyan().bold(),
                     gw_name.magenta().bold(),
-                    ports_tag
+                    ports_tag,
+                    descr_tag
                 );
             }
 
@@ -259,6 +267,12 @@ pub fn print_topology_tree(
                         .collect();
                     if !ports_str.is_empty() {
                         ep_desc = format!("{} [{}]", ep_desc, ports_str.join(", ").yellow());
+                    } else {
+                        ep_desc = format!(
+                            "{} [{}]",
+                            ep_desc,
+                            "Stealth / Firewalled (SNMP ARP)".dimmed().italic()
+                        );
                     }
 
                     println!("{}{}        {} {}", indent, sub_indent, ep_branch, ep_desc);
