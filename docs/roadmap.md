@@ -16,6 +16,7 @@ This document outlines the milestones and release goals for the **idNX** project
 - [x] Active host discovery (TCP connect / RST alive detection + stealth ICMP echo sweep fallback).
 - [x] Responsive terminal status output & formatted table (`indicatif` & `comfy-table`).
 - [x] Multi-format export engine (`--output json|yaml|xml|csv|text`) with auto-timestamped naming (`idnx_YYYYMMDD.<ext>`).
+- [ ] Ergonomic `ScannerBuilder` API (fluent builder pattern for embedding `idnx` in third-party applications).
 
 ### Milestone 2: Infrastructure Fingerprinting & UPnP -> [COMPLETED]
 - [x] Gateway detection (detect default gateway via routing table/socket).
@@ -42,10 +43,10 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 5: Recursive Pivot & Visualization -> [PLANNED]
+### Milestone 5: Recursive Pivot & Deep Fingerprinting -> [PLANNED]
 - [ ] Recursive exploration scheduler (`--recursive` flag to queue discovered subnets).
 - [ ] Updatable 2-Tier OUI Engine (`idnx update-oui` fetching master OUI database to `~/.cache/idnx/oui.bin`).
-- [ ] TLS X.509 Certificate Fingerprinting (Port 443 / 8443 Subject, Issuer, SAN extraction).
+- [ ] Clean-Room Protocol Probes (targeted handshake triggers: TLS ClientHello for X.509 cert extraction, SMB Negotiate for Windows domain/hostname).
 - [ ] Network topology graph export (`--format json`, `--export-graph topology.html` / SVG).
 
 ---
@@ -65,3 +66,9 @@ This document outlines the milestones and release goals for the **idNX** project
 - [ ] Model Context Protocol (MCP) server detector (JSON-RPC 2.0 / SSE endpoint discovery).
 - [ ] AgentPin standard prober (`.well-known/agent-identity.json`).
 - [ ] Dedicated topology category: `🤖 AI Agents & LLM Runtimes` in ASCII tree, tables, and JSON/YAML exports.
+
+---
+
+## 🛡️ Code Origin & Licensing Integrity
+All features and components in `idnx` are 100% original, clean-room, handwritten Rust code licensed under **Apache-2.0**. We strictly reject copying or vendoring code from copyleft/GPL projects, guaranteeing a permissive, commercially safe foundation for the open-source community and enterprise users.
+
