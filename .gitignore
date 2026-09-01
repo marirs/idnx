@@ -1,5 +1,7 @@
 target/
 .*
 !.gitignore
+!.github/
+!.github/**
 data/
 Thumbs.db
