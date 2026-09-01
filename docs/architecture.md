@@ -1,84 +1,91 @@
 # idNX Architecture & Design Specification
 
-This document details the architectural design, concurrency model, and data flow of **idNX**.
+This document details the architectural design, concurrency model, modular crate structure, and data flow of **idNX**.
 
 ---
 
 ## 1. System Overview
 
-idNX is architected around a multi-stage, event-driven pipeline written in asynchronous Rust on top of `tokio`.
+idNX is architected as a high-performance, asynchronous Rust library (`idnx`) with a paired command-line interface (`idnx` binary).
 
-```
-               ┌───────────────────────────────┐
-               │         CLI / Config          │
-               │   (clap derive, args, opts)   │
-               └───────────────┬───────────────┘
-                               │
-                               ▼
-               ┌───────────────────────────────┐
-               │       Scan Coordinator        │
-               │  - Subnet Queue / Scheduler   │
-               │  - Deduplication Cache        │
-               └───────┬───────────────┬───────┘
-                       │               │
-      Stage 1: Primary │               │ Stage 2: Deep Infrastructure
-      Data-Plane Probe │               │ Control-Plane Interrogation
-                       ▼               ▼
-         ┌───────────────────┐   ┌───────────────────────────┐
-         │ Fast Host & Port  │   │  Deep Exploration Engine  │
-         │ Discovery Worker  │   │  • SNMP Walker (MIB-II)   │
-         │ • TCP SYN/Connect │   │  • UPnP/SSDP Interrogator │
-         │ • ICMP / ARP Ping │   │  • L2 Sniffer (LLDP/CDP)  │
-         └─────────┬─────────┘   └─────────────┬─────────────┘
-                   │                           │
-                   └───────────┬───────────────┘
-                               ▼
-               ┌───────────────────────────────┐
-               │    Topology & Graph Store     │
-               │  - Device Model (Role, OUI)   │
-               │  - Interfaces & VLANs         │
-               │  - Harvested Remote Hosts     │
-               └───────────────┬───────────────┘
-                               │
-                               ▼
-               ┌───────────────────────────────┐
-               │        Output Formatter       │
-               │  • ASCII / Colored Terminal   │
-               │  • JSON / GraphViz DOT        │
-               └───────────────────────────────┘
+```text
+               ┌───────────────────────────────────────────┐
+               │        CLI Binary (src/main.rs)           │
+               │        - clap derive, args, banner        │
+               │        - Link speed display, progress bar │
+               └─────────────────────┬─────────────────────┘
+                                     │
+                                     ▼
+               ┌───────────────────────────────────────────┐
+               │        idNX Library (src/lib.rs)          │
+               │      Public APIs & Module Pipeline        │
+               └───────┬───────────────────────────┬───────┘
+                       │                           │
+      Stage 1: Primary │                           │ Stage 2: Deep Infrastructure
+      Data-Plane Probe │                           │ Control-Plane Interrogation
+                       ▼                           ▼
+         ┌─────────────────────────┐   ┌───────────────────────────┐
+         │ Fast Host & Port Engine │   │  Deep Exploration Engine  │
+         │ • L2 ARP & Ping Sweep   │   │  • L2 Sniffer (LLDP/CDP)  │
+         │ • Parallel TCP Connect  │   │  • MikroTik MNDP (UDP)    │
+         │ • Dual mDNS & DNS PTR   │   │  • UPnP / SSDP XML Query  │
+         │ • Banner Grabbing       │   │  • Gateway Explorer       │
+         └─────────────┬───────────┘   └─────────────┬─────────────┘
+                       │                             │
+                       └───────────────┬─────────────┘
+                                       ▼
+               ┌───────────────────────────────────────────┐
+               │         Topology & Output Engine          │
+               │  - Device Role Classifier (classifier.rs) │
+               │  - IEEE OUI Database (oui.rs)             │
+               │  - Unified Topology Tree (tree.rs)        │
+               │  - Terminal Results Table (terminal.rs)   │
+               └───────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. Core Modules
+## 2. Core Modules (`idnx::*`)
 
 ### 2.1 `engine`
-- **`scanner`**: Responsible for driving the data-plane sweeps across given CIDR blocks. Uses bounded worker pools (semaphores) to ensure high concurrency without exhausting file descriptors or flooding local network buffers.
-- **`coordinator`**: Manages the life cycle of discovered targets, preventing duplicate probes and feeding newly discovered subnets into the scheduler when running with `--recursive`.
+* **`scanner`**: Drives data-plane discovery using bounded semaphore worker pools. Coordinates Layer 2 ARP population, parallel TCP SYN/connect sweeps, asynchronous ICMP echo sweeps for stealth hosts, and service banner grabbing.
+* **`deep`**: Interrogates candidate RFC 1918 gateway routers to detect upstream parent WANs, downstream cascaded routers, and adjacent managed switch subnets.
 
 ### 2.2 `probes`
-- **`tcp`**: High-speed asynchronous TCP connect and half-open SYN probes.
-- **`snmp`**: Asynchronous SNMP v1/v2c client that walks IP-MIB, Route-MIB, and ARP tables using compact ASN.1 BER encoding.
-- **`l2`**: Raw packet capture and broadcast parser for 802.1AB LLDP, Cisco CDP, and MikroTik MNDP.
-- **`upnp`**: SSDP M-SEARCH multicast engine with XML descriptor parsing.
+* **`lldp`**: Berkeley Packet Filter (macOS `/dev/bpf*`) and raw packet socket (Linux `AF_PACKET`) frame listener that decodes IEEE 802.1AB LLDP TLVs (Chassis ID, Port ID, System Name, System Description, Capabilities).
+* **`cdp`**: Cisco Discovery Protocol frame decoder for LLC/SNAP encapsulated packets (`01:00:0c:cc:cc:cc`, protocol `0x2000`). Extracts device hostname, hardware platform, port ID, and native VLAN.
+* **`mndp`**: MikroTik Neighbor Discovery Protocol listener on UDP port 5678. Extracts RouterOS identity, software version, hardware board name, and MAC address.
+* **`upnp`**: SSDP multicast (`239.255.255.250:1900`) discovery engine that fetches device XML descriptions to extract manufacturer and model details.
+* **`asus`**: Probes ASUSWRT discovery protocol on UDP ports 9999 and 18017.
 
-### 2.3 `fingerprint`
-- **`oui`**: In-memory prefix tree / hash map of IEEE Organizationally Unique Identifiers (MAC vendors) to classify switch and router hardware (Cisco, Ubiquiti, Juniper, MikroTik, HP/Aruba, etc.).
-- **`service`**: Identifies administrative interfaces (SSH, Telnet, HTTP/HTTPS WebFig/LuCI/pfSense, Winbox, SNMP).
+### 2.3 `net`
+* **`interface`**: Cross-platform network interface enumeration and primary route detection (`get_if_addrs` + outbound routing probe).
+* **`link_speed`**: Queries the operating system for real-time negotiated physical link speed (e.g. `10 Gbps Full-Duplex` or `1.81 Gbps Wi-Fi 6E 160MHz`).
+* **`arp`**: Cross-platform OS kernel ARP table reader:
+  * Linux: Reads directly from `/proc/net/arp` (works on minimal/container distros without external tools).
+  * macOS: Parses Darwin `arp -a`.
+  * Windows: Parses Windows `arp -a` with hyphenated MAC support.
+* **`dns`**: High-performance zero-copy Unicast DNS reverse PTR resolver (RFC 1035) that queries subnet gateway DNS servers (e.g. dnsmasq) for hostnames across routed subnets.
+* **`mdns`**: Asynchronous Multicast DNS (RFC 6762) reverse PTR resolver on `224.0.0.251:5353`.
 
-### 2.4 `topology`
-- Represents the network as an in-memory directed graph:
-  - **Nodes**: Subnets, Routers, Switches, Hosts, Interfaces.
-  - **Edges**: `routes_to`, `connected_to_port`, `member_of_vlan`, `discovered_via_arp`.
+### 2.4 `fingerprint`
+* **`oui`**: Embedded, binary-searchable IEEE OUI vendor database. Automatically checks for IEEE 802 local/randomized MAC addresses (`mac[0] & 0x02 != 0`).
+* **`classifier`**: Multi-signal heuristic device classifier assigning nodes into:
+  * Gateways & Routers
+  * Managed Switches
+  * Workstations, Laptops & Servers (including DGX / AI compute nodes)
+  * IoT & Connected Smart Devices (air purifiers, hubs, smart bulbs, TVs)
+
+### 2.5 `output`
+* **`tree`**: Renders the complete multi-tier network hierarchy in Unicode showing Gateway $\to$ Workstations $\to$ Smart Devices $\to$ Cascaded & Adjacent Networks.
+* **`terminal`**: Renders a synchronized, formatted tabular overview (`comfy-table`) with network origin, IP, hostname, MAC/vendor, open ports, and latency.
 
 ---
 
-## 3. Concurrency & Resource Management
+## 3. Concurrency & Privileges
 
-1. **File Descriptor Limits**:
-   - `tokio::sync::Semaphore` caps the maximum number of concurrent in-flight sockets (e.g., default 512, configurable via `--concurrency`).
-2. **Packet Rate Limiting**:
-   - Token bucket / rate-limiter prevents triggering network intrusion detection or overwhelming intermediate switch buffers.
-3. **Privilege Decoupling**:
-   - **Unprivileged Mode (default)**: Operates using standard POSIX `TcpStream` and UDP sockets without requiring `sudo` / root.
-   - **Raw Socket Mode (optional / `--raw`)**: Leverages `pnet` for raw ARP sweeps and L2 frame sniffing.
+1. **Privilege Decoupling**:
+   * **Unprivileged Mode (Non-Root)**: Uses standard POSIX sockets and ICMP sweeps without requiring `sudo`. Displays a prominent indicator informing the user that raw Layer 2 switch discovery is disabled.
+   * **Privileged Mode (`sudo idnx`)**: Opens raw Berkeley Packet Filter (macOS) and `AF_PACKET` raw sockets (Linux) to capture wire-level LLDP and CDP frames.
+2. **Resource Throttling**:
+   * All network operations use `tokio::sync::Semaphore` to cap in-flight sockets and prevent file descriptor exhaustion or switch buffer overruns.

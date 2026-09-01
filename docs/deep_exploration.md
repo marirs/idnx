@@ -1,99 +1,55 @@
 # Deep Infrastructure Exploration Guide
 
-This document explains the technical mechanisms `idNX` uses to extract hidden networks, VLANs, routing tables, and remote host IPs from routers and managed switches.
+This document explains the technical mechanisms `idNX` uses to extract hidden networks, cascaded routers, managed switches, and silent devices.
 
 ---
 
-## 1. The Core Problem: Data Plane vs. Control Plane
+## 1. The Core Problem: Multi-Tier Networks & The Perimeter Trap
 
-Traditional network scanners query each IP individually on target ports. This approach fails in modern segmented environments:
+Traditional network scanners query each IP individually on a single flat subnet. This approach fails in modern segmented and layered environments:
 
-1. **VLAN Segmentation**: Routers isolate traffic between subnets (e.g., VLAN 10 for Corporate, VLAN 20 for IoT).
-2. **Access Control Lists (ACLs) & Firewalls**: Even if routing exists, firewalls on the router block traffic originating from untrusted subnets.
-
-### The idNX Advantage
-Routers and Layer 3 managed switches must know about all connected networks to function. They store this state in memory:
-- **Routing tables**
-- **ARP tables (Neighbor caches)**
-- **Interface definitions & IP addresses**
-- **Bridge forwarding databases (FDB)**
-
-By querying these management structures, idNX maps the entire network footprint **from the control plane**.
+1. **Cascaded & Prosumer Routers**: Users and departments frequently attach downstream routers (e.g. Wi-Fi 6E/7 access points, travel routers, lab subnets). The primary router sees them as a single client IP, hiding all devices attached behind them.
+2. **Enterprise Rogue Devices**: Employees or contractors plug unauthorized Wi-Fi routers or unmanaged switches into office wall jacks. Traditional scanners only see one IP responding, completely oblivious to the rogue secondary network behind it.
+3. **WAN SPI Firewalls**: Many commercial and prosumer routers (like ASUSWRT) ship with aggressive WAN SPI firewalls enabled by default:
+   * All inbound TCP connect attempts from outside the WAN are dropped (no `RST` reply).
+   * ICMP echo requests from the WAN are dropped (`Respond to Ping from WAN = No`).
+   * Broadcasts and multicast (ARP, mDNS) cannot cross the router boundary.
 
 ---
 
-## 2. Extraction Techniques
+## 2. How idNX Synthesizes Multi-Tier Topology
 
-### 2.1 SNMP MIB Walking (The Primary Deep Probe)
-When idNX detects an infrastructure host or when `--deep` is enabled:
-1. It sends an SNMP `GetRequest` or `GetNextRequest` / `GetBulkRequest` (v2c) on UDP port 161 with targeted community strings (e.g., `public`, `private`).
-2. It walks three critical MIB tables:
+`idNX` attacks this problem from four angles:
 
-#### A. Interface Addresses (`ipAddrTable` - `1.3.6.1.2.1.4.20`)
-- **What it returns**: All IP addresses assigned to every physical port, virtual interface, and VLAN on the router.
-- **Value**: Instantly reveals other internal gateway IPs (e.g., `10.0.10.1`, `10.0.20.1`, `172.16.50.1`).
+### 2.1 RFC 1918 Gateway Traversal
+When deep exploration is active, `idNX` probes standard RFC 1918 gateway candidates (`192.168.x.1`, `10.x.x.1`, `172.16.x.1`). When a responsive gateway or managed switch is found (e.g. `192.168.1.1` or `192.168.70.1`), `idNX`:
+1. Identifies the gateway type (router vs. managed switch).
+2. Probes the management endpoints (HTTP/HTTPS, SSH, Telnet, SNMP).
+3. Automatically queues the discovered subnet for recursive discovery.
 
-#### B. Routing Table (`ipRouteTable` - `1.3.6.1.2.1.4.21` / `inetCidrRouteTable` - `1.3.6.1.2.1.4.24`)
-- **What it returns**: Complete list of destination CIDR blocks, subnet masks, next-hop gateways, and route types (direct, indirect).
-- **Value**: Discovers all routable subnets, including multi-hop corporate networks and branch office tunnels.
+### 2.2 Dual-Mode Name Synthesis (Overcoming Multicast Barriers)
+* **Local Subnet**: `idNX` uses Multicast DNS (RFC 6762 on `224.0.0.251:5353`) to resolve Apple, Linux, and IoT `.local` names.
+* **Cascaded / Routed Subnets**: Because mDNS packets cannot cross routers, `idNX` uses a custom zero-copy **RFC 1035 Unicast DNS PTR resolver**. It directs UDP reverse DNS queries directly to the subnet gateway's DNS daemon (e.g. dnsmasq on `192.168.1.1:53`), extracting device names (`507-Appt-Room`, `dmaker-fan`, `spark-48f8`, `Mac-mini`) across routing boundaries without root privileges.
 
-#### C. ARP Cache Table (`ipNetToMediaTable` - `1.3.6.1.2.1.4.22`)
-- **What it returns**: The router's ARP table: IP address to MAC address mappings across **all** attached subnets.
-- **Value**: **This is the biggest win.** Even if idNX cannot route a single packet into VLAN 30, the router's ARP table lists the IP and MAC address of every device that has transmitted packets on VLAN 30!
+### 2.3 Layer 2 Link-Layer Frame Capture (LLDP, CDP, MNDP)
+In privileged mode (`sudo idnx`), `idNX` taps into the raw network interface using BPF (macOS) and `AF_PACKET` (Linux):
+* **IEEE 802.1AB LLDP**: Intercepts advertisements on `01:80:c2:00:00:0e` to read switch chassis IDs, port numbers, and system descriptions.
+* **Cisco CDP**: Decodes frames on `01:00:0c:cc:cc:cc` to discover Cisco, Ubiquiti UniFi, and TP-Link Omada switches, their model names, and native VLANs.
+* **MikroTik MNDP**: Listens on UDP port 5678 for RouterOS broadcast beacons.
 
----
-
-### 2.2 Layer 2 Discovery (LLDP, CDP, MNDP)
-Managed switches and enterprise routers broadcast discovery packets:
-- **LLDP (802.1AB)**: Standardized neighbor discovery sent to multicast MAC `01:80:c2:00:00:0e`.
-- **CDP**: Cisco proprietary discovery sent to `01:00:0c:cc:cc:cc`.
-- **MNDP**: MikroTik Neighbor Discovery Protocol over UDP 5678.
-
-**Payload extracted**:
-- Switch chassis ID, hostname, and management IP.
-- Port ID and port description (e.g., `GigabitEthernet0/12 - Uplink to Core`).
-- Native VLAN and enabled capabilities (Bridge, Router, WLAN).
+### 2.4 Stealth ICMP Echo Fallbacks
+For devices on routed subnets that have no open TCP ports or drop SYN packets, `idNX` runs parallel ICMP echo sweeps with dynamic timeout clamping (`.clamp(300, 1500)`), capturing stealth endpoints that standard port scanners skip.
 
 ---
 
-### 2.3 UPnP / SSDP (Consumer & Edge Gateways)
-1. idNX broadcasts an `M-SEARCH` UDP packet to `239.255.255.250:1900`:
-   ```http
-   M-SEARCH * HTTP/1.1
-   HOST: 239.255.255.250:1900
-   MAN: "ssdp:discover"
-   MX: 2
-   ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1
-   ```
-2. The gateway returns its XML descriptor URL.
-3. idNX parses the descriptor to obtain:
-   - External WAN IP and status.
-   - Internal LAN subnets.
-   - Active UPnP port mappings.
+## 3. The Role of Milestone 3: Deep SNMP Harvesting
 
----
+When a router has its WAN firewall in strict stealth mode (dropping both TCP and ICMP from the WAN, as observed with default ASUSWRT settings):
+* The device is invisible to direct Layer 3 packets originating from upstream.
+* **However, the upstream switch or gateway knows about it.**
 
-## 3. Recursive Exploration Workflow
-
-When `--recursive` is enabled alongside `--deep`:
-
-```
-[Start Sweep: 192.168.1.0/24]
-        │
-        ▼
-[Find Router: 192.168.1.1]
-        │
-        ├─► [Harvest ARP Table] ────────► Discovered 48 remote IPs
-        │
-        └─► [Harvest Routing Table]
-                    │
-                    ├── Subnet A: 10.0.10.0/24 (Directly Connected)
-                    ├── Subnet B: 10.0.20.0/24 (VLAN 20)
-                    └── Subnet C: 172.16.0.0/16 (Corporate VPN)
-                            │
-                            ▼
-           [Test Reachability / Add to Queue]
-                            │
-                            ▼
-           [Recursive Sweep: 10.0.10.0/24]
-```
+### How SNMP Bridges the Gap:
+1. **ARP Cache Walking (`ipNetToMediaTable` - `1.3.6.1.2.1.4.22`)**:
+   The upstream managed switch (`192.168.70.1`) and gateway router (`192.168.1.1`) keep a live hardware ARP table of every MAC and IP address communicating across their ports. By querying this MIB table via SNMP, `idNX` extracts the stealth router's IP and MAC without needing the router itself to answer a single packet!
+2. **Routing Table Extraction (`ipRouteTable` / `inetCidrRouteTable`)**:
+   Extracting the router's routing table reveals downstream next-hop subnets (e.g. `192.168.50.0/24`) even if they are shielded behind a firewall.
