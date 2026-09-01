@@ -69,6 +69,14 @@ struct Cli {
     #[arg(long)]
     switches: Option<String>,
 
+    /// Export scan results in the specified format (json, yaml, xml, csv, text)
+    #[arg(short = 'o', long = "output", value_enum)]
+    output: Option<idnx::output::export::OutputFormat>,
+
+    /// Custom output file path (defaults to idnx_YYYYMMDD.<ext>)
+    #[arg(long = "output-file")]
+    output_file: Option<String>,
+
     /// List all local network interfaces and exit
     #[arg(long, default_value_t = false)]
     list_interfaces: bool,
@@ -291,4 +299,26 @@ async fn main() {
 
     // 2. Render Detailed Results Table
     output::terminal::print_scan_results(&target_cidr, &summary, &child_networks);
+
+    // 3. Export to file if requested
+    if let Some(format) = cli.output {
+        match output::export::export_results(
+            format,
+            cli.output_file.as_deref(),
+            &target_cidr,
+            &summary,
+            &child_networks,
+        ) {
+            Ok(path) => {
+                println!(
+                    "\n{} Results exported to: {}",
+                    "[+]".green().bold(),
+                    path.display().to_string().cyan().bold()
+                );
+            }
+            Err(e) => {
+                eprintln!("\n{} Export failed: {}", "[!]".red().bold(), e);
+            }
+        }
+    }
 }
