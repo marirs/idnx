@@ -163,6 +163,7 @@ pub fn parse_windows_ndp(output: &str) -> Vec<NdpEntry> {
 
 /// Stimulates IPv6 neighbors on the local network by sending a brief ICMPv6 multicast echo
 pub async fn stimulate_ipv6_neighbors(interface: &str) {
+    let _ = interface;
     // Attempt ping to All-Nodes Link-Local Multicast address (ff02::1%<interface>)
     #[cfg(target_os = "macos")]
     let _ = timeout(
@@ -230,10 +231,12 @@ pub async fn harvest_ndp_cache(target_interface: Option<&str>) -> Vec<NdpEntry> 
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(output) = Command::new("netsh")
-            .args(["interface", "ipv6", "show", "neighbors"])
-            .output()
-            .await
+        let mut cmd = Command::new("netsh");
+        cmd.args(["interface", "ipv6", "show", "neighbors"]);
+        if let Some(iface) = target_interface {
+            cmd.arg(format!("interface=\"{}\"", iface));
+        }
+        if let Ok(output) = cmd.output().await
             && let Ok(text) = String::from_utf8(output.stdout)
         {
             parse_windows_ndp(&text)
@@ -244,6 +247,7 @@ pub async fn harvest_ndp_cache(target_interface: Option<&str>) -> Vec<NdpEntry> 
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
+        let _ = target_interface;
         Vec::new()
     }
 }
