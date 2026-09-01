@@ -6,7 +6,7 @@
  (_) __| | \ | | \ \/ /
  | |/ _` |  \| |  \  / 
  | | (_| | |\  |  /  \ 
- |_|\__,_|_| \_| /_/\_\  v0.1.1
+ |_|\__,_|_| \_| /_/\_\  v0.2.0
 ```
 
 [![CI](https://github.com/marirs/idnx/actions/workflows/ci.yml/badge.svg)](https://github.com/marirs/idnx/actions/workflows/ci.yml)
@@ -128,10 +128,13 @@ idnx --output xml
 # Export to formatted plain text table (without terminal ANSI codes)
 idnx --output text
 
+# Export an interactive HTML topology graph (standalone, zero-dependency force-directed map)
+idnx --export-graph topology.html
+
 # Export to a custom destination file
 sudo idnx --output json --output-file /tmp/datacenter_inventory.json
 ```
-> **What it does:** Dumps every discovered device across all local and cascaded networks—including IP, hostname, MAC address, manufacturer OUI, open ports, status, and round-trip latency—into your chosen format.
+> **What it does:** Dumps every discovered device across all local and cascaded networks—including IP, hostname, MAC address, manufacturer OUI, open ports, status, and round-trip latency—into your chosen format, or visualizes it as an interactive force-directed web graph.
 
 ### 4. Targeting a Specific Subnet & Interface
 Scan a specific corporate VLAN, secondary network card, or VPN tunnel:
@@ -169,29 +172,45 @@ idnx --list-interfaces
 
 ## 📦 Using idNX as a Rust Library
 
-`idnx` is structured as a library (`lib.rs`) alongside the CLI binary (`main.rs`). Add it to your `Cargo.toml`:
+`idnx` is structured as a high-performance library (`lib.rs`) alongside the CLI binary (`main.rs`). Add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-idnx = "0.1.1"
+idnx = "0.2.0"
 ```
 
+Use the ergonomic `ScannerBuilder` to configure and execute network scans:
+
 ```rust
-use idnx::engine::scanner::scan_subnet;
-use idnx::net::interface::detect_local_network;
+use idnx::ScannerBuilder;
 use std::time::Duration;
 
 #[tokio::main]
-async fn main() {
-    let local = detect_local_network().expect("Failed to detect network");
-    println!("Scanning {} on {}", local.cidr, local.interface_name);
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Fluent builder pattern to configure scan parameters
+    let scanner = ScannerBuilder::new()
+        .target("192.168.1.0/24")?
+        .ports(&[22, 80, 443, 445, 8080])
+        .concurrency(256)
+        .timeout(Duration::from_millis(500))
+        .deep(true)
+        .build()?;
 
-    let ports = vec![22, 80, 443, 8080];
-    let summary = scan_subnet(local.cidr, &ports, None, 256, Duration::from_millis(500), None).await;
-
-    for host in summary.active_hosts {
-        println!("Host: {} | Hostname: {:?}", host.ip, host.hostname);
+    // 1. Run standard subnet discovery and port sweep
+    let summary = scanner.scan().await;
+    println!("Found {} active hosts:", summary.active_hosts.len());
+    for host in &summary.active_hosts {
+        println!(
+            "Host: {:15} | Hostname: {:25?} | Vendor: {:?}",
+            host.ip, host.hostname, host.vendor
+        );
     }
+
+    // 2. Or run full multi-tier infrastructure exploration (cascaded subnets & SNMP)
+    let (summary, cascaded) = scanner.scan_deep().await;
+    println!("Discovered {} downstream networks", cascaded.len());
+
+    Ok(())
 }
 ```
 
