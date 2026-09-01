@@ -1,13 +1,6 @@
 # idNX 🚀
 ### Network Identification & Deep eXploration Tool
 
-```text
-  _     _ _   _  __  __
- (_) __| | \ | | \ \/ /
- | |/ _` |  \| |  \  / 
- | | (_| | |\  |  /  \ 
- |_|\__,_|_| \_| /_/\_\  v0.2.0
-```
 
 [![CI](https://github.com/marirs/idnx/actions/workflows/ci.yml/badge.svg)](https://github.com/marirs/idnx/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-windows%20|%20macos%20|%20linux-blue?logo=gnubash&logoColor=white)
