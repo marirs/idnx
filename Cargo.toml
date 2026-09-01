@@ -1,6 +1,6 @@
 [package]
 name = "idnx"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Sriram <marirs@gmail.com>"]
 description = "Fast, asynchronous network identification and deep infrastructure exploration library."
