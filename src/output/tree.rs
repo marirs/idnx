@@ -297,7 +297,9 @@ pub fn print_topology_tree(
                     let ep_branch = if is_last_ep { "└──" } else { "├──" };
                     let mut ep_desc = ep.ip.to_string().cyan().bold().to_string();
 
-                    if let Some(ref name) = ep.hostname {
+                    if let Some(ref ai) = ep.ai_runtime {
+                        ep_desc = format!("{} 🤖 [{}]", ep_desc, ai.summary_label().green());
+                    } else if let Some(ref name) = ep.hostname {
                         ep_desc = format!("{} [{}]", ep_desc, name.magenta().bold());
                     } else if let Some(ref vendor) = ep.vendor {
                         ep_desc = format!("{} ({})", ep_desc, vendor.green());
@@ -322,6 +324,20 @@ pub fn print_topology_tree(
                 }
             }
         }
+    }
+
+    let total_ai_agents: usize = summary
+        .active_hosts
+        .iter()
+        .chain(child_networks.iter().flat_map(|c| c.summary.active_hosts.iter()))
+        .filter(|h| h.ai_runtime.is_some())
+        .count();
+    if total_ai_agents > 0 {
+        println!(
+            "\n{} Detected {} active AI Agent / LLM Runtime(s)",
+            "[+]".green().bold(),
+            total_ai_agents.to_string().cyan().bold()
+        );
     }
 
     // Render physical unmanaged switches if provided

@@ -41,7 +41,7 @@ struct Cli {
     interface: Option<String>,
 
     /// Target ports or ranges separated by commas (e.g. 22,80,443 or 80-90 or 'common')
-    #[arg(short, long, default_value = "21,22,23,25,53,80,161,443,445,1234,8080,8443,11434")]
+    #[arg(short, long, default_value = "21,22,23,25,53,80,161,443,445,1234,8000,8080,8443,11434")]
     ports: String,
 
     /// Timeout in milliseconds per port probe
@@ -309,6 +309,10 @@ async fn main() {
     if !cli.no_deep {
         println!(
             "{} Deep mode active. Probing router management endpoints and child subnets...",
+            "[*]".blue().bold(),
+        );
+        println!(
+            "{} AI Agent & LLM runtime detection: ACTIVE (Ollama 11434, LM Studio 1234, vLLM 8000, LocalAI 8080, MCP)",
             "[*]".blue().bold(),
         );
     }

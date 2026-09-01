@@ -1,4 +1,4 @@
-use crate::engine::scanner::{HostResult, ScanSummary, scan_subnet};
+use crate::engine::scanner::{HostResult, ScanSummary};
 use crate::probes::snmp::{SnmpArpEntry, harvest_snmp_device};
 use ipnet::Ipv4Net;
 use std::collections::HashSet;
@@ -122,8 +122,16 @@ pub async fn explore_downstream_networks(
     let mut discovered_networks = Vec::new();
 
     while let Some((subnet, label, depth)) = queue.pop_front() {
-        let mut summary =
-            scan_subnet(subnet, ports, None, concurrency, timeout_duration, None).await;
+        let mut summary = crate::engine::scanner::scan_subnet_ext(
+            subnet,
+            ports,
+            None,
+            concurrency,
+            timeout_duration,
+            None,
+            false,
+        )
+        .await;
 
         let gw = Ipv4Addr::new(
             subnet.addr().octets()[0],

@@ -580,10 +580,40 @@ pub async fn scan_subnet_ext(
         }
 
         // Probe AI Agent & Local LLM Runtimes (Ollama 11434, LM Studio 1234, vLLM 8000, LocalAI 8080, MCP)
+        let is_local_machine = if let Ok(info) = crate::net::interface::detect_local_network() {
+            info.ip == host.ip
+        } else {
+            false
+        };
+
         let open_port_nums: Vec<u16> = host.open_ports.iter().map(|p| p.port).collect();
-        if open_port_nums.iter().any(|&p| matches!(p, 11434 | 1234 | 8000 | 8080 | 5000 | 3000 | 80 | 443))
-            && let Some(ai_info) = crate::probes::ai::probe_ai_runtime(host.ip, &open_port_nums, Duration::from_millis(400)).await
+
+        // If scanning the local host, also probe loopback (default Ollama/LM Studio bind address)
+        let local_ai = if is_local_machine {
+            let loopback = Ipv4Addr::new(127, 0, 0, 1);
+            crate::probes::ai::probe_ai_runtime(
+                loopback,
+                &[11434, 1234, 8000, 8080],
+                Duration::from_millis(300),
+            )
+            .await
+        } else {
+            None
+        };
+
+        let detected_ai = if local_ai.is_some() {
+            local_ai
+        } else if open_port_nums
+            .iter()
+            .any(|&p| matches!(p, 11434 | 1234 | 8000 | 8080 | 5000 | 3000 | 80 | 443))
         {
+            crate::probes::ai::probe_ai_runtime(host.ip, &open_port_nums, Duration::from_millis(400))
+                .await
+        } else {
+            None
+        };
+
+        if let Some(ai_info) = detected_ai {
             if host.hostname.is_none()
                 || host.hostname.as_deref() == Some("?")
                 || host.hostname.as_deref() == Some("-")
@@ -695,7 +725,7 @@ impl ScannerBuilder {
         Self {
             target: None,
             interface: None,
-            ports: parse_ports("21,22,23,25,53,80,161,443,445,1234,8080,8443,11434").unwrap(),
+            ports: parse_ports("21,22,23,25,53,80,161,443,445,1234,8000,8080,8443,11434").unwrap(),
             concurrency: 256,
             timeout: Duration::from_millis(800),
             enable_deep: true,

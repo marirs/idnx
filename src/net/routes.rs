@@ -7,6 +7,7 @@ use ipnet::Ipv4Net;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Represents a route learned directly from the kernel routing table
@@ -290,24 +291,31 @@ pub async fn derive_adjacent_candidate_gateways(
         }
     }
 
+    // Ingest active UPnP/SSDP devices
+    let upnp_devices =
+        crate::probes::upnp::discover_upnp_devices(Duration::from_millis(300)).await;
+    for dev in upnp_devices {
+        if !parent_cidr.contains(&dev.ip) && is_rfc1918(&dev.ip) {
+            let octets = dev.ip.octets();
+            if let Ok(sub) = Ipv4Net::new(Ipv4Addr::new(octets[0], octets[1], octets[2], 0), 24) {
+                candidates.insert((dev.ip, sub));
+            }
+        }
+    }
+
     // 3. Dynamic candidate generation for the active subnet class:
     let octets = parent_cidr.addr().octets();
     if octets[0] == 192 && octets[1] == 168 {
-        // Probe neighboring /24s in the local /16 block
-        let current_third = octets[2];
-        for delta in [-2i16, -1, 1, 2, 3] {
-            let target_third = current_third as i16 + delta;
-            if (1..=254).contains(&target_third) {
-                let third = target_third as u8;
-                let gw1 = Ipv4Addr::new(192, 168, third, 1);
-                let gw254 = Ipv4Addr::new(192, 168, third, 254);
-                if let Ok(net) = Ipv4Net::new(Ipv4Addr::new(192, 168, third, 0), 24) {
-                    if !parent_cidr.contains(&gw1) {
-                        candidates.insert((gw1, net));
-                    }
-                    if !parent_cidr.contains(&gw254) {
-                        candidates.insert((gw254, net));
-                    }
+        // Probe all 254 /24 subnets in 192.168.0.0/16 checking both .1 and .254
+        for third in 1..=254 {
+            let gw1 = Ipv4Addr::new(192, 168, third, 1);
+            let gw254 = Ipv4Addr::new(192, 168, third, 254);
+            if let Ok(net) = Ipv4Net::new(Ipv4Addr::new(192, 168, third, 0), 24) {
+                if !parent_cidr.contains(&gw1) {
+                    candidates.insert((gw1, net));
+                }
+                if !parent_cidr.contains(&gw254) {
+                    candidates.insert((gw254, net));
                 }
             }
         }
