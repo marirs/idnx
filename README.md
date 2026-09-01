@@ -10,7 +10,7 @@
 ```
 
 [![CI](https://github.com/marirs/idnx/actions/workflows/ci.yml/badge.svg)](https://github.com/marirs/idnx/actions/workflows/ci.yml)
-![Windows](https://shields.io) ![macOS](https://shields.io) ![Linux](https://shields.io)
+![Platform](https://img.shields.io/badge/platform-windows%20|%20macos%20|%20linux-blue?logo=gnubash&logoColor=white)
 
 **idNX** is a fast, asynchronous network discovery and deep infrastructure exploration utility and Rust library.
 
