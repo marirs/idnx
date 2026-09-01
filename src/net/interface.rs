@@ -8,6 +8,7 @@ pub struct LocalNetworkInfo {
     pub interface_name: String,
     pub ip: Ipv4Addr,
     pub netmask: Ipv4Addr,
+    #[allow(dead_code)]
     pub prefix_len: u8,
     pub cidr: Ipv4Net,
 }

@@ -144,25 +144,53 @@ pub fn print_topology_tree(
                     services_summary.join(", ").dimmed()
                 );
             }
+        }
+    }
 
-            // If downstream child networks were discovered for this router, branch them
-            for child in child_networks {
-                println!(
-                    "{}{}└── 🌐 Discovered Subnet: {} [{} hosts]",
-                    indent,
-                    sub_indent,
-                    child.cidr.to_string().cyan().bold(),
-                    child.summary.active_hosts.len()
-                );
-                for ch in &child.summary.active_hosts {
-                    println!(
-                        "{}{}    ├── {} ({})",
-                        indent,
-                        sub_indent,
-                        ch.ip.to_string().cyan(),
-                        ch.hostname.as_deref().unwrap_or("Host")
-                    );
+    // Render discovered cascaded child networks
+    if !child_networks.is_empty() {
+        println!(
+            "├── 🌐 {}",
+            "Cascaded Downstream Subnets (Discovered Routers & Switches)"
+                .bold()
+                .yellow()
+        );
+        for (c_idx, child) in child_networks.iter().enumerate() {
+            let is_last_subnet = c_idx == child_networks.len() - 1;
+            let sub_branch = if is_last_subnet {
+                "└──"
+            } else {
+                "├──"
+            };
+            let sub_indent = if is_last_subnet { "    " } else { "│   " };
+            println!(
+                "│   {} Subnet: {} [{} hosts active]",
+                sub_branch,
+                child.cidr.to_string().cyan().bold(),
+                child.summary.active_hosts.len()
+            );
+            for (h_idx, ch) in child.summary.active_hosts.iter().enumerate() {
+                let h_branch = if h_idx == child.summary.active_hosts.len() - 1 {
+                    "└──"
+                } else {
+                    "├──"
+                };
+                let mut h_desc = ch.ip.to_string().cyan().bold().to_string();
+                if let Some(ref name) = ch.hostname {
+                    h_desc = format!("{} [{}]", h_desc, name.magenta().bold());
                 }
+                if let Some(ref vendor) = ch.vendor {
+                    h_desc = format!("{} ({})", h_desc, vendor.green());
+                }
+                let ports_str: Vec<String> = ch
+                    .open_ports
+                    .iter()
+                    .map(|p| format!("{}/{}", p.port, p.service))
+                    .collect();
+                if !ports_str.is_empty() {
+                    h_desc = format!("{} [{}]", h_desc, ports_str.join(", ").yellow());
+                }
+                println!("│   {}    {} {}", sub_indent, h_branch, h_desc);
             }
         }
     }

@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct UpnpDevice {
     pub ip: Ipv4Addr,
     pub location: Option<String>,

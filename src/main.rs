@@ -27,6 +27,11 @@ const BANNER: &str = r#"
 )]
 struct Cli {
     /// Target CIDR network, IP, or interface name to scan (e.g. 192.168.1.0/24 or en0).
+    /// If omitted, automatically detects and scans the active local network.
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
+
+    /// Target CIDR network, IP, or interface name to scan (e.g. 192.168.1.0/24 or en0).
     /// If flag is specified without an argument, auto-detects the local subnet.
     #[arg(
         short,
@@ -52,19 +57,15 @@ struct Cli {
     #[arg(short, long, default_value_t = 256)]
     concurrency: usize,
 
-    /// Enable deep infrastructure exploration (SNMP, router & switch interrogation)
+    /// Disable deep downstream infrastructure exploration
     #[arg(long, default_value_t = false)]
-    deep: bool,
+    no_deep: bool,
 
     /// SNMP community strings for deep exploration (comma-separated)
     #[arg(long, default_value = "public,private")]
     snmp_communities: String,
 
-    /// Recursively scan newly discovered subnets from routing tables
-    #[arg(short, long, default_value_t = false)]
-    recursive: bool,
-
-    /// Comma-separated list of child/downstream subnets to explore (e.g. 192.168.58.0/24,192.168.92.0/24)
+    /// Comma-separated list of child/downstream subnets to explore (e.g. 192.168.58.0/24)
     #[arg(long)]
     subnets: Option<String>,
 
@@ -115,8 +116,9 @@ async fn main() {
     }
 
     // Determine target CIDR network
+    let target_input = cli.target.as_deref().or(cli.scan.as_deref());
     let (target_cidr, local_info_opt) =
-        match net::interface::resolve_target(cli.scan.as_deref(), cli.interface.as_deref()) {
+        match net::interface::resolve_target(target_input, cli.interface.as_deref()) {
             Ok(resolved) => resolved,
             Err(e) => {
                 eprintln!("{} Target resolution failed: {}", "[!]".red().bold(), e);
@@ -158,9 +160,9 @@ async fn main() {
         cli.timeout
     );
 
-    if cli.deep {
+    if !cli.no_deep {
         println!(
-            "{} Deep mode enabled. Probing router management endpoints and child subnets...",
+            "{} Deep mode active. Probing router management endpoints and child subnets...",
             "[*]".blue().bold(),
         );
     }
@@ -186,8 +188,8 @@ async fn main() {
     )
     .await;
 
-    // Explore downstream child networks if deep mode or subnets specified
-    let child_networks = if cli.deep || cli.subnets.is_some() {
+    // Explore downstream child networks by default (unless --no-deep specified)
+    let child_networks = if !cli.no_deep || cli.subnets.is_some() {
         println!(
             "{} Probing downstream networks and cascaded subnets...",
             "[*]".blue().bold()
