@@ -55,7 +55,6 @@ fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<String> {
                 return None;
             }
             if !jumped {
-                offset += 2;
                 jumped = true;
             }
             offset = ptr_offset;
@@ -178,8 +177,7 @@ fn extract_ptr_target(packet: &[u8]) -> Option<String> {
 
         if offset + 10 <= packet.len() {
             let rtype = ((packet[offset] as u16) << 8) | (packet[offset + 1] as u16);
-            let rdlength =
-                ((packet[offset + 8] as u16) << 8) | (packet[offset + 9] as u16) as usize;
+            let rdlength = (((packet[offset + 8] as usize) << 8) | (packet[offset + 9] as usize));
             offset += 10;
 
             if rtype == 12 && offset + rdlength <= packet.len() {

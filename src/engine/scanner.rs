@@ -320,6 +320,24 @@ pub async fn scan_subnet(
         bar.finish_and_clear();
     }
 
+    // 4. Resolve mDNS hostnames for all active hosts (e.g. Srirams-Mac-Studio)
+    let active_ips: Vec<Ipv4Addr> = host_results.keys().copied().collect();
+    let mdns_names =
+        crate::net::mdns::resolve_mdns_hostnames(&active_ips, Duration::from_millis(500)).await;
+    for (ip, name) in mdns_names {
+        if let Some(host) = host_results.get_mut(&ip) {
+            let is_generic = host.hostname.as_deref().map_or(true, |h| {
+                h == "?"
+                    || h == "-"
+                    || h.eq_ignore_ascii_case("mac")
+                    || h.eq_ignore_ascii_case("unknown")
+            });
+            if is_generic {
+                host.hostname = Some(name);
+            }
+        }
+    }
+
     let mut active_hosts: Vec<HostResult> = host_results.into_values().collect();
     active_hosts.sort_by_key(|h| h.ip);
 
