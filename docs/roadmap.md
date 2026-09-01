@@ -61,7 +61,7 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 7: AI Agent & LLM Runtime Fingerprinting -> [ACTIVE - NEXT UP]
+### Milestone 7: AI Agent & LLM Runtime Fingerprinting (v0.2.2) -> [ACTIVE - NEXT UP]
 - [ ] Local LLM runtime detector (Ollama `11434`, LM Studio `1234`, vLLM `8000`, LocalAI `8080`, Text-generation-webui `5000`).
 - [ ] Active model inventory extractor (`/v1/models` and `/api/tags` to identify loaded models like `llama3.2`, `deepseek-r1`).
 - [ ] Model Context Protocol (MCP) server detector (JSON-RPC 2.0 / SSE endpoint discovery).
