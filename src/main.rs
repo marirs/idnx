@@ -2,6 +2,7 @@ mod engine;
 mod fingerprint;
 mod net;
 mod output;
+mod probes;
 
 use clap::Parser;
 use colored::*;
@@ -63,6 +64,14 @@ struct Cli {
     #[arg(short, long, default_value_t = false)]
     recursive: bool,
 
+    /// Comma-separated list of child/downstream subnets to explore (e.g. 192.168.58.0/24,192.168.92.0/24)
+    #[arg(long)]
+    subnets: Option<String>,
+
+    /// Physical unmanaged switches to document in the topology tree (e.g. "UGREEN 6-Port PoE, TP-Link LS1005")
+    #[arg(long)]
+    switches: Option<String>,
+
     /// List all local network interfaces and exit
     #[arg(long, default_value_t = false)]
     list_interfaces: bool,
@@ -79,63 +88,64 @@ fn print_banner() {
 
 #[tokio::main]
 async fn main() {
-    print_banner();
-
     let cli = Cli::parse();
 
+    print_banner();
+
+    // If --list-interfaces requested, display and exit
     if cli.list_interfaces {
-        println!("{} Enumerating local IPv4 interfaces:\n", "[*]".blue().bold());
         match net::interface::list_ipv4_interfaces() {
             Ok(ifaces) => {
+                println!("{}", "Available IPv4 Network Interfaces:".green().bold());
                 for iface in ifaces {
                     println!(
-                        "  • {} -> IP: {} | Mask: {} | Subnet: {}",
-                        iface.interface_name.green().bold(),
+                        "  • {:<10} IP: {:<16} Netmask: {:<16} Subnet: {}",
+                        iface.interface_name.cyan().bold(),
                         iface.ip.to_string().yellow(),
                         iface.netmask.to_string().dimmed(),
-                        iface.cidr.to_string().cyan()
+                        iface.cidr.to_string().bold()
                     );
                 }
             }
-            Err(e) => eprintln!("{} Error reading interfaces: {}", "[!]".red().bold(), e),
+            Err(e) => {
+                eprintln!("{} Failed to list interfaces: {}", "[!]".red().bold(), e);
+            }
         }
         return;
     }
 
-    let target_input = cli.scan.as_deref().or(if cli.interface.is_some() {
-        None
-    } else {
-        Some("auto")
-    });
-
+    // Determine target CIDR network
     let (target_cidr, local_info_opt) =
-        match net::interface::resolve_target(target_input, cli.interface.as_deref()) {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("{} Target resolution failed: {}", "[!]".red().bold(), e);
-                std::process::exit(1);
-            }
-        };
-
-    let iface_filter = local_info_opt.as_ref().map(|info| info.interface_name.as_str());
+        match net::interface::resolve_target(cli.scan.as_deref(), cli.interface.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("{} Target resolution failed: {}", "[!]".red().bold(), e);
+            std::process::exit(1);
+        }
+    };
 
     if let Some(ref info) = local_info_opt {
         println!(
             "{} Target network on {}: {} (Subnet: {})",
             "[*]".blue().bold(),
-            info.interface_name.green().bold(),
-            format!("{}/{}", info.ip, info.prefix_len).yellow(),
-            info.cidr.to_string().cyan().bold()
+            info.interface_name.cyan().bold(),
+            format!("{}/{}", info.ip, info.cidr.prefix_len()).yellow(),
+            info.cidr.to_string().bold()
         );
     }
 
     let ports = match engine::scanner::parse_ports(&cli.ports) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{} Invalid port specification: {}", "[!]".red().bold(), e);
+            eprintln!("{} Port parsing error: {}", "[!]".red().bold(), e);
             std::process::exit(1);
         }
     };
+
+    let iface_filter = cli
+        .interface
+        .as_deref()
+        .or_else(|| local_info_opt.as_ref().map(|info| info.interface_name.as_str()));
 
     println!(
         "{} Target: {} ({} hosts) | Ports: {} probed | Concurrency: {} | Timeout: {}ms",
@@ -149,9 +159,8 @@ async fn main() {
 
     if cli.deep {
         println!(
-            "{} Deep mode enabled. SNMP communities: {}",
+            "{} Deep mode enabled. Probing router management endpoints and child subnets...",
             "[*]".blue().bold(),
-            cli.snmp_communities.cyan()
         );
     }
 
@@ -176,8 +185,38 @@ async fn main() {
     )
     .await;
 
+    // Explore downstream child networks if deep mode or subnets specified
+    let child_networks = if cli.deep || cli.subnets.is_some() {
+        println!(
+            "{} Probing downstream networks and cascaded subnets...",
+            "[*]".blue().bold()
+        );
+        engine::deep::explore_downstream_networks(
+            &target_cidr,
+            cli.subnets.as_deref(),
+            &ports,
+            cli.concurrency,
+            timeout_duration,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
+    let physical_switches: Vec<&str> = cli
+        .switches
+        .as_deref()
+        .map(|s| s.split(',').map(|item| item.trim()).filter(|item| !item.is_empty()).collect())
+        .unwrap_or_default();
+
     // 1. Render Network Topology Tree
-    output::tree::print_topology_tree(&target_cidr, local_info_opt.as_ref(), &summary);
+    output::tree::print_topology_tree(
+        &target_cidr,
+        local_info_opt.as_ref(),
+        &summary,
+        &physical_switches,
+        &child_networks,
+    );
 
     // 2. Render Detailed Results Table
     output::terminal::print_scan_results(&summary);

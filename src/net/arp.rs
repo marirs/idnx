@@ -32,32 +32,14 @@ pub fn normalize_mac(mac_str: &str) -> String {
         .join(":")
 }
 
-/// Basic OUI vendor lookup for common router and consumer devices
+/// OUI vendor and randomized MAC lookup using the embedded IEEE database
 pub fn lookup_vendor(mac: &str) -> Option<String> {
-    let normalized = normalize_mac(mac);
-    let parts: Vec<&str> = normalized.split(':').collect();
-    if parts.len() < 3 {
-        return None;
+    let info = crate::fingerprint::oui::lookup_mac(mac);
+    if info.vendor.is_some() || info.is_randomized {
+        Some(info.display_label())
+    } else {
+        None
     }
-    let prefix = format!("{}:{}:{}", parts[0], parts[1], parts[2]).to_lowercase();
-
-    let vendor = match prefix.as_str() {
-        "74:12:13" => "Linksys",
-        "c4:f7:c1" => "Tuya Smart",
-        "7c:c2:94" => "Xiaomi / Smartmi",
-        "58:02:05" => "Positive Grid (Spark)",
-        "d4:dc:cd" | "68:5e:dd" | "5e:8e:44" | "a0:ad:9f" | "14:d8:81" | "16:c7:37" => "Apple",
-        "00:1a:2b" | "00:0c:29" => "Cisco / VMware",
-        "b4:fb:e4" | "fc:ec:da" | "24:a0:74" => "Ubiquiti",
-        "48:8f:5a" | "cc:2d:e0" => "MikroTik",
-        "ec:08:6b" | "08:55:31" => "TP-Link",
-        "00:26:86" | "98:fc:11" => "Netgear",
-        "00:11:32" => "Synology",
-        "2c:fd:a1" | "b8:27:eb" | "dc:a6:32" | "e4:5f:01" => "Raspberry Pi",
-        _ => return None,
-    };
-
-    Some(vendor.to_string())
 }
 
 /// Reads the operating system's ARP table

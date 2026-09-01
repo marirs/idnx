@@ -1,3 +1,4 @@
+use crate::engine::deep::ChildNetworkResult;
 use crate::engine::scanner::{HostResult, ScanSummary};
 use crate::fingerprint::classifier::{classify_host, DeviceRole};
 use crate::net::interface::LocalNetworkInfo;
@@ -8,6 +9,8 @@ pub fn print_topology_tree(
     target_cidr: &Ipv4Net,
     local_info_opt: Option<&LocalNetworkInfo>,
     summary: &ScanSummary,
+    physical_switches: &[&str],
+    child_networks: &[ChildNetworkResult],
 ) {
     if summary.active_hosts.is_empty() {
         return;
@@ -46,24 +49,26 @@ pub fn print_topology_tree(
         }
     }
 
-    let mut categories: Vec<(&'static str, &'static str, &Vec<&HostResult>)> = Vec::new();
+    let mut categories: Vec<(&'static str, &'static str, Vec<&HostResult>)> = Vec::new();
     if !gateways.is_empty() {
-        categories.push(("📡", "Gateways & Routers", &gateways));
+        categories.push(("📡", "Gateways & Routers", gateways));
     }
     if !switches.is_empty() {
-        categories.push(("🔀", "Managed Switches & Infrastructure", &switches));
+        categories.push(("🔀", "Managed Switches & Infrastructure", switches));
     }
     if !workstations.is_empty() {
-        categories.push(("💻", "Workstations, Laptops & Servers", &workstations));
+        categories.push(("💻", "Workstations, Laptops & Servers", workstations));
     }
     if !smart_devices.is_empty() {
-        categories.push(("🔌", "IoT & Connected Smart Devices", &smart_devices));
+        categories.push(("🔌", "IoT & Connected Smart Devices", smart_devices));
     }
     if !generic_hosts.is_empty() {
-        categories.push(("❓", "Other Active Hosts", &generic_hosts));
+        categories.push(("❓", "Other Active Hosts", generic_hosts));
     }
 
-    let total_cats = categories.len();
+    let has_switches_section = !physical_switches.is_empty();
+    let total_cats = categories.len() + if has_switches_section { 1 } else { 0 };
+
     for (cat_idx, (icon, cat_name, hosts)) in categories.iter().enumerate() {
         let is_last_cat = cat_idx == total_cats - 1;
         let cat_branch = if is_last_cat { "└──" } else { "├──" };
@@ -101,7 +106,6 @@ pub fn print_topology_tree(
                 label = format!("{} {}", label, "[Local Machine]".green().bold());
             }
 
-            // If ports open, append compact summary
             let open_ports_str: Vec<String> = host
                 .open_ports
                 .iter()
@@ -127,6 +131,35 @@ pub fn print_topology_tree(
                     services_summary.join(", ").dimmed()
                 );
             }
+
+            // If downstream child networks were discovered for this router, branch them
+            for child in child_networks {
+                println!(
+                    "{}{}└── 🌐 Discovered Subnet: {} [{} hosts]",
+                    indent,
+                    sub_indent,
+                    child.cidr.to_string().cyan().bold(),
+                    child.summary.active_hosts.len()
+                );
+                for ch in &child.summary.active_hosts {
+                    println!(
+                        "{}{}    ├── {} ({})",
+                        indent,
+                        sub_indent,
+                        ch.ip.to_string().cyan(),
+                        ch.hostname.as_deref().unwrap_or("Host")
+                    );
+                }
+            }
+        }
+    }
+
+    // Render physical unmanaged switches if provided
+    if has_switches_section {
+        println!("└── 🔀 {}", "Physical Switches (Unmanaged Layer 2)".bold().yellow());
+        for (i, sw) in physical_switches.iter().enumerate() {
+            let branch = if i == physical_switches.len() - 1 { "    └──" } else { "    ├──" };
+            println!("{} {}", branch, sw.blue().bold());
         }
     }
 }

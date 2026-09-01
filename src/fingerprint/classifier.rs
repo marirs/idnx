@@ -49,18 +49,18 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
     let octets = host.ip.octets();
     let last_octet = octets[3];
 
-    // 1. Gateway / Router Identification
+    // 1. Gateway / Router Identification (Primary Gateway or Downstream Sub-Router)
     if is_default_gateway
+        || vendor_lower.contains("asus")
+        || vendor_lower.contains("linksys")
+        || vendor_lower.contains("mikrotik")
+        || vendor_lower.contains("ubiquiti")
+        || hostname_lower.contains("router")
+        || hostname_lower.contains("gateway")
         || (last_octet == 1 || last_octet == 254)
-            && (vendor_lower.contains("linksys")
-                || vendor_lower.contains("cisco")
+            && (vendor_lower.contains("cisco")
                 || vendor_lower.contains("netgear")
-                || vendor_lower.contains("mikrotik")
                 || vendor_lower.contains("tp-link")
-                || vendor_lower.contains("ubiquiti")
-                || hostname_lower.contains("router")
-                || hostname_lower.contains("gateway")
-                || hostname_lower.contains("linksys")
                 || has_http_or_https)
     {
         return DeviceRole::GatewayRouter;
@@ -74,12 +74,32 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         return DeviceRole::Switch;
     }
 
-    // 3. IoT & Smart Devices
+    // 3. Workstations, Laptops & Servers (including DGX / AI Compute Nodes)
+    if hostname_lower.contains("mac")
+        || hostname_lower.contains("air")
+        || hostname_lower.contains("mini")
+        || hostname_lower.contains("pro")
+        || hostname_lower.contains("pc")
+        || hostname_lower.contains("desktop")
+        || hostname_lower.contains("laptop")
+        || hostname_lower.contains("server")
+        || hostname_lower.contains("dgx")
+        || hostname_lower.contains("thinkpad")
+        || hostname_lower.contains("dell")
+        || hostname_lower.contains("ubuntu")
+        || hostname_lower.contains("debian")
+        || vendor_lower.contains("nvidia")
+        || vendor_lower.contains("azurewave")
+        || (hostname_lower.contains("spark") && has_ssh)
+        || has_ssh
+    {
+        return DeviceRole::Workstation;
+    }
+
+    // 4. IoT & Connected Smart Devices
     if vendor_lower.contains("tuya")
         || vendor_lower.contains("xiaomi")
         || vendor_lower.contains("smartmi")
-        || vendor_lower.contains("positive grid")
-        || vendor_lower.contains("spark")
         || vendor_lower.contains("espressif")
         || vendor_lower.contains("sonos")
         || vendor_lower.contains("roku")
@@ -87,7 +107,6 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         || vendor_lower.contains("philips")
         || hostname_lower.contains("fan")
         || hostname_lower.contains("miapd")
-        || hostname_lower.contains("spark")
         || hostname_lower.contains("light")
         || hostname_lower.contains("bulb")
         || hostname_lower.contains("plug")
@@ -97,24 +116,6 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         || hostname_lower.contains("room")
     {
         return DeviceRole::SmartDevice;
-    }
-
-    // 4. Workstations, Laptops & Servers
-    if hostname_lower.contains("mac")
-        || hostname_lower.contains("air")
-        || hostname_lower.contains("mini")
-        || hostname_lower.contains("pro")
-        || hostname_lower.contains("pc")
-        || hostname_lower.contains("desktop")
-        || hostname_lower.contains("laptop")
-        || hostname_lower.contains("server")
-        || hostname_lower.contains("thinkpad")
-        || hostname_lower.contains("dell")
-        || hostname_lower.contains("ubuntu")
-        || hostname_lower.contains("debian")
-        || has_ssh
-    {
-        return DeviceRole::Workstation;
     }
 
     DeviceRole::GenericHost
@@ -165,5 +166,25 @@ mod tests {
             min_latency: None,
         };
         assert_eq!(classify_host(&host, false), DeviceRole::SmartDevice);
+    }
+
+    #[test]
+    fn test_classify_dgx_server() {
+        use crate::engine::scanner::{PortInfo, PortStatus};
+        let host = HostResult {
+            ip: Ipv4Addr::new(192, 168, 1, 173),
+            is_alive: true,
+            hostname: Some("spark-48f8".to_string()),
+            mac_address: Some("58:02:05:d1:70:62".to_string()),
+            vendor: Some("AzureWave (NVIDIA DGX / Compute Node)".to_string()),
+            open_ports: vec![PortInfo {
+                port: 22,
+                status: PortStatus::Open,
+                latency: None,
+                service: "ssh",
+            }],
+            min_latency: None,
+        };
+        assert_eq!(classify_host(&host, false), DeviceRole::Workstation);
     }
 }

@@ -148,16 +148,6 @@ pub fn resolve_target(
     let normalized = if target.contains('/') {
         target.to_string()
     } else {
-        // If single IP, check if it matches a local interface's subnet
-        if let Ok(ip) = Ipv4Addr::from_str(target) {
-            if let Ok(all) = list_ipv4_interfaces() {
-                for iface in all {
-                    if iface.cidr.contains(&ip) {
-                        return Ok((iface.cidr, Some(iface)));
-                    }
-                }
-            }
-        }
         format!("{}/32", target)
     };
 
