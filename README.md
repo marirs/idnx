@@ -9,126 +9,202 @@
  |_|\__,_|_| \_| /_/\_\  v0.1.0
 ```
 
-**idNX** is a fast, asynchronous network discovery and deep infrastructure exploration utility written in Rust.
+**idNX** is a fast, asynchronous network discovery and deep infrastructure exploration utility and Rust library.
 
-While traditional network scanners (like Nmap) focus primarily on data-plane port probing within directly reachable subnets, **idNX digs deeper into the control plane**. When it discovers routers, Layer 3 managed switches, or gateways, it interrogates their management protocols (SNMP, LLDP, CDP, UPnP/SSDP) to harvest hidden VLANs, routing tables, and remote ARP caches—mapping networks you couldn't otherwise see.
-
----
-
-## ✨ Features
-
-- **⚡ Lightning-Fast Asynchronous Sweeps:** Powered by `tokio` for massive concurrency across wide CIDR blocks.
-- **🛰️ Deep Infrastructure Harvesting:**
-  - **SNMP Route & Interface Walking:** Extracts all IP interfaces (`ipAddrTable`) and full routing tables (`ipRouteTable` / `inetCidrRouteTable`).
-  - **ARP Cache Harvesting:** Dumps the router's active ARP cache (`ipNetToMediaTable`), uncovering live IP/MAC pairs across isolated VLANs without needing direct routing to them.
-- **🔍 Layer 2 Discovery:**
-  - Passive & active interrogation of LLDP (802.1AB), CDP (Cisco Discovery Protocol), and MNDP (MikroTik Neighbor Discovery Protocol).
-  - Uncovers switch ports, neighbor topologies, and native VLAN IDs.
-- **📡 UPnP / SSDP Gateway Interrogation:** Queries consumer/prosumer routers for external WAN IPs, gateway configs, and port-forwarding rules.
-- **🔄 Recursive Pivot Exploration:** Automatically schedules secondary sweeps against newly discovered internal subnets.
-- **🌳 Topology Tree Visualization:** Clean, colorized terminal hierarchy showing Switch ➔ VLAN ➔ Router ➔ Host relationships.
-- **📊 Modern CLI & Export:** Rich terminal tables, interactive progress bars, and JSON/graph export options.
+While traditional network scanners (such as Nmap, Angry IP, or Advanced IP Scanner) only sweep a single flat CIDR block, **idNX synthesizes control-plane, data-plane, and Layer 2 link-layer intelligence** to reconstruct the entire multi-tier network topology—including managed switches, cascaded downstream routers, parent WANs, VLANs, and connected IoT devices.
 
 ---
 
-## 🏗️ Deep Exploration in Action
+## ⚡ Why idNX? (Beyond Traditional Scanners)
 
-```
-                  ┌──────────────────────────────────────────────┐
-                  │                 idNX Scanner                 │
-                  └───────┬──────────────┬──────────────┬────────┘
-                          │              │              │
-                    (1) SNMP       (2) L2 Discovery   (3) UPnP/SSDP
-                    UDP 161        CDP/LLDP/MNDP      UDP 1900
-                          │              │              │
-                          ▼              ▼              ▼
-           ┌────────────────────────────────────────────────────────────┐
-           │                  Router / Managed Switch                   │
-           │                                                            │
-           │  • Interface Table    --> VLAN 10 (10.0.10.1), VLAN 20 ... │
-           │  • Route Table        --> 10.0.10.0/24, 192.168.20.0/24... │
-           │  • ARP Cache (L3)     --> 10.0.10.45 (MAC), 10.0.10.88 ... │
-           │  • Bridge FDB (L2)    --> Port 4: MAC a4:b1:..., VLAN 10   │
-           └────────────────────────────────────────────────────────────┘
+### 1. Commercial Scanners Look at One Flat Subnet
+> **The Blindspot:** Tools like **Nmap, Angry IP Scanner, or Advanced IP Scanner** assume a network is just a single, flat CIDR block (e.g. `192.168.1.0/24`). If you have downstream routers (`192.168.51.0/24`), secondary guest/travel APs (`192.168.50.0/24`), or isolated PoE switch management subnets (`192.168.70.0/24`), **traditional tools are completely blind to them**.
+>
+> **The idNX Solution:** idNX automatically detects and pivots into adjacent, parent WAN, and cascaded child subnets using multi-signal RFC 1918 gateway probes, Unicast DNS PTR synthesis, and Layer 2 frame sniffing—reconstructing the true multi-tier topology.
+
+### 2. Rogue Device & Shadow IT Detection
+> **The Enterprise Risk:** In corporate, campus, and lab environments, employees or contractors frequently plug unmanaged Wi-Fi access points, travel routers, or desktop switches into office Ethernet wall jacks. Standard port scanners see only a single IP responding and never investigate what is running behind it.
+>
+> **The idNX Solution:** idNX synthesizes **Layer 2 wire sniffing (LLDP/CDP/MNDP)**, **UPnP hardware XML descriptors**, **asynchronous ICMP stealth sweeps**, and **RFC 1918 gateway sweeps** to uncover hidden downstream networks, identify switch ports, and flag rogue infrastructure instantly.
+
+---
+
+## 🏗️ How idNX Maps the Complete Network Picture
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          idNX Discovery Engine                              │
+└──────┬──────────────────┬─────────────────┬──────────────────┬──────────────┘
+       │                  │                 │                  │
+(1) L2 Sniffer     (2) Dual DNS      (3) UPnP XML       (4) RFC 1918 Gateway
+    LLDP/CDP/MNDP      mDNS + Unicast    Device Hardware    Sweep & ICMP Fallback
+       │                  │                 │                  │
+       ▼                  ▼                 ▼                  ▼
+┌──────────────┐   ┌──────────────┐  ┌──────────────┐   ┌─────────────────────┐
+│ Switch Ports │   │ Hostnames &  │  │ Model, Serial│   │ Cascaded & Adjacent │
+│ & Topologies │   │ IoT Roles    │  │ & Mfg Data   │   │ Subnets Traversed   │
+└──────────────┘   └──────────────┘  └──────────────┘   └─────────────────────┘
 ```
 
+1. **Auto-Detects Local Network & Link Speed:** Immediately detects the active interface, subnet CIDR, and real-time physical link speed (e.g. `10 Gbps Full-Duplex` or `2.16 Gbps Wi-Fi 6E 160MHz`).
+2. **Passive & Active Layer 2 Hardware Discovery:** Decodes IEEE 802.1AB **LLDP**, Cisco **CDP**, and MikroTik **MNDP** frames off the wire to map physical switch chassis, port IDs, native VLANs, and RouterOS boards.
+3. **Dual-Mode Name Synthesis:** Queries local Multicast DNS (RFC 6762) for `.local` names **and** sends RFC 1035 Unicast DNS PTR queries directly to gateway DNS servers (e.g. dnsmasq) to extract hostnames across routed subnets.
+4. **Cascaded & Adjacent Subnet Traversal:** Probes standard RFC 1918 gateway candidates to detect upstream WANs and downstream router/switch subnets, queuing them for recursive exploration.
+5. **Stealth ICMP Fallback:** Runs parallel ICMP echo sweeps so silent or firewalled hosts without open TCP ports (e.g. Mac-mini, phones, IoT hubs) are never missed.
+6. **Hardware Fingerprinting:** Resolves IEEE registered OUIs, flags IEEE 802 randomized private MAC addresses, interrogates UPnP/SSDP XML descriptors, and grabs SSH/HTTP server banners.
+
 ---
 
-## 🛠️ Getting Started
+## ✨ Core Features
 
-### Prerequisites
+- **⚡ Lightning-Fast Asynchronous Engine:** Powered by `tokio` for massive concurrency across wide CIDR blocks.
+- **🔌 Multi-Protocol L2 Decoders:**
+  - **LLDP (IEEE 802.1AB):** Chassis ID, Port ID, System Name, System Description, Capabilities.
+  - **Cisco CDP:** Device ID, Port ID, Platform/Hardware Model, Software Version, Native VLAN.
+  - **MikroTik MNDP:** RouterOS Identity, Board Name (e.g. `RB5009`, `hEX`), Version, MAC.
+- **🛰️ UPnP / SSDP Hardware Interrogation:** Extracts manufacturer, model name, and descriptions from consumer and enterprise gateways.
+- **🔍 Link Negotiation Detection:** Reports real-time physical link speed (Gbps / Mbps / Wi-Fi generation, frequency, and channel width).
+- **🌳 Unified Topology Tree & Table:** Synchronized hierarchical view showing Gateways, Workstations, Smart Devices, and Cascaded Subnets.
+- **💾 Multi-Format Export:** Export complete network inventories to **JSON**, **YAML**, **XML**, **CSV**, or formatted plain **Text** with automatic `idnx_YYYYMMDD.<ext>` timestamping.
+- **📦 Dual Library + CLI Binary:** Use as a standalone CLI or embed as a Rust crate in custom automation and future UI applications.
 
-Ensure the Rust toolchain is installed:
+---
 
+## 🛠️ Installation & Build
+
+Ensure Rust is installed:
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### Installation & Build
-
+Clone and build:
 ```bash
-git clone https://github.com/yourusername/idnx.git
+git clone https://github.com/marirs/idnx.git
 cd idnx
 cargo build --release
 ```
 
-To install the binary globally:
-
+Install binary globally:
 ```bash
 sudo cp target/release/idnx /usr/local/bin/
 ```
 
 ---
 
-## 🚀 Usage
+## 🚀 Usage & Example Commands
 
-### 1. Basic Host & Port Scan
-Perform a high-speed sweep of a target subnet:
+`idnx` is designed to work with zero configuration out of the box, while offering granular controls for enterprise auditing and custom sweeps.
 
+### 1. Zero-Config Instant Network Scan
+Auto-detects your primary active network interface, discovers your local subnet, inspects link speed, and automatically finds adjacent cascaded subnets:
 ```bash
-# Scan local subnet for common ports
-idnx --scan 192.168.1.0/24 --ports 22,80,443,8080
+idnx
+```
+> **What it does:** Runs an unprivileged multi-threaded scan on your active interface (e.g. `en0`), identifies all live hosts using TCP SYN and ICMP echo fallbacks, queries mDNS and gateway DNS PTR records for hostnames, and probes standard RFC 1918 gateway candidates.
+
+### 2. Full Privileged Discovery (Recommended for Switches)
+Unlocks raw socket packet capture (BPF on macOS, `AF_PACKET` on Linux) to capture wire-level Layer 2 switch advertisements:
+```bash
+sudo idnx
+```
+> **What it does:** Everything in (1), plus listens for IEEE 802.1AB **LLDP** and Cisco **CDP** frames. Identifies connected switch chassis MACs, physical port numbers (e.g. `GigabitEthernet0/1`), native VLANs, and MikroTik **MNDP** identities.
+
+### 3. Multi-Format Asset Inventory Export
+Export complete scan results to disk for spreadsheets, SIEM ingestion, or asset databases:
+```bash
+# Export to JSON (auto-saved as idnx_YYYYMMDD.json)
+idnx --output json
+
+# Export to CSV (perfect for Excel / Google Sheets)
+idnx --output csv
+
+# Export to YAML or XML
+idnx --output yaml
+idnx --output xml
+
+# Export to formatted plain text table (without terminal ANSI codes)
+idnx --output text
+
+# Export to a custom destination file
+sudo idnx --output json --output-file /tmp/datacenter_inventory.json
+```
+> **What it does:** Dumps every discovered device across all local and cascaded networks—including IP, hostname, MAC address, manufacturer OUI, open ports, status, and round-trip latency—into your chosen format.
+
+### 4. Targeting a Specific Subnet & Interface
+Scan a specific corporate VLAN, secondary network card, or VPN tunnel:
+```bash
+# Scan a specific /24 subnet
+idnx --scan 10.10.20.0/24
+
+# Bind explicitly to a specific interface (e.g. eth1, en5, or utun2)
+idnx --scan 192.168.10.0/24 --interface eth1
+```
+> **What it does:** Overrides the automatic interface detector and directs all probes exclusively across the specified subnet and network adapter.
+
+### 5. High-Concurrency Custom Port Audit
+Audit specific service and management ports across large subnets with custom timeouts:
+```bash
+idnx --scan 172.16.0.0/24 --ports 21,22,23,80,443,8080,8443,9000-9050 --concurrency 512 --timeout 300
+```
+> **What it does:** Expands the port list to include custom ranges and increases worker threads to 512 simultaneous probes with an aggressive 300ms connection timeout, completing a 254-host multi-port audit in seconds.
+
+### 6. Deep Multi-Subnet Traversal with Physical Switch Documentation
+Explicitly specify downstream subnets to explore while labeling physical unmanaged switches in the topology tree:
+```bash
+sudo idnx --subnets 192.168.50.0/24,192.168.70.0/24 --switches "UGREEN 6-Port PoE Switch, TP-Link TL-SG105"
+```
+> **What it does:** Traverses your primary network, explores the specified secondary subnets, and places your unmanaged switches directly into the ASCII topology tree hierarchy above their connected endpoints.
+
+### 7. Interface & Network Inspection
+Quickly inspect all detected network interfaces on the local host without scanning:
+```bash
+idnx --list-interfaces
+```
+> **What it does:** Displays all IPv4 and IPv6 network adapters, interface names, loopbacks, and associated CIDR network prefixes detected on the machine.
+
+---
+
+## 📦 Using idNX as a Rust Library
+
+`idnx` is structured as a library (`lib.rs`) alongside the CLI binary (`main.rs`). Add it to your `Cargo.toml`:
+
+```toml
+[dependencies]
+idnx = "0.1.0"
 ```
 
-### 2. Deep Infrastructure Exploration
-Enable deep exploration to interrogate routers and switches:
+```rust
+use idnx::engine::scanner::scan_subnet;
+use idnx::net::interface::detect_local_network;
+use std::time::Duration;
 
-```bash
-# Deep scan with default SNMP communities ('public', 'private')
-idnx --scan 192.168.1.0/24 --deep
+#[tokio::main]
+async fn main() {
+    let local = detect_local_network().expect("Failed to detect network");
+    println!("Scanning {} on {}", local.cidr, local.interface_name);
 
-# Deep scan with custom SNMP communities and recursive pivot
-idnx --scan 10.0.0.0/24 --deep --snmp-communities public,mgmt_ro --recursive
-```
+    let ports = vec![22, 80, 443, 8080];
+    let summary = scan_subnet(local.cidr, &ports, None, 256, Duration::from_millis(500), None).await;
 
-### 3. Layer 2 Discovery Mode
-Listen for and query LLDP/CDP/MNDP broadcast frames:
-
-```bash
-# Listen on interface en0 for switch broadcasts
-idnx --discover-l2 --interface en0
-```
-
-### 4. JSON Output
-Export full network topology and harvested host catalogs:
-
-```bash
-idnx --scan 192.168.1.0/24 --deep --json topology.json
+    for host in summary.active_hosts {
+        println!("Host: {} | Hostname: {:?}", host.ip, host.hostname);
+    }
+}
 ```
 
 ---
 
 ## 📚 Documentation
 
-Deep-dive documentation is available in the [`docs/`](docs/) directory:
+Deep-dive architectural documentation is in [`docs/`](docs/):
 
-- [**Architecture & Design**](docs/architecture.md): Overall modular structure, concurrency model, and data flow.
-- [**Deep Exploration Engine**](docs/deep_exploration.md): How SNMP, ARP harvesting, and routing table extraction work under the hood.
-- [**Supported Protocols & MIBs**](docs/protocols.md): OID references, Layer 2 packet specifications, and UPnP endpoints.
-- [**Roadmap & Implementation Plan**](docs/roadmap.md): Milestones, crate ecosystem choices, and planned features.
+- [**Architecture & Design**](docs/architecture.md): Modular structure, crate layout, and concurrency model.
+- [**Deep Exploration Engine**](docs/deep_exploration.md): Multi-tier traversal, control-plane vs. data-plane, and stealth host discovery.
+- [**Supported Protocols & MIBs**](docs/protocols.md): LLDP, CDP, MNDP, UPnP, and SNMP OID specifications.
+- [**Roadmap & Implementation Plan**](docs/roadmap.md): Current release status and upcoming milestones.
 
 ---
 
 ## 📜 License
 
-This project is licensed under the [MIT License](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE).
