@@ -42,6 +42,8 @@ pub struct NetworkExport {
 pub struct ExportHost {
     pub network: String,
     pub ip: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ipv6_addresses: Vec<String>,
     pub hostname: Option<String>,
     pub mac_address: Option<String>,
     pub vendor: Option<String>,
@@ -65,9 +67,11 @@ pub fn build_export_data(
             .map(|p| format!("{}/{}", p.port, p.service))
             .collect();
         let latency_ms = h.min_latency.map(|d| (d.as_micros() as f64) / 1000.0);
+        let ipv6_strings: Vec<String> = h.ipv6_addrs.iter().map(|ip| ip.to_string()).collect();
         hosts.push(ExportHost {
             network: format!("{} (Local)", primary_cidr),
             ip: h.ip.to_string(),
+            ipv6_addresses: ipv6_strings,
             hostname: h.hostname.clone(),
             mac_address: h.mac_address.clone(),
             vendor: h.vendor.clone(),
@@ -89,9 +93,11 @@ pub fn build_export_data(
                 .map(|p| format!("{}/{}", p.port, p.service))
                 .collect();
             let latency_ms = h.min_latency.map(|d| (d.as_micros() as f64) / 1000.0);
+            let ipv6_strings: Vec<String> = h.ipv6_addrs.iter().map(|ip| ip.to_string()).collect();
             hosts.push(ExportHost {
                 network: format!("{} (Cascaded)", child.cidr),
                 ip: h.ip.to_string(),
+                ipv6_addresses: ipv6_strings,
                 hostname: h.hostname.clone(),
                 mac_address: h.mac_address.clone(),
                 vendor: h.vendor.clone(),
@@ -256,6 +262,7 @@ mod tests {
                     service: "http",
                 }],
                 min_latency: Some(Duration::from_millis(5)),
+                ipv6_addrs: Vec::new(),
             }],
             elapsed: Duration::from_secs(1),
         };

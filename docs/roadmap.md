@@ -52,16 +52,16 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 6: IPv6 Multi-Stack Engine & Neighbor Discovery -> [ACTIVE - NEXT UP]
-- [ ] ICMPv6 Link-Local All-Nodes Multicast Echo Sweep (`ff02::1%<interface>`) for zero-config L2 IPv6 discovery.
-- [ ] Cross-platform NDP (Neighbor Discovery Protocol) cache harvesting (`ndp -an` on macOS, `ip -6 neigh` on Linux, `GetIpNetTable2` on Windows).
-- [ ] mDNS IPv6 resolution (`[ff02::fb]:5353`) for `AAAA` record extraction.
-- [ ] Dual-stack host unification (merging IPv4 and IPv6 addresses under unified MAC-based device nodes).
-- [ ] Router Advertisement (RA) prefix listener (`ICMPv6 type 134`) to detect local `/64` network prefixes and default gateways.
+### Milestone 6: IPv6 Multi-Stack Engine & Neighbor Discovery -> [COMPLETED]
+- [x] ICMPv6 Link-Local All-Nodes Multicast Echo Sweep (`ff02::1%<interface>`) for zero-config L2 IPv6 discovery.
+- [x] Cross-platform NDP (Neighbor Discovery Protocol) cache harvesting (`ndp -an` on macOS, `ip -6 neigh` on Linux, `netsh` on Windows).
+- [x] mDNS IPv6 PTR resolution (`[ff02::fb]:5353` for `ip6.arpa` name resolution).
+- [x] Dual-stack host unification (merging IPv4 and IPv6 addresses under unified MAC-based device nodes).
+- [x] Multi-format IPv6 reporting (terminal table, ASCII topology tree, JSON/YAML/XML/CSV exports, and interactive HTML graph).
 
 ---
 
-### Milestone 7: AI Agent & LLM Runtime Fingerprinting -> [PLANNED]
+### Milestone 7: AI Agent & LLM Runtime Fingerprinting -> [ACTIVE - NEXT UP]
 - [ ] Local LLM runtime detector (Ollama `11434`, LM Studio `1234`, vLLM `8000`, LocalAI `8080`, Text-generation-webui `5000`).
 - [ ] Active model inventory extractor (`/v1/models` and `/api/tags` to identify loaded models like `llama3.2`, `deepseek-r1`).
 - [ ] Model Context Protocol (MCP) server detector (JSON-RPC 2.0 / SSE endpoint discovery).

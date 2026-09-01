@@ -20,6 +20,7 @@ struct GraphNode {
     role: String,
     category: String,
     ip: Option<String>,
+    ipv6: Vec<String>,
     mac: Option<String>,
     vendor: Option<String>,
     hostname: Option<String>,
@@ -61,6 +62,7 @@ pub fn export_interactive_topology_html(
         role: "Subnet".to_string(),
         category: "Network".to_string(),
         ip: None,
+        ipv6: Vec::new(),
         mac: None,
         vendor: None,
         hostname: None,
@@ -80,6 +82,7 @@ pub fn export_interactive_topology_html(
             role: "Switch".to_string(),
             category: "Switch".to_string(),
             ip: None,
+            ipv6: Vec::new(),
             mac: None,
             vendor: None,
             hostname: None,
@@ -125,6 +128,7 @@ pub fn export_interactive_topology_html(
             role: "Cascaded Subnet".to_string(),
             category: "Network".to_string(),
             ip: child.parent_router_ip.map(|ip| ip.to_string()),
+            ipv6: Vec::new(),
             mac: None,
             vendor: None,
             hostname: child.snmp_system_name.clone(),
@@ -207,6 +211,7 @@ fn build_host_node(host: &HostResult) -> GraphNode {
         role: format!("{:?}", role),
         category: category.to_string(),
         ip: Some(host.ip.to_string()),
+        ipv6: host.ipv6_addrs.iter().map(|ip| ip.to_string()).collect(),
         mac: host.mac_address.clone(),
         vendor: host.vendor.clone(),
         hostname: host.hostname.clone(),
@@ -512,6 +517,7 @@ function updateSidebar(node) {{
       </div>
 
       ${{node.ip ? `<div class="meta-row"><span class="meta-label">IP Address:</span><span class="meta-val">${{node.ip}}</span></div>` : ''}}
+      ${{node.ipv6 && node.ipv6.length > 0 ? `<div class="meta-row"><span class="meta-label">IPv6 Address:</span><span class="meta-val">${{node.ipv6.join('<br>')}}</span></div>` : ''}}
       ${{node.mac ? `<div class="meta-row"><span class="meta-label">MAC Address:</span><span class="meta-val">${{node.mac}}</span></div>` : ''}}
       ${{node.vendor ? `<div class="meta-row"><span class="meta-label">OUI Vendor:</span><span class="meta-val">${{node.vendor}}</span></div>` : ''}}
       ${{node.hostname ? `<div class="meta-row"><span class="meta-label">Hostname:</span><span class="meta-val">${{node.hostname}}</span></div>` : ''}}

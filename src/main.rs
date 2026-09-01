@@ -100,6 +100,10 @@ struct Cli {
     #[arg(long = "update-oui", default_value_t = false)]
     update_oui: bool,
 
+    /// Disable IPv6 neighbor discovery and NDP table harvesting
+    #[arg(long = "no-ipv6", default_value_t = false)]
+    no_ipv6: bool,
+
     /// List all local network interfaces and exit
     #[arg(long, default_value_t = false)]
     list_interfaces: bool,

@@ -106,6 +106,16 @@ pub fn print_topology_tree(
             // Build node label
             let mut label = format!("{}", host.ip.to_string().cyan().bold());
 
+            if !host.ipv6_addrs.is_empty() {
+                let v6_str = host
+                    .ipv6_addrs
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                label = format!("{} / {}", label, v6_str.cyan());
+            }
+
             if let Some(ref name) = host.hostname {
                 label = format!("{} [{}]", label, name.magenta().bold());
             }

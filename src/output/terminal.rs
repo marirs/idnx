@@ -82,7 +82,12 @@ pub fn print_scan_results(
 
 fn add_host_row(table: &mut Table, network_label: &str, host: &crate::engine::scanner::HostResult) {
     let net_cell = Cell::new(network_label).fg(TableColor::Cyan);
-    let ip_cell = Cell::new(host.ip.to_string()).fg(TableColor::Cyan);
+    let ip_desc = if host.ipv6_addrs.is_empty() {
+        host.ip.to_string()
+    } else {
+        format!("{}\n{}", host.ip, host.ipv6_addrs[0])
+    };
+    let ip_cell = Cell::new(ip_desc).fg(TableColor::Cyan);
 
     let hostname_desc = host.hostname.as_deref().unwrap_or("-");
     let hostname_cell = Cell::new(hostname_desc).fg(if host.hostname.is_some() {

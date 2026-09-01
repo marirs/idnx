@@ -161,7 +161,24 @@ sudo idnx --subnets 192.168.50.0/24,192.168.70.0/24 --switches "UGREEN 6-Port Po
 ```
 > **What it does:** Traverses your primary network, explores the specified secondary subnets, and places your unmanaged switches directly into the ASCII topology tree hierarchy above their connected endpoints.
 
-### 7. Interface & Network Inspection
+### 7. Dual-Stack IPv6 Neighbor Discovery (NDP)
+`idnx` automatically discovers active IPv6 endpoints on the local Layer 2 broadcast domain using ICMPv6 all-nodes multicast (`ff02::1`) and cross-platform NDP table synthesis, unifying IPv4 and IPv6 addresses under single host cards:
+```bash
+# Standard scan automatically unifies dual-stack IPv4 & IPv6 hosts
+idnx
+
+# Disable IPv6 neighbor discovery if preferred
+idnx --no-ipv6
+```
+
+### 8. Updatable 2-Tier IEEE OUI Engine
+Download the authoritative IEEE OUI hardware vendor registry to keep local vendor resolutions completely up to date:
+```bash
+idnx --update-oui
+```
+> **What it does:** Downloads and compiles the latest IEEE OUI vendor registry to `~/.cache/idnx/oui.txt`, automatically overriding the built-in static table with tens of thousands of newly registered device manufacturers.
+
+### 9. Interface & Network Inspection
 Quickly inspect all detected network interfaces on the local host without scanning:
 ```bash
 idnx --list-interfaces
@@ -176,7 +193,7 @@ idnx --list-interfaces
 
 ```toml
 [dependencies]
-idnx = "0.2.0"
+idnx = "0.2.1"
 ```
 
 Use the ergonomic `ScannerBuilder` to configure and execute network scans:

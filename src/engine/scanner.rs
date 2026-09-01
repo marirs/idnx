@@ -32,6 +32,7 @@ pub struct HostResult {
     pub vendor: Option<String>,
     pub open_ports: Vec<PortInfo>,
     pub min_latency: Option<Duration>,
+    pub ipv6_addrs: Vec<std::net::Ipv6Addr>,
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +370,7 @@ pub async fn scan_subnet(
                 vendor: arp.vendor.clone(),
                 open_ports: Vec::new(),
                 min_latency: None,
+                ipv6_addrs: Vec::new(),
             },
         );
     }
@@ -385,6 +387,7 @@ pub async fn scan_subnet(
                     vendor: None,
                     open_ports: Vec::new(),
                     min_latency: None,
+                    ipv6_addrs: Vec::new(),
                 });
 
                 entry.is_alive = true;
@@ -435,6 +438,7 @@ pub async fn scan_subnet(
                     vendor: None,
                     open_ports: Vec::new(),
                     min_latency: None,
+                    ipv6_addrs: Vec::new(),
                 });
             }
         }
@@ -545,6 +549,23 @@ pub async fn scan_subnet(
             && let Some(cn) = tls_info.common_name
         {
             host.hostname = Some(cn);
+        }
+    }
+
+    // 7. Dual-Stack IPv6 NDP Neighbor Harvesting & Correlation
+    if let Some(iface) = interface_filter {
+        crate::net::ipv6::stimulate_ipv6_neighbors(iface).await;
+    }
+    let ndp_entries = crate::net::ipv6::harvest_ndp_cache(interface_filter).await;
+
+    for ndp in ndp_entries {
+        for host in host_results.values_mut() {
+            if let Some(ref host_mac) = host.mac_address
+                && host_mac.eq_ignore_ascii_case(&ndp.mac)
+                && !host.ipv6_addrs.contains(&ndp.ip)
+            {
+                host.ipv6_addrs.push(ndp.ip);
+            }
         }
     }
 

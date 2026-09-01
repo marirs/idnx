@@ -159,6 +159,7 @@ mod tests {
             vendor: Some("Linksys".to_string()),
             open_ports: Vec::new(),
             min_latency: None,
+            ipv6_addrs: Vec::new(),
         };
         assert_eq!(classify_host(&host, true), DeviceRole::GatewayRouter);
     }
@@ -173,6 +174,7 @@ mod tests {
             vendor: Some("Apple".to_string()),
             open_ports: Vec::new(),
             min_latency: None,
+            ipv6_addrs: Vec::new(),
         };
         assert_eq!(classify_host(&host, false), DeviceRole::Workstation);
     }
@@ -187,6 +189,7 @@ mod tests {
             vendor: Some("Xiaomi / Smartmi".to_string()),
             open_ports: Vec::new(),
             min_latency: None,
+            ipv6_addrs: Vec::new(),
         };
         assert_eq!(classify_host(&host, false), DeviceRole::SmartDevice);
     }
@@ -207,6 +210,7 @@ mod tests {
                 service: "ssh",
             }],
             min_latency: None,
+            ipv6_addrs: Vec::new(),
         };
         assert_eq!(classify_host(&host, false), DeviceRole::Workstation);
     }

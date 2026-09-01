@@ -189,3 +189,51 @@ fn extract_ptr_target(packet: &[u8]) -> Option<String> {
 
     None
 }
+
+/// Builds a DNS PTR query for IPv6 (`<ip>.ip6.arpa`)
+pub fn build_ipv6_ptr_query(ip: std::net::Ipv6Addr) -> Vec<u8> {
+    let segments = ip.octets();
+    let mut packet = Vec::with_capacity(96);
+
+    // Header: ID=0, Flags=0, Questions=1, Answer RRs=0, Authority RRs=0, Additional RRs=0
+    packet.extend_from_slice(&[
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+
+    // QNAME: 32 reversed hex nibbles
+    for &byte in segments.iter().rev() {
+        let low = format!("{:x}", byte & 0x0F);
+        packet.push(1);
+        packet.extend_from_slice(low.as_bytes());
+
+        let high = format!("{:x}", (byte >> 4) & 0x0F);
+        packet.push(1);
+        packet.extend_from_slice(high.as_bytes());
+    }
+    packet.push(3);
+    packet.extend_from_slice(b"ip6");
+    packet.push(4);
+    packet.extend_from_slice(b"arpa");
+    packet.push(0);
+
+    // QTYPE: PTR (12), QCLASS: IN (1)
+    packet.extend_from_slice(&[0x00, 0x0C, 0x00, 0x01]);
+    packet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_build_ipv6_ptr_query_format() {
+        let ip = std::net::Ipv6Addr::from_str("fe80::1").unwrap();
+        let query = build_ipv6_ptr_query(ip);
+        assert!(query.len() > 70);
+        // Verify last labels are ip6 and arpa
+        let query_str = String::from_utf8_lossy(&query);
+        assert!(query_str.contains("ip6"));
+        assert!(query_str.contains("arpa"));
+    }
+}

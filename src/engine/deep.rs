@@ -195,6 +195,7 @@ pub async fn explore_downstream_networks(
                                     vendor,
                                     open_ports: Vec::new(),
                                     min_latency: None,
+                                    ipv6_addrs: Vec::new(),
                                 });
                             }
                         }
