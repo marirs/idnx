@@ -65,7 +65,7 @@ pub fn read_system_arp_table(interface_filter: Option<&str>) -> Vec<ArpEntry> {
 }
 
 /// Parses the Linux `/proc/net/arp` table
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", test))]
 pub fn parse_proc_net_arp(content: &str, interface_filter: Option<&str>) -> Vec<ArpEntry> {
     let mut entries = Vec::new();
     for line in content.lines().skip(1) {

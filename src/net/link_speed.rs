@@ -208,7 +208,7 @@ fn get_windows_link_speed(_iface_name: &str) -> Option<LinkSpeedInfo> {
     None
 }
 
-#[allow(dead_code)]
+#[cfg(any(target_os = "macos", test))]
 fn parse_media_speed(media_str: &str) -> String {
     let lower = media_str.to_lowercase();
     if lower.contains("10gbase") {
