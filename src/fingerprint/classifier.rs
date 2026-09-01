@@ -77,29 +77,7 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         return DeviceRole::Switch;
     }
 
-    // 3. Workstations, Laptops & Servers (including DGX / AI Compute Nodes)
-    if hostname_lower.contains("mac")
-        || hostname_lower.contains("air")
-        || hostname_lower.contains("mini")
-        || hostname_lower.contains("pro")
-        || hostname_lower.contains("pc")
-        || hostname_lower.contains("desktop")
-        || hostname_lower.contains("laptop")
-        || hostname_lower.contains("server")
-        || hostname_lower.contains("dgx")
-        || hostname_lower.contains("thinkpad")
-        || hostname_lower.contains("dell")
-        || hostname_lower.contains("ubuntu")
-        || hostname_lower.contains("debian")
-        || vendor_lower.contains("nvidia")
-        || vendor_lower.contains("azurewave")
-        || (hostname_lower.contains("spark") && has_ssh)
-        || has_ssh
-    {
-        return DeviceRole::Workstation;
-    }
-
-    // 4. IoT & Connected Smart Devices
+    // 3. IoT & Connected Smart Devices
     if vendor_lower.contains("tuya")
         || vendor_lower.contains("xiaomi")
         || vendor_lower.contains("smartmi")
@@ -123,8 +101,44 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         || hostname_lower.contains("monitor")
         || hostname_lower.contains("speaker")
         || hostname_lower.contains("room")
+        || hostname_lower.contains("airp")
+        || hostname_lower.contains("hub")
+        || hostname_lower.contains("aqara")
+        || hostname_lower.contains("purifier")
     {
         return DeviceRole::SmartDevice;
+    }
+
+    // 4. Workstations, Laptops & Servers (including DGX / AI Compute Nodes)
+    if hostname_lower.contains("mac")
+        || hostname_lower.contains("macbook")
+        || hostname_lower.contains("-air")
+        || hostname_lower.ends_with("air")
+        || hostname_lower.contains("mini")
+        || hostname_lower.contains("pro")
+        || hostname_lower.contains("pc")
+        || hostname_lower.contains("desktop")
+        || hostname_lower.contains("laptop")
+        || hostname_lower.contains("server")
+        || hostname_lower.contains("dgx")
+        || hostname_lower.contains("thinkpad")
+        || hostname_lower.contains("dell")
+        || hostname_lower.contains("ubuntu")
+        || hostname_lower.contains("debian")
+        || vendor_lower.contains("nvidia")
+        || vendor_lower.contains("azurewave")
+        || (hostname_lower.contains("spark") && has_ssh)
+        || has_ssh
+    {
+        return DeviceRole::Workstation;
+    }
+
+    // Mobile / Handheld devices with Private / Randomized MAC and stealth posture
+    if let Some(ref mac) = host.mac_address {
+        let is_randomized = crate::fingerprint::oui::lookup_mac(mac).is_randomized;
+        if is_randomized && host.open_ports.is_empty() && host.hostname.is_none() {
+            return DeviceRole::SmartDevice;
+        }
     }
 
     DeviceRole::GenericHost

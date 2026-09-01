@@ -160,6 +160,37 @@ async fn main() {
         cli.timeout
     );
 
+    // Layer 2 Hardware Discovery (LLDP - IEEE 802.1AB)
+    let iface_name = iface_filter.as_deref().unwrap_or("en0");
+    match crate::probes::lldp::capture_lldp_neighbors(iface_name, Duration::from_millis(600)).await
+    {
+        crate::probes::lldp::LldpCaptureResult::Success(neighbors) => {
+            if !neighbors.is_empty() {
+                println!(
+                    "{} Captured {} Layer 2 LLDP hardware advertisement(s):",
+                    "[+]".green().bold(),
+                    neighbors.len().to_string().cyan().bold()
+                );
+                for n in &neighbors {
+                    println!(
+                        "    └── 🔌 [{}] Port: {} | System: {} | Desc: {}",
+                        n.chassis_id.cyan().bold(),
+                        n.port_id.yellow(),
+                        n.system_name.as_deref().unwrap_or("Unknown").green().bold(),
+                        n.system_description.as_deref().unwrap_or("N/A").dimmed()
+                    );
+                }
+            }
+        }
+        crate::probes::lldp::LldpCaptureResult::PermissionDenied => {
+            println!(
+                "{} Note: Layer 2 LLDP capture requires root (run with 'sudo idnx' to capture raw IEEE 802.1AB frames)",
+                "[*]".blue().bold()
+            );
+        }
+        crate::probes::lldp::LldpCaptureResult::NotSupported(_) => {}
+    }
+
     if !cli.no_deep {
         println!(
             "{} Deep mode active. Probing router management endpoints and child subnets...",
@@ -227,5 +258,5 @@ async fn main() {
     );
 
     // 2. Render Detailed Results Table
-    output::terminal::print_scan_results(&summary);
+    output::terminal::print_scan_results(&target_cidr, &summary, &child_networks);
 }

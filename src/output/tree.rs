@@ -71,11 +71,14 @@ pub fn print_topology_tree(
         categories.push(("❓", "Other Active Hosts", generic_hosts));
     }
 
+    let has_child_networks = !child_networks.is_empty();
     let has_switches_section = !physical_switches.is_empty();
-    let total_cats = categories.len() + if has_switches_section { 1 } else { 0 };
+    let total_top_level = categories.len()
+        + if has_child_networks { 1 } else { 0 }
+        + if has_switches_section { 1 } else { 0 };
 
     for (cat_idx, (icon, cat_name, hosts)) in categories.iter().enumerate() {
-        let is_last_cat = cat_idx == total_cats - 1;
+        let is_last_cat = cat_idx == total_top_level - 1;
         let cat_branch = if is_last_cat {
             "└──"
         } else {
@@ -148,13 +151,23 @@ pub fn print_topology_tree(
     }
 
     // Render discovered cascaded child networks
-    if !child_networks.is_empty() {
+    if has_child_networks {
+        let is_last_sec = !has_switches_section;
+        let branch = if is_last_sec {
+            "└──"
+        } else {
+            "├──"
+        };
+        let indent = if is_last_sec { "    " } else { "│   " };
+
         println!(
-            "├── 🌐 {}",
-            "Cascaded Downstream Subnets (Discovered Routers & Switches)"
+            "{} 🌐 {}",
+            branch.bold(),
+            "Cascaded Downstream Networks (Discovered Subnets & Endpoints)"
                 .bold()
                 .yellow()
         );
+
         for (c_idx, child) in child_networks.iter().enumerate() {
             let is_last_subnet = c_idx == child_networks.len() - 1;
             let sub_branch = if is_last_subnet {
@@ -163,34 +176,93 @@ pub fn print_topology_tree(
                 "├──"
             };
             let sub_indent = if is_last_subnet { "    " } else { "│   " };
+
+            let subnet_label = child.cidr.to_string().cyan().bold().to_string();
+
             println!(
-                "│   {} Subnet: {} [{} hosts active]",
+                "{}{} 🔀 Subnet: {} [{} hosts active]",
+                indent,
                 sub_branch,
-                child.cidr.to_string().cyan().bold(),
+                subnet_label,
                 child.summary.active_hosts.len()
             );
-            for (h_idx, ch) in child.summary.active_hosts.iter().enumerate() {
-                let h_branch = if h_idx == child.summary.active_hosts.len() - 1 {
-                    "└──"
+
+            // Separate gateway/switch from connected endpoints
+            let mut switch_gws = Vec::new();
+            let mut endpoints = Vec::new();
+
+            for host in &child.summary.active_hosts {
+                if host.ip.octets()[3] == 1
+                    || host.open_ports.iter().any(|p| p.port == 23 || p.port == 80)
+                {
+                    switch_gws.push(host);
                 } else {
-                    "├──"
+                    endpoints.push(host);
+                }
+            }
+
+            let has_endpoints = !endpoints.is_empty();
+
+            for (gw_idx, gw) in switch_gws.iter().enumerate() {
+                let is_last_gw = gw_idx == switch_gws.len() - 1 && !has_endpoints;
+                let gw_branch = if is_last_gw { "└──" } else { "├──" };
+                let gw_name = if gw.open_ports.iter().any(|p| p.port == 23) {
+                    "Managed Switch Gateway"
+                } else if gw.open_ports.iter().any(|p| p.port == 53) {
+                    "Subnet Gateway Router"
+                } else {
+                    "Subnet Gateway"
                 };
-                let mut h_desc = ch.ip.to_string().cyan().bold().to_string();
-                if let Some(ref name) = ch.hostname {
-                    h_desc = format!("{} [{}]", h_desc, name.magenta().bold());
-                }
-                if let Some(ref vendor) = ch.vendor {
-                    h_desc = format!("{} ({})", h_desc, vendor.green());
-                }
-                let ports_str: Vec<String> = ch
+                let ports_str: Vec<String> = gw
                     .open_ports
                     .iter()
                     .map(|p| format!("{}/{}", p.port, p.service))
                     .collect();
-                if !ports_str.is_empty() {
-                    h_desc = format!("{} [{}]", h_desc, ports_str.join(", ").yellow());
+                let ports_tag = if !ports_str.is_empty() {
+                    format!(" [{}]", ports_str.join(", ").yellow())
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{}{}    {} 🔀 {} [{}]{}",
+                    indent,
+                    sub_indent,
+                    gw_branch,
+                    gw.ip.to_string().cyan().bold(),
+                    gw_name.magenta().bold(),
+                    ports_tag
+                );
+            }
+
+            if has_endpoints {
+                println!(
+                    "{}{}    └── 📱 {}",
+                    indent,
+                    sub_indent,
+                    "Connected Devices Under Switch".bold().yellow()
+                );
+                for (e_idx, ep) in endpoints.iter().enumerate() {
+                    let is_last_ep = e_idx == endpoints.len() - 1;
+                    let ep_branch = if is_last_ep { "└──" } else { "├──" };
+                    let mut ep_desc = ep.ip.to_string().cyan().bold().to_string();
+
+                    if let Some(ref name) = ep.hostname {
+                        ep_desc = format!("{} [{}]", ep_desc, name.magenta().bold());
+                    } else if let Some(ref vendor) = ep.vendor {
+                        ep_desc = format!("{} ({})", ep_desc, vendor.green());
+                    }
+
+                    let ports_str: Vec<String> = ep
+                        .open_ports
+                        .iter()
+                        .map(|p| format!("{}/{}", p.port, p.service))
+                        .collect();
+                    if !ports_str.is_empty() {
+                        ep_desc = format!("{} [{}]", ep_desc, ports_str.join(", ").yellow());
+                    }
+
+                    println!("{}{}        {} {}", indent, sub_indent, ep_branch, ep_desc);
                 }
-                println!("│   {}    {} {}", sub_indent, h_branch, h_desc);
             }
         }
     }

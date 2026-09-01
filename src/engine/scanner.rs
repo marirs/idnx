@@ -147,13 +147,61 @@ pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration)
     let start = Instant::now();
 
     match timeout(timeout_duration, tokio::net::TcpStream::connect(addr)).await {
-        Ok(Ok(_stream)) => {
+        Ok(Ok(mut stream)) => {
             let elapsed = start.elapsed();
+            let mut service = lookup_service(port);
+
+            // Active banner grabbing for service identification
+            if port == 22 {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 128];
+                if let Ok(Ok(n)) = timeout(Duration::from_millis(250), stream.read(&mut buf)).await
+                {
+                    if n > 0 {
+                        let banner = String::from_utf8_lossy(&buf[..n]);
+                        if banner.contains("Ubuntu") {
+                            service = "ssh (Ubuntu Linux)";
+                        } else if banner.contains("Debian") {
+                            service = "ssh (Debian Linux)";
+                        } else if banner.contains("Raspbian") {
+                            service = "ssh (Raspberry Pi)";
+                        } else if banner.contains("FreeBSD") {
+                            service = "ssh (FreeBSD)";
+                        } else if banner.contains("Cisco") {
+                            service = "ssh (Cisco)";
+                        } else if banner.contains("Dropbear") {
+                            service = "ssh (Embedded Linux / Router)";
+                        }
+                    }
+                }
+            } else if port == 80 || port == 8080 {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let req = b"HEAD / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+                let _ = stream.write_all(req).await;
+                let mut buf = [0u8; 256];
+                if let Ok(Ok(n)) = timeout(Duration::from_millis(250), stream.read(&mut buf)).await
+                {
+                    if n > 0 {
+                        let res = String::from_utf8_lossy(&buf[..n]);
+                        let lower = res.to_ascii_lowercase();
+                        if lower.contains("server: nginx") {
+                            service = "http (nginx)";
+                        } else if lower.contains("server: apache") {
+                            service = "http (Apache)";
+                        } else if lower.contains("server: lighttpd") {
+                            service = "http (Lighttpd)";
+                        } else if lower.contains("server: iis") {
+                            service = "http (Microsoft-IIS)";
+                        }
+                    }
+                }
+            }
+
             PortInfo {
                 port,
                 status: PortStatus::Open,
                 latency: Some(elapsed),
-                service: lookup_service(port),
+                service,
             }
         }
         Ok(Err(e)) => {
@@ -224,6 +272,30 @@ pub async fn scan_host_tcp(
     (is_alive, open_ports, min_latency)
 }
 
+/// Fast ICMP ping probe for discovering live hosts across routed/cascaded subnets
+pub async fn ping_host(ip: Ipv4Addr, timeout_duration: Duration) -> bool {
+    let timeout_ms = (timeout_duration.as_millis() as u64).max(300).min(1500);
+
+    #[cfg(target_os = "macos")]
+    let cmd = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", &timeout_ms.to_string(), &ip.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    #[cfg(not(target_os = "macos"))]
+    let cmd = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", "1", &ip.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match tokio::time::timeout(timeout_duration, cmd).await {
+        Ok(Ok(s)) => s.success(),
+        _ => false,
+    }
+}
+
 /// Scans an entire CIDR network block using combined ARP + TCP discovery
 pub async fn scan_subnet(
     cidr: Ipv4Net,
@@ -273,6 +345,9 @@ pub async fn scan_subnet(
 
     // Populate with ARP-discovered devices first (they are 100% active on the wire!)
     for (&ip, arp) in &arp_map {
+        if ip == cidr.broadcast() || ip.octets()[3] == 255 || arp.mac == "ff:ff:ff:ff:ff:ff" {
+            continue;
+        }
         host_results.insert(
             ip,
             HostResult {
@@ -316,6 +391,44 @@ pub async fn scan_subnet(
         }
     }
 
+    // ICMP Ping Sweep fallback for stealth hosts with no open TCP ports (e.g. Mac-mini, Mac, routers)
+    let missing_liveness: Vec<Ipv4Addr> = hosts
+        .iter()
+        .copied()
+        .filter(|ip| !host_results.contains_key(ip))
+        .collect();
+
+    if !missing_liveness.is_empty() {
+        let ping_sem = Arc::new(Semaphore::new(concurrency.min(64)));
+        let mut ping_tasks = Vec::with_capacity(missing_liveness.len());
+        for &ip in &missing_liveness {
+            let p_sem = Arc::clone(&ping_sem);
+            let to = timeout_duration.max(Duration::from_millis(750));
+            ping_tasks.push(tokio::spawn(async move {
+                let _permit = p_sem.acquire().await.unwrap();
+                if ping_host(ip, to).await {
+                    Some(ip)
+                } else {
+                    None
+                }
+            }));
+        }
+
+        for task in ping_tasks {
+            if let Ok(Some(ip)) = task.await {
+                host_results.entry(ip).or_insert_with(|| HostResult {
+                    ip,
+                    is_alive: true,
+                    hostname: None,
+                    mac_address: None,
+                    vendor: None,
+                    open_ports: Vec::new(),
+                    min_latency: None,
+                });
+            }
+        }
+    }
+
     if let Some(ref bar) = progress_bar {
         bar.finish_and_clear();
     }
@@ -334,6 +447,57 @@ pub async fn scan_subnet(
             });
             if is_generic {
                 host.hostname = Some(name);
+            }
+        }
+    }
+
+    // 4b. Resolve Unicast DNS PTR records against the subnet gateway (for routed/cascaded networks)
+    let missing_ips: Vec<Ipv4Addr> = host_results
+        .values()
+        .filter(|h| h.hostname.is_none())
+        .map(|h| h.ip)
+        .collect();
+
+    if !missing_ips.is_empty() {
+        let octets = cidr.addr().octets();
+        let gw_ip = Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
+        let dns_ptrs = crate::net::dns::resolve_unicast_dns_ptrs(
+            &missing_ips,
+            gw_ip,
+            Duration::from_millis(400),
+        )
+        .await;
+        for (ip, name) in dns_ptrs {
+            if let Some(host) = host_results.get_mut(&ip) {
+                if host.hostname.is_none() {
+                    host.hostname = Some(name);
+                }
+            }
+        }
+    }
+
+    // 5. Query UPnP / SSDP device descriptions for rich hardware metadata
+    let upnp_devices = crate::probes::upnp::discover_upnp_devices(Duration::from_millis(500)).await;
+    for dev in upnp_devices {
+        if let Some(host) = host_results.get_mut(&dev.ip) {
+            let model_opt = dev.model_description.or(dev.model_name);
+            if let Some(ref model) = model_opt {
+                if let Some(ref mfg) = dev.manufacturer {
+                    host.vendor = Some(format!("{} ({})", mfg, model));
+                } else {
+                    host.vendor = Some(model.clone());
+                }
+            }
+            if let Some(ref fname) = dev.friendly_name {
+                let is_generic = host.hostname.as_deref().map_or(true, |h| {
+                    h == "?"
+                        || h == "-"
+                        || h.eq_ignore_ascii_case("mac")
+                        || h.eq_ignore_ascii_case("unknown")
+                });
+                if is_generic {
+                    host.hostname = Some(fname.clone());
+                }
             }
         }
     }

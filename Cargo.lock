@@ -277,6 +277,7 @@ dependencies = [
  "get_if_addrs",
  "indicatif",
  "ipnet",
+ "libc",
  "tokio",
 ]
 

@@ -119,6 +119,10 @@ pub fn parse_arp_output(output: &str, interface_filter: Option<&str>) -> Vec<Arp
             }
         }
 
+        if ip.octets()[3] == 255 || mac == "ff:ff:ff:ff:ff:ff" || ip.is_multicast() {
+            continue;
+        }
+
         let vendor = lookup_vendor(&mac);
 
         entries.push(ArpEntry {
