@@ -287,6 +287,25 @@ async fn main() {
         }
     }
 
+    // ASUS Router Discovery Protocol (UDP 9999 / 18017)
+    let asus_routers = probes::asus::discover_asus_routers(Duration::from_millis(300)).await;
+    if !asus_routers.is_empty() {
+        println!(
+            "{} Discovered {} ASUSWRT router(s):",
+            "[+]".green().bold(),
+            asus_routers.len().to_string().cyan().bold()
+        );
+        for a in &asus_routers {
+            println!(
+                "    └── 📡 [{}] Model: {} | Firmware: {} | SSID: {}",
+                a.ip.to_string().cyan().bold(),
+                a.model_name.as_deref().unwrap_or("ASUS Router").green().bold(),
+                a.firmware_version.as_deref().unwrap_or("N/A").dimmed(),
+                a.ssid.as_deref().unwrap_or("N/A").yellow()
+            );
+        }
+    }
+
     if !cli.no_deep {
         println!(
             "{} Deep mode active. Probing router management endpoints and child subnets...",
@@ -305,13 +324,14 @@ async fn main() {
     );
 
     let timeout_duration = Duration::from_millis(cli.timeout);
-    let summary = engine::scanner::scan_subnet(
+    let summary = engine::scanner::scan_subnet_ext(
         target_cidr,
         &ports,
         iface_filter,
         cli.concurrency,
         timeout_duration,
         Some(pb),
+        !cli.no_ipv6,
     )
     .await;
 

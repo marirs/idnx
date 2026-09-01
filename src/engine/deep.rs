@@ -18,49 +18,40 @@ pub struct ChildNetworkResult {
     pub snmp_system_descr: Option<String>,
 }
 
-/// Dynamically sweeps RFC 1918 gateway addresses in parallel to discover
-/// reachable routed subnets without any hardcoded IP lists.
+/// Dynamically sweeps candidate gateway addresses inferred from the OS kernel routing table,
+/// network interfaces, and adjacent private subnets (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+/// without any hardcoded IP lists.
 pub async fn discover_routed_gateways(
     parent_cidr: &Ipv4Net,
     concurrency: usize,
     timeout_duration: Duration,
 ) -> Vec<Ipv4Net> {
-    let mut tasks = Vec::with_capacity(254);
+    let candidates = crate::net::routes::derive_adjacent_candidate_gateways(parent_cidr).await;
+    let mut tasks = Vec::with_capacity(candidates.len());
     let sem = Arc::new(Semaphore::new(concurrency.min(128)));
-    let octets = parent_cidr.addr().octets();
 
-    // If local network is in 192.168.0.0/16, sweep all 254 possible /24 subnets
-    if octets[0] == 192 && octets[1] == 168 {
-        for third in 1..=254 {
-            let gw = Ipv4Addr::new(192, 168, third, 1);
-            if parent_cidr.contains(&gw) {
-                continue; // Skip the parent network itself
-            }
-            let permit_sem = Arc::clone(&sem);
-            let to = timeout_duration.min(Duration::from_millis(250));
-            tasks.push(tokio::spawn(async move {
-                let _permit = permit_sem.acquire().await.unwrap();
-                for &p in &[80, 443, 53] {
-                    let probe = crate::engine::scanner::probe_tcp_port(gw, p, to).await;
-                    if probe.status == crate::engine::scanner::PortStatus::Open {
-                        let cidr_str = format!("192.168.{}.0/24", third);
-                        if let Ok(c) = Ipv4Net::from_str(&cidr_str) {
-                            return Some(c);
-                        }
-                    }
+    for (gw, subnet) in candidates {
+        let permit_sem = Arc::clone(&sem);
+        let to = timeout_duration.min(Duration::from_millis(250));
+        tasks.push(tokio::spawn(async move {
+            let _permit = permit_sem.acquire().await.unwrap();
+            for &p in &[80, 443, 53, 22, 161] {
+                let probe = crate::engine::scanner::probe_tcp_port(gw, p, to).await;
+                if probe.status == crate::engine::scanner::PortStatus::Open {
+                    return Some(subnet);
                 }
-                None
-            }));
-        }
+            }
+            None
+        }));
     }
 
-    let mut discovered = Vec::new();
+    let mut discovered = HashSet::new();
     for task in tasks {
         if let Ok(Some(net)) = task.await {
-            discovered.push(net);
+            discovered.insert(net);
         }
     }
-    discovered
+    discovered.into_iter().collect()
 }
 
 #[derive(Debug, Clone)]

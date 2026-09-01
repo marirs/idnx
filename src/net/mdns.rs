@@ -221,6 +221,57 @@ pub fn build_ipv6_ptr_query(ip: std::net::Ipv6Addr) -> Vec<u8> {
     packet
 }
 
+/// Discovers mDNS hostnames for all provided IPv6 addresses using multicast DNS queries over IPv6 ([ff02::fb]:5353)
+pub async fn resolve_ipv6_mdns_hostnames(
+    ips: &[std::net::Ipv6Addr],
+    timeout_duration: Duration,
+) -> HashMap<std::net::Ipv6Addr, String> {
+    use std::net::{Ipv6Addr, SocketAddrV6};
+    let socket = match UdpSocket::bind("[::]:0").await {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mdns_dest = SocketAddrV6::new(
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb),
+        5353,
+        0,
+        0,
+    );
+
+    for &ip in ips {
+        let q = build_ipv6_ptr_query(ip);
+        let _ = socket.send_to(&q, mdns_dest).await;
+    }
+
+    let mut map = HashMap::new();
+    let mut buf = [0u8; 2048];
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        if let Ok(Ok((len, peer))) = timeout(remaining, socket.recv_from(&mut buf)).await {
+            let data = &buf[..len];
+            if let std::net::SocketAddr::V6(v6) = peer {
+                let peer_ip = *v6.ip();
+                if let Some(name) = extract_ptr_target(data) {
+                    let clean_name = name
+                        .trim_end_matches(".local")
+                        .trim_end_matches('.')
+                        .to_string();
+                    map.insert(peer_ip, clean_name);
+                }
+            }
+        }
+    }
+
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -320,6 +320,28 @@ pub async fn scan_subnet(
     timeout_duration: Duration,
     progress_bar: Option<ProgressBar>,
 ) -> ScanSummary {
+    scan_subnet_ext(
+        cidr,
+        ports,
+        interface_filter,
+        concurrency,
+        timeout_duration,
+        progress_bar,
+        true,
+    )
+    .await
+}
+
+/// Core asynchronous scanning engine with optional IPv6 discovery control
+pub async fn scan_subnet_ext(
+    cidr: Ipv4Net,
+    ports: &[u16],
+    interface_filter: Option<&str>,
+    concurrency: usize,
+    timeout_duration: Duration,
+    progress_bar: Option<ProgressBar>,
+    enable_ipv6: bool,
+) -> ScanSummary {
     let start_time = Instant::now();
     let hosts: Vec<Ipv4Addr> = cidr.hosts().collect();
     let total_hosts = hosts.len();
@@ -573,24 +595,71 @@ pub async fn scan_subnet(
     }
 
     // 7. Dual-Stack IPv6 NDP Neighbor Harvesting & Correlation
-    if let Some(iface) = interface_filter {
-        crate::net::ipv6::stimulate_ipv6_neighbors(iface).await;
-    }
-    let ndp_entries = crate::net::ipv6::harvest_ndp_cache(interface_filter).await;
+    let mut ipv6_only_hosts = Vec::new();
+    if enable_ipv6 {
+        if let Some(iface) = interface_filter {
+            crate::net::ipv6::stimulate_ipv6_neighbors(iface).await;
+        }
+        let ndp_entries = crate::net::ipv6::harvest_ndp_cache(interface_filter).await;
 
-    for ndp in ndp_entries {
+        let mut matched_ndp_macs = HashSet::new();
+        for ndp in &ndp_entries {
+            for host in host_results.values_mut() {
+                if let Some(ref host_mac) = host.mac_address
+                    && host_mac.eq_ignore_ascii_case(&ndp.mac)
+                {
+                    if !host.ipv6_addrs.contains(&ndp.ip) {
+                        host.ipv6_addrs.push(ndp.ip);
+                    }
+                    matched_ndp_macs.insert(ndp.mac.to_lowercase());
+                }
+            }
+        }
+
+        // Collect all discovered IPv6 addresses for reverse mDNS PTR resolution
+        let all_ipv6s: Vec<std::net::Ipv6Addr> = ndp_entries.iter().map(|e| e.ip).collect();
+        let ipv6_mdns_names =
+            crate::net::mdns::resolve_ipv6_mdns_hostnames(&all_ipv6s, Duration::from_millis(400))
+                .await;
+
+        // Apply resolved IPv6 mDNS names to matched dual-stack hosts if missing hostname
         for host in host_results.values_mut() {
-            if let Some(ref host_mac) = host.mac_address
-                && host_mac.eq_ignore_ascii_case(&ndp.mac)
-                && !host.ipv6_addrs.contains(&ndp.ip)
-            {
-                host.ipv6_addrs.push(ndp.ip);
+            if host.hostname.is_none() || host.hostname.as_deref() == Some("?") {
+                for ip6 in &host.ipv6_addrs {
+                    if let Some(name) = ipv6_mdns_names.get(ip6) {
+                        host.hostname = Some(name.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Represent IPv6-only hosts: retained instead of discarded
+        for ndp in ndp_entries {
+            if !matched_ndp_macs.contains(&ndp.mac.to_lowercase()) {
+                let vendor = crate::fingerprint::oui::lookup_mac(&ndp.mac).vendor;
+                let hostname = ipv6_mdns_names
+                    .get(&ndp.ip)
+                    .cloned()
+                    .or_else(|| Some("[IPv6 Only]".to_string()));
+                ipv6_only_hosts.push(HostResult {
+                    ip: Ipv4Addr::UNSPECIFIED,
+                    is_alive: true,
+                    hostname,
+                    mac_address: Some(ndp.mac),
+                    vendor,
+                    open_ports: Vec::new(),
+                    min_latency: None,
+                    ipv6_addrs: vec![ndp.ip],
+                    ai_runtime: None,
+                });
             }
         }
     }
 
     let mut active_hosts: Vec<HostResult> = host_results.into_values().collect();
-    active_hosts.sort_by_key(|h| h.ip);
+    active_hosts.extend(ipv6_only_hosts);
+    active_hosts.sort_by_key(|h| (h.ip, h.mac_address.clone()));
 
     ScanSummary {
         total_hosts,
@@ -612,6 +681,7 @@ pub struct ScannerBuilder {
     snmp_config: Option<crate::engine::deep::SnmpProbeConfig>,
     recursive: bool,
     max_depth: usize,
+    enable_ipv6: bool,
 }
 
 impl Default for ScannerBuilder {
@@ -633,6 +703,7 @@ impl ScannerBuilder {
             snmp_config: Some(crate::engine::deep::SnmpProbeConfig::default()),
             recursive: false,
             max_depth: 2,
+            enable_ipv6: true,
         }
     }
 
@@ -719,6 +790,12 @@ impl ScannerBuilder {
         self
     }
 
+    /// Enables or disables IPv6 neighbor discovery and NDP harvesting
+    pub fn enable_ipv6(mut self, enable: bool) -> Self {
+        self.enable_ipv6 = enable;
+        self
+    }
+
     /// Builds the configured `Scanner` instance
     pub fn build(self) -> Result<Scanner, String> {
         let target = match self.target {
@@ -739,6 +816,7 @@ impl ScannerBuilder {
             snmp_config: self.snmp_config,
             recursive: self.recursive,
             max_depth: self.max_depth,
+            enable_ipv6: self.enable_ipv6,
         })
     }
 }
@@ -756,18 +834,20 @@ pub struct Scanner {
     pub snmp_config: Option<crate::engine::deep::SnmpProbeConfig>,
     pub recursive: bool,
     pub max_depth: usize,
+    pub enable_ipv6: bool,
 }
 
 impl Scanner {
     /// Executes a standard subnet scan on the target CIDR
     pub async fn scan(&self) -> ScanSummary {
-        scan_subnet(
+        scan_subnet_ext(
             self.target,
             &self.ports,
             self.interface.as_deref(),
             self.concurrency,
             self.timeout,
             None,
+            self.enable_ipv6,
         )
         .await
     }
@@ -829,5 +909,13 @@ mod tests {
         assert_eq!(scanner.concurrency, 128);
         assert_eq!(scanner.timeout, Duration::from_millis(500));
         assert!(!scanner.enable_deep);
+        assert!(scanner.enable_ipv6);
+
+        let scanner_no_v6 = ScannerBuilder::new()
+            .target_cidr(cidr)
+            .enable_ipv6(false)
+            .build()
+            .unwrap();
+        assert!(!scanner_no_v6.enable_ipv6);
     }
 }

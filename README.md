@@ -7,33 +7,35 @@
 
 **idNX** is a fast, asynchronous network discovery and deep infrastructure exploration utility and Rust library.
 
-While traditional network scanners (such as Nmap, Angry IP, or Advanced IP Scanner) only sweep a single flat CIDR block, **idNX synthesizes control-plane, data-plane, and Layer 2 link-layer intelligence** to reconstruct the entire multi-tier network topology—including managed switches, cascaded downstream routers, parent WANs, VLANs, and connected IoT devices.
+**idNX** is a fast, asynchronous network topology discovery and infrastructure exploration utility and Rust library.
+
+Unlike target-list scanners that require manual subnet inputs, **idNX begins with the active interface and automatically expands into reachable adjacent networks learned from gateways, routing tables, and link-layer advertisements**, producing one correlated topology in a single run.
 
 ---
 
-## ⚡ Why idNX? (Beyond Traditional Scanners)
+## ⚡ Why idNX? (Topology Inference Through Multiple Signals)
 
-### 1. Commercial Scanners Look at One Flat Subnet
-> **The Blindspot:** Tools like **Nmap, Angry IP Scanner, or Advanced IP Scanner** assume a network is just a single, flat CIDR block (e.g. `192.168.1.0/24`). If you have downstream routers (`192.168.51.0/24`), secondary guest/travel APs (`192.168.50.0/24`), or isolated PoE switch management subnets (`192.168.70.0/24`), **traditional tools are completely blind to them**.
+### 1. Zero-Configuration Topology Expansion
+> **The Target-List Limitation:** Most command-line scanners report reachable hosts and services on targets explicitly provided by the user. If you have downstream routers, secondary guest APs, or isolated switch management subnets, discovering them typically requires manually configuring multiple scans.
 >
-> **The idNX Solution:** idNX automatically detects and pivots into adjacent, parent WAN, and cascaded child subnets using multi-signal RFC 1918 gateway probes, Unicast DNS PTR synthesis, and Layer 2 frame sniffing—reconstructing the true multi-tier topology.
+> **The idNX Approach:** idNX starts with the active interface, harvests OS kernel routing tables and gateways, probes candidate adjacent subnets across RFC 1918 ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), and recursively traverses discovered subnets—reconstructing the true multi-tier topology in a single run.
 
-### 2. Rogue Device & Shadow IT Detection
-> **The Enterprise Risk:** In corporate, campus, and lab environments, employees or contractors frequently plug unmanaged Wi-Fi access points, travel routers, or desktop switches into office Ethernet wall jacks. Standard port scanners see only a single IP responding and never investigate what is running behind it.
+### 2. Rogue Device & Shadow Infrastructure Detection
+> **The Visibility Gap:** In corporate, campus, and lab environments, unmanaged Wi-Fi access points, travel routers, or desktop switches are often plugged into office Ethernet ports. Standard endpoint scanners see only an IP responding and cannot explain what is running behind it.
 >
-> **The idNX Solution:** idNX synthesizes **Layer 2 wire sniffing (LLDP/CDP/MNDP)**, **UPnP hardware XML descriptors**, **asynchronous ICMP stealth sweeps**, and **RFC 1918 gateway sweeps** to uncover hidden downstream networks, identify switch ports, and flag rogue infrastructure instantly.
+> **The idNX Approach:** idNX synthesizes **Layer 2 wire sniffing (LLDP/CDP/MNDP)**, **UPnP hardware XML descriptors**, **ASUS discovery**, **SNMP MIB-II route/ARP harvesting**, and **adjacent gateway sweeps** to uncover hidden downstream networks, identify switch ports, and highlight infrastructure relationships.
 
 ---
 
-## 🏗️ How idNX Maps the Complete Network Picture
+## 🏗️ How idNX Maps the Network
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          idNX Discovery Engine                              │
 └──────┬──────────────────┬─────────────────┬──────────────────┬──────────────┘
        │                  │                 │                  │
-(1) L2 Sniffer     (2) Dual DNS      (3) UPnP XML       (4) RFC 1918 Gateway
-    LLDP/CDP/MNDP      mDNS + Unicast    Device Hardware    Sweep & ICMP Fallback
+(1) L2 Sniffer     (2) Dual DNS      (3) UPnP / ASUS    (4) Routing Tables &
+    LLDP/CDP/MNDP      mDNS + Unicast    Device Hardware    Adjacent Subnet Probes
        │                  │                 │                  │
        ▼                  ▼                 ▼                  ▼
 ┌──────────────┐   ┌──────────────┐  ┌──────────────┐   ┌─────────────────────┐
@@ -45,8 +47,8 @@ While traditional network scanners (such as Nmap, Angry IP, or Advanced IP Scann
 1. **Auto-Detects Local Network & Link Speed:** Immediately detects the active interface, subnet CIDR, and real-time physical link speed (e.g. `10 Gbps Full-Duplex` or `2.16 Gbps Wi-Fi 6E 160MHz`).
 2. **Passive & Active Layer 2 Hardware Discovery:** Decodes IEEE 802.1AB **LLDP**, Cisco **CDP**, and MikroTik **MNDP** frames off the wire to map physical switch chassis, port IDs, native VLANs, and RouterOS boards.
 3. **Dual-Mode Name Synthesis:** Queries local Multicast DNS (RFC 6762) for `.local` names **and** sends RFC 1035 Unicast DNS PTR queries directly to gateway DNS servers (e.g. dnsmasq) to extract hostnames across routed subnets.
-4. **Cascaded & Adjacent Subnet Traversal:** Probes standard RFC 1918 gateway candidates to detect upstream WANs and downstream router/switch subnets, queuing them for recursive exploration.
-5. **Stealth ICMP Fallback:** Runs parallel ICMP echo sweeps so silent or firewalled hosts without open TCP ports (e.g. Mac-mini, phones, IoT hubs) are never missed.
+4. **Cascaded & Adjacent Subnet Traversal:** Derives candidate adjacent networks from OS routing tables and gateway probes, queuing them for bounded recursive exploration.
+5. **Multi-Signal Host Discovery:** Combines ARP, ICMP echo, and TCP SYN probes to maximize coverage of endpoints across different operating systems and firewall profiles.
 6. **Hardware Fingerprinting:** Resolves IEEE registered OUIs, flags IEEE 802 randomized private MAC addresses, interrogates UPnP/SSDP XML descriptors, and grabs SSH/HTTP server banners.
 
 ---

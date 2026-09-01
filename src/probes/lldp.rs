@@ -22,6 +22,27 @@ pub fn parse_lldp_frame(payload: &[u8]) -> Option<LldpNeighbor> {
         return None;
     }
 
+    // Check if frame is Cisco Discovery Protocol (CDP: dest MAC 01:00:0c:cc:cc:cc)
+    if payload.len() >= 22
+        && payload[0..6] == [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]
+        && let Some(cdp) = crate::probes::cdp::parse_cdp_frame(payload)
+    {
+        let desc = match (cdp.platform, cdp.software_version) {
+            (Some(p), Some(v)) => Some(format!("{} - {}", p, v)),
+            (Some(p), None) => Some(p),
+            (None, Some(v)) => Some(v),
+            (None, None) => None,
+        };
+        return Some(LldpNeighbor {
+            chassis_id: cdp.device_id.clone(),
+            port_id: cdp.port_id,
+            system_name: Some(cdp.device_id),
+            system_description: desc,
+            management_ip: cdp.management_ip,
+            capabilities: cdp.capabilities,
+        });
+    }
+
     // Skip Ethernet header (14 bytes: 6 dest MAC + 6 src MAC + 2 EtherType)
     let mut offset = 14;
 
@@ -243,10 +264,13 @@ fn capture_macos_bpf(interface: &str, duration: Duration) -> LldpCaptureResult {
                         break;
                     }
 
-                    // Check EtherType at offset 12 in the Ethernet header
+                    // Check EtherType at offset 12 in the Ethernet header (LLDP 0x88CC or CDP destination MAC 01:00:0c:cc:cc:cc)
                     let ethertype =
                         ((buffer[pkt_start + 12] as u16) << 8) | (buffer[pkt_start + 13] as u16);
-                    if ethertype == 0x88CC
+                    let is_cdp = buffer[pkt_start..pkt_start + 6]
+                        == [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC];
+
+                    if (ethertype == 0x88CC || is_cdp)
                         && let Some(neighbor) = parse_lldp_frame(&buffer[pkt_start..n])
                     {
                         neighbors.push(neighbor);

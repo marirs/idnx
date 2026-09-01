@@ -109,9 +109,17 @@ pub fn print_topology_tree(
             let sub_indent = if is_last_host { "    " } else { "│   " };
 
             // Build node label
-            let mut label = format!("{}", host.ip.to_string().cyan().bold());
+            let mut label = if host.ip.is_unspecified() {
+                if !host.ipv6_addrs.is_empty() {
+                    format!("{}", host.ipv6_addrs[0].to_string().cyan().bold())
+                } else {
+                    format!("{}", "[IPv6 Only]".cyan().bold())
+                }
+            } else {
+                format!("{}", host.ip.to_string().cyan().bold())
+            };
 
-            if !host.ipv6_addrs.is_empty() {
+            if !host.ip.is_unspecified() && !host.ipv6_addrs.is_empty() {
                 let v6_str = host
                     .ipv6_addrs
                     .iter()
