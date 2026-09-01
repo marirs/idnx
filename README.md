@@ -9,6 +9,8 @@
  |_|\__,_|_| \_| /_/\_\  v0.1.1
 ```
 
+[![CI](https://github.com/marirs/idnx/actions/workflows/ci.yml/badge.svg)](https://github.com/marirs/idnx/actions/workflows/ci.yml)
+
 **idNX** is a fast, asynchronous network discovery and deep infrastructure exploration utility and Rust library.
 
 While traditional network scanners (such as Nmap, Angry IP, or Advanced IP Scanner) only sweep a single flat CIDR block, **idNX synthesizes control-plane, data-plane, and Layer 2 link-layer intelligence** to reconstruct the entire multi-tier network topology—including managed switches, cascaded downstream routers, parent WANs, VLANs, and connected IoT devices.
