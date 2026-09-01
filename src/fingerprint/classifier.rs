@@ -52,9 +52,6 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         .open_ports
         .iter()
         .any(|p| p.port == 80 || p.port == 443);
-    let octets = host.ip.octets();
-    let last_octet = octets[3];
-
     // 1. Gateway / Router Identification (Primary Gateway or Downstream Sub-Router)
     if is_default_gateway
         || vendor_lower.contains("asus")
@@ -63,11 +60,10 @@ pub fn classify_host(host: &HostResult, is_default_gateway: bool) -> DeviceRole 
         || vendor_lower.contains("ubiquiti")
         || hostname_lower.contains("router")
         || hostname_lower.contains("gateway")
-        || (last_octet == 1 || last_octet == 254)
-            && (vendor_lower.contains("cisco")
-                || vendor_lower.contains("netgear")
-                || vendor_lower.contains("tp-link")
-                || has_http_or_https)
+        || (vendor_lower.contains("cisco")
+            || vendor_lower.contains("netgear")
+            || vendor_lower.contains("tp-link"))
+            && has_http_or_https
     {
         return DeviceRole::GatewayRouter;
     }

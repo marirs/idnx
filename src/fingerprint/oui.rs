@@ -17,12 +17,24 @@ impl OuiInfo {
     }
 }
 
-/// Returns the path to the user-cached OUI database (~/.cache/idnx/oui.txt)
+/// Returns the path to the user-cached OUI database (%LOCALAPPDATA%\idnx\oui.txt on Windows, ~/.cache/idnx/oui.txt on Unix)
 pub fn get_oui_cache_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    Some(PathBuf::from(home).join(".cache").join("idnx").join("oui.txt"))
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            return Some(PathBuf::from(local_app_data).join("idnx").join("oui.txt"));
+        }
+    }
+
+    let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        PathBuf::from(xdg)
+    } else if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        PathBuf::from(home).join(".cache")
+    } else {
+        return None;
+    };
+
+    Some(base.join("idnx").join("oui.txt"))
 }
 
 /// Downloads and updates the IEEE OUI database to ~/.cache/idnx/oui.txt

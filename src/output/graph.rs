@@ -100,9 +100,12 @@ pub fn export_interactive_topology_html(
         switch_parent_id = sw_id;
     }
 
+    let default_gw = crate::net::interface::detect_local_network().ok().and_then(|i| i.default_gateway);
+
     // 3. Add Local Network Hosts
     for host in &summary.active_hosts {
-        let host_node = build_host_node(host);
+        let is_gw = default_gw.map(|gw| gw == host.ip).unwrap_or(false);
+        let host_node = build_host_node(host, is_gw);
         let host_id = host_node.id.clone();
         nodes.push(host_node);
 
@@ -147,7 +150,8 @@ pub fn export_interactive_topology_html(
 
         // Add child network hosts
         for host in &child.summary.active_hosts {
-            let host_node = build_host_node(host);
+            let is_gw = host.ip == child.gateway;
+            let host_node = build_host_node(host, is_gw);
             let host_id = host_node.id.clone();
             nodes.push(host_node);
 
@@ -159,6 +163,7 @@ pub fn export_interactive_topology_html(
         }
     }
 
+    // Embed JSON data and assemble HTML page
     let graph_data = GraphData { nodes, links };
     let json_data = serde_json::to_string(&graph_data)
         .map_err(|e| format!("Failed to serialize graph data: {}", e))?;
@@ -173,8 +178,7 @@ pub fn export_interactive_topology_html(
     Ok(())
 }
 
-fn build_host_node(host: &HostResult) -> GraphNode {
-    let is_gateway = host.ip.octets()[3] == 1;
+fn build_host_node(host: &HostResult, is_gateway: bool) -> GraphNode {
     let role = classify_host(host, is_gateway);
 
     let (color, category, radius) = match role {

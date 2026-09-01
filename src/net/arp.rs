@@ -187,7 +187,7 @@ pub fn parse_arp_output(output: &str, interface_filter: Option<&str>) -> Vec<Arp
             continue;
         }
 
-        if ip.octets()[3] == 255 || mac == "ff:ff:ff:ff:ff:ff" || ip.is_multicast() {
+        if ip.is_broadcast() || mac == "ff:ff:ff:ff:ff:ff" || ip.is_multicast() {
             continue;
         }
 

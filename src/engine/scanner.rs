@@ -179,8 +179,12 @@ pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration)
                 }
             } else if port == 80 || port == 8080 {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let req = b"HEAD / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
-                let _ = stream.write_all(req).await;
+                let req = format!(
+                    "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: idnx/{}\r\nConnection: close\r\n\r\n",
+                    ip,
+                    env!("CARGO_PKG_VERSION")
+                );
+                let _ = stream.write_all(req.as_bytes()).await;
                 let mut buf = [0u8; 256];
                 if let Ok(Ok(n)) = timeout(Duration::from_millis(250), stream.read(&mut buf)).await
                     && n > 0
@@ -382,7 +386,7 @@ pub async fn scan_subnet_ext(
 
     // Populate with ARP-discovered devices first (they are 100% active on the wire!)
     for (&ip, arp) in &arp_map {
-        if ip == cidr.broadcast() || ip.octets()[3] == 255 || arp.mac == "ff:ff:ff:ff:ff:ff" {
+        if ip == cidr.broadcast() || ip.is_broadcast() || arp.mac == "ff:ff:ff:ff:ff:ff" || ip.is_multicast() {
             continue;
         }
         host_results.insert(
@@ -502,19 +506,32 @@ pub async fn scan_subnet_ext(
         .collect();
 
     if !missing_ips.is_empty() {
-        let octets = cidr.addr().octets();
-        let gw_ip = Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
-        let dns_ptrs = crate::net::dns::resolve_unicast_dns_ptrs(
-            &missing_ips,
-            gw_ip,
-            Duration::from_millis(400),
-        )
-        .await;
-        for (ip, name) in dns_ptrs {
-            if let Some(host) = host_results.get_mut(&ip)
-                && host.hostname.is_none()
-            {
-                host.hostname = Some(name);
+        // Query DNS server from:
+        // 1. Any discovered host with port 53 (DNS) open
+        // 2. Kernel default gateway
+        let dns_server_opt = host_results
+            .values()
+            .find(|h| h.open_ports.iter().any(|p| p.port == 53))
+            .map(|h| h.ip)
+            .or_else(|| {
+                crate::net::interface::detect_local_network()
+                    .ok()
+                    .and_then(|info| info.default_gateway)
+            });
+
+        if let Some(gw_ip) = dns_server_opt {
+            let dns_ptrs = crate::net::dns::resolve_unicast_dns_ptrs(
+                &missing_ips,
+                gw_ip,
+                Duration::from_millis(400),
+            )
+            .await;
+            for (ip, name) in dns_ptrs {
+                if let Some(host) = host_results.get_mut(&ip)
+                    && host.hostname.is_none()
+                {
+                    host.hostname = Some(name);
+                }
             }
         }
     }
@@ -712,6 +729,7 @@ pub struct ScannerBuilder {
     recursive: bool,
     max_depth: usize,
     enable_ipv6: bool,
+    enable_heuristic_sweep: bool,
 }
 
 impl Default for ScannerBuilder {
@@ -734,6 +752,7 @@ impl ScannerBuilder {
             recursive: false,
             max_depth: 2,
             enable_ipv6: true,
+            enable_heuristic_sweep: false,
         }
     }
 
@@ -826,6 +845,12 @@ impl ScannerBuilder {
         self
     }
 
+    /// Enables or disables brute-force RFC 1918 candidate sweeping (disabled by default)
+    pub fn enable_heuristic_sweep(mut self, enable: bool) -> Self {
+        self.enable_heuristic_sweep = enable;
+        self
+    }
+
     /// Builds the configured `Scanner` instance
     pub fn build(self) -> Result<Scanner, String> {
         let target = match self.target {
@@ -847,6 +872,7 @@ impl ScannerBuilder {
             recursive: self.recursive,
             max_depth: self.max_depth,
             enable_ipv6: self.enable_ipv6,
+            enable_heuristic_sweep: self.enable_heuristic_sweep,
         })
     }
 }
@@ -865,6 +891,7 @@ pub struct Scanner {
     pub recursive: bool,
     pub max_depth: usize,
     pub enable_ipv6: bool,
+    pub enable_heuristic_sweep: bool,
 }
 
 impl Scanner {
@@ -895,6 +922,7 @@ impl Scanner {
                 self.snmp_config.as_ref(),
                 self.recursive,
                 self.max_depth,
+                self.enable_heuristic_sweep,
             )
             .await
         } else {

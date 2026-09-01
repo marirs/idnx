@@ -78,10 +78,10 @@ async fn http_get(
     let request = format!(
         "GET {} HTTP/1.1\r\n\
          Host: {}:{}\r\n\
-         User-Agent: idnx/0.2.2\r\n\
+         User-Agent: idnx/{}\r\n\
          Accept: application/json, text/event-stream, */*\r\n\
          Connection: close\r\n\r\n",
-        path, ip, port
+        path, ip, port, env!("CARGO_PKG_VERSION")
     );
 
     timeout(timeout_duration, stream.write_all(request.as_bytes()))

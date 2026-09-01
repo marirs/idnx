@@ -34,6 +34,7 @@ pub fn print_topology_tree(
     );
 
     let local_ip = local_info_opt.map(|info| info.ip);
+    let default_gw = local_info_opt.and_then(|info| info.default_gateway);
 
     // Group hosts by role
     let mut gateways = Vec::new();
@@ -44,7 +45,7 @@ pub fn print_topology_tree(
     let mut generic_hosts = Vec::new();
 
     for host in &summary.active_hosts {
-        let is_gateway = host.ip.octets()[3] == 1; // standard default gateway heuristic
+        let is_gateway = default_gw.map(|gw| gw == host.ip).unwrap_or(false);
         let role = classify_host(host, is_gateway);
         match role {
             DeviceRole::GatewayRouter => gateways.push(host),
@@ -235,9 +236,9 @@ pub fn print_topology_tree(
             let mut endpoints = Vec::new();
 
             for host in &child.summary.active_hosts {
-                if host.ip.octets()[3] == 1
-                    || host.open_ports.iter().any(|p| p.port == 23 || p.port == 80)
-                {
+                let is_gw = host.ip == child.gateway;
+                let role = classify_host(host, is_gw);
+                if is_gw || role == DeviceRole::GatewayRouter || role == DeviceRole::Switch {
                     switch_gws.push(host);
                 } else {
                     endpoints.push(host);

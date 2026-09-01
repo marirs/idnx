@@ -72,9 +72,13 @@ struct Cli {
     #[arg(long = "output-file")]
     output_file: Option<String>,
 
-    /// SNMP community strings to probe (comma-separated, default: "public,private")
-    #[arg(long, default_value = "public,private")]
+    /// SNMP community strings to probe (comma-separated, default: "public")
+    #[arg(long, default_value = "public")]
     snmp_communities: String,
+
+    /// Enable heuristic brute-force RFC 1918 candidate sweeping (default: false)
+    #[arg(long, default_value_t = false)]
+    heuristic_sweep: bool,
 
     /// SNMP target UDP port (default: 161)
     #[arg(long, default_value_t = 161)]
@@ -287,24 +291,6 @@ async fn main() {
         }
     }
 
-    // ASUS Router Discovery Protocol (UDP 9999 / 18017)
-    let asus_routers = probes::asus::discover_asus_routers(Duration::from_millis(300)).await;
-    if !asus_routers.is_empty() {
-        println!(
-            "{} Discovered {} ASUSWRT router(s):",
-            "[+]".green().bold(),
-            asus_routers.len().to_string().cyan().bold()
-        );
-        for a in &asus_routers {
-            println!(
-                "    └── 📡 [{}] Model: {} | Firmware: {} | SSID: {}",
-                a.ip.to_string().cyan().bold(),
-                a.model_name.as_deref().unwrap_or("ASUS Router").green().bold(),
-                a.firmware_version.as_deref().unwrap_or("N/A").dimmed(),
-                a.ssid.as_deref().unwrap_or("N/A").yellow()
-            );
-        }
-    }
 
     if !cli.no_deep {
         println!(
@@ -367,6 +353,7 @@ async fn main() {
             Some(&snmp_cfg),
             cli.recursive,
             cli.max_depth,
+            cli.heuristic_sweep,
         )
         .await
     } else {

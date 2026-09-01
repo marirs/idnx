@@ -1,6 +1,6 @@
 use if_addrs::{IfAddr, get_if_addrs};
 use ipnet::Ipv4Net;
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -11,6 +11,7 @@ pub struct LocalNetworkInfo {
     #[allow(dead_code)]
     pub prefix_len: u8,
     pub cidr: Ipv4Net,
+    pub default_gateway: Option<Ipv4Addr>,
 }
 
 impl LocalNetworkInfo {
@@ -26,6 +27,7 @@ impl LocalNetworkInfo {
             netmask,
             prefix_len,
             cidr,
+            default_gateway: None,
         })
     }
 }
@@ -51,14 +53,16 @@ pub fn detect_local_network() -> Result<LocalNetworkInfo, String> {
         return Err("No active IPv4 network interfaces found on system.".to_string());
     }
 
-    // Attempt 1: Query the OS kernel routing table for the outbound IP
-    if let Ok(outbound_ip) = get_outbound_ip()
-        && let Some(matched) = all_interfaces.iter().find(|info| info.ip == outbound_ip)
+    // Attempt 1: Query the OS kernel routing table for the default route without external network packets
+    if let Some((iface_name, gw_opt)) = get_kernel_default_route()
+        && let Some(matched) = all_interfaces.iter().find(|info| info.interface_name.eq_ignore_ascii_case(&iface_name))
     {
-        return Ok(matched.clone());
+        let mut res = matched.clone();
+        res.default_gateway = gw_opt;
+        return Ok(res);
     }
 
-    // Attempt 2: Pick the first non-virtual / non-loopback interface
+    // Attempt 2: Pick the preferred non-virtual physical interface (en*, eth*, wl*)
     let preferred = all_interfaces.iter().find(|info| {
         let name = info.interface_name.to_lowercase();
         (name.starts_with("en") || name.starts_with("eth") || name.starts_with("wl"))
@@ -165,22 +169,77 @@ pub fn resolve_target(
     Ok((cidr, None))
 }
 
-/// Queries the OS kernel for the default outbound IP address via a dummy UDP socket connect.
-fn get_outbound_ip() -> Result<Ipv4Addr, String> {
-    let socket =
-        UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
-
-    socket
-        .connect("8.8.8.8:80")
-        .map_err(|e| format!("Failed to resolve outbound route: {}", e))?;
-
-    match socket.local_addr() {
-        Ok(addr) => match addr.ip() {
-            IpAddr::V4(v4) => Ok(v4),
-            IpAddr::V6(_) => Err("Outbound IP resolved to IPv6".to_string()),
-        },
-        Err(e) => Err(format!("Failed to retrieve local address: {}", e)),
+/// Queries the OS kernel for the default route without external network packets or internet access
+fn get_kernel_default_route() -> Option<(String, Option<Ipv4Addr>)> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("netstat")
+            .args(["-rn", "-f", "inet"])
+            .output()
+            && let Ok(text) = String::from_utf8(output.stdout)
+        {
+            let mut in_table = false;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("Destination") {
+                    in_table = true;
+                    continue;
+                }
+                if in_table {
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 4 && parts[0] == "default" {
+                        let gw = parts[1].parse::<Ipv4Addr>().ok();
+                        let iface = parts[3].to_string();
+                        return Some((iface, gw));
+                    }
+                }
+            }
+        }
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+            for line in content.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 3 && fields[1] == "00000000" {
+                    let iface = fields[0].to_string();
+                    let gw = u32::from_str_radix(fields[2], 16)
+                        .ok()
+                        .map(|hex| Ipv4Addr::from(hex.to_be()));
+                    return Some((iface, gw));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("route")
+            .args(["print", "-4"])
+            .output()
+            && let Ok(text) = String::from_utf8(output.stdout)
+        {
+            let mut in_active_routes = false;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains("Active Routes:") {
+                    in_active_routes = true;
+                    continue;
+                }
+                if in_active_routes {
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 5 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
+                        let gw = parts[2].parse::<Ipv4Addr>().ok();
+                        let iface_ip = parts[3];
+                        return Some((iface_ip.to_string(), gw));
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

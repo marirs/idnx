@@ -238,123 +238,133 @@ async fn harvest_windows_routes() -> Vec<KernelRoute> {
     }
 }
 
-/// Discovers adjacent routed subnets across ALL RFC 1918 ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-/// dynamically inferred from kernel routes, local interfaces, and gateway probing.
-pub async fn derive_adjacent_candidate_gateways(
+/// Identifies the evidence source that discovered a network route
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiscoverySource {
+    KernelRoute,
+    SnmpRouteTable,
+    UpnpSsdp,
+    DhcpOption3,
+    LldpCdp,
+    ExplicitSubnet,
+    HeuristicSweep,
+}
+
+impl DiscoverySource {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            DiscoverySource::KernelRoute => "Kernel Routing Table",
+            DiscoverySource::SnmpRouteTable => "SNMP MIB-II ipRouteTable",
+            DiscoverySource::UpnpSsdp => "UPnP / SSDP",
+            DiscoverySource::DhcpOption3 => "DHCP Default Gateway",
+            DiscoverySource::LldpCdp => "Layer 2 LLDP/CDP",
+            DiscoverySource::ExplicitSubnet => "Explicit Subnet",
+            DiscoverySource::HeuristicSweep => "Heuristic Sweep",
+        }
+    }
+}
+
+/// Represents an active network route with its responding gateway and verified prefix
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiscoveredRoute {
+    pub gateway: Ipv4Addr,
+    pub network: Ipv4Net,
+    pub source: DiscoverySource,
+}
+
+/// Discovers adjacent candidate routes from OS kernel routing tables, network interfaces,
+/// and live wire advertisements (UPnP / SSDP) without blind guessing.
+pub async fn derive_candidate_routes(
     parent_cidr: &Ipv4Net,
-) -> Vec<(Ipv4Addr, Ipv4Net)> {
+    enable_heuristic_sweep: bool,
+) -> Vec<DiscoveredRoute> {
     let mut candidates = HashSet::new();
 
-    // 1. Ingest all gateways and subnets from OS routing table
+    // 1. Ingest all gateways and subnets from OS kernel routing table
     let kernel_routes = harvest_kernel_routes().await;
     for route in kernel_routes {
-        // If route has a private gateway outside current CIDR, candidate!
+        let prefix = route.destination.prefix_len();
+
+        // Direct routed destination network with known prefix (e.g. /16, /20, /24)
+        if prefix > 0 && prefix < 32 && &route.destination != parent_cidr {
+            let gw = route.gateway.unwrap_or_else(|| route.destination.network());
+            candidates.insert(DiscoveredRoute {
+                gateway: gw,
+                network: route.destination,
+                source: DiscoverySource::KernelRoute,
+            });
+        }
+
+        // If route has an explicit gateway outside parent_cidr
         if let Some(gw) = route.gateway
             && is_rfc1918(&gw)
             && !parent_cidr.contains(&gw)
         {
-            // Derive /24 subnet containing this gateway
-            if let Ok(sub) = Ipv4Net::new(Ipv4Addr::new(gw.octets()[0], gw.octets()[1], gw.octets()[2], 0), 24) {
-                candidates.insert((gw, sub));
-            }
-        }
-
-        // If route destination is a private network not equal to parent, candidate!
-        if is_rfc1918(&route.destination.addr())
-            && &route.destination != parent_cidr
-            && route.destination.prefix_len() >= 16
-            && route.destination.prefix_len() <= 29
-        {
-            // Probe .1 and .254 in that destination subnet
-            let octets = route.destination.addr().octets();
-            let gw1 = Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
-            let gw254 = Ipv4Addr::new(octets[0], octets[1], octets[2], 254);
-            if !parent_cidr.contains(&gw1) {
-                candidates.insert((gw1, route.destination));
-            }
-            if !parent_cidr.contains(&gw254) {
-                candidates.insert((gw254, route.destination));
-            }
+            let net = if route.destination.contains(&gw) && prefix > 0 && prefix < 32 {
+                route.destination
+            } else if let Ok(n) = Ipv4Net::new(Ipv4Addr::new(gw.octets()[0], gw.octets()[1], gw.octets()[2], 0), 24) {
+                n
+            } else {
+                continue;
+            };
+            candidates.insert(DiscoveredRoute {
+                gateway: gw,
+                network: net,
+                source: DiscoverySource::KernelRoute,
+            });
         }
     }
 
-    // 2. Ingest other local network interfaces (e.g. secondary NIC, bridge, VLAN interface)
+    // 2. Ingest secondary network interfaces with their exact interface CIDR
     if let Ok(ifaces) = crate::net::interface::list_ipv4_interfaces() {
         for iface in ifaces {
             if &iface.cidr != parent_cidr && is_rfc1918(&iface.ip) {
-                let octets = iface.ip.octets();
-                let gw1 = Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
-                let gw254 = Ipv4Addr::new(octets[0], octets[1], octets[2], 254);
-                candidates.insert((gw1, iface.cidr));
-                candidates.insert((gw254, iface.cidr));
+                candidates.insert(DiscoveredRoute {
+                    gateway: iface.ip,
+                    network: iface.cidr,
+                    source: DiscoverySource::KernelRoute,
+                });
             }
         }
     }
 
-    // Ingest active UPnP/SSDP devices
+    // 3. Ingest active UPnP/SSDP discovered device endpoints
     let upnp_devices =
         crate::probes::upnp::discover_upnp_devices(Duration::from_millis(300)).await;
     for dev in upnp_devices {
         if !parent_cidr.contains(&dev.ip) && is_rfc1918(&dev.ip) {
             let octets = dev.ip.octets();
             if let Ok(sub) = Ipv4Net::new(Ipv4Addr::new(octets[0], octets[1], octets[2], 0), 24) {
-                candidates.insert((dev.ip, sub));
+                candidates.insert(DiscoveredRoute {
+                    gateway: dev.ip,
+                    network: sub,
+                    source: DiscoverySource::UpnpSsdp,
+                });
             }
         }
     }
 
-    // 3. Dynamic candidate generation for the active subnet class:
-    let octets = parent_cidr.addr().octets();
-    if octets[0] == 192 && octets[1] == 168 {
-        // Probe all 254 /24 subnets in 192.168.0.0/16 checking both .1 and .254
-        for third in 1..=254 {
-            let gw1 = Ipv4Addr::new(192, 168, third, 1);
-            let gw254 = Ipv4Addr::new(192, 168, third, 254);
-            if let Ok(net) = Ipv4Net::new(Ipv4Addr::new(192, 168, third, 0), 24) {
-                if !parent_cidr.contains(&gw1) {
-                    candidates.insert((gw1, net));
-                }
-                if !parent_cidr.contains(&gw254) {
-                    candidates.insert((gw254, net));
-                }
-            }
-        }
-    } else if octets[0] == 10 {
-        // In 10.0.0.0/8, test adjacent /24s around current second & third octet, plus common enterprise /24s
-        let current_second = octets[1];
-        let current_third = octets[2];
-        for delta in [-1i16, 1, 2] {
-            let target_third = current_third as i16 + delta;
-            if (1..=254).contains(&target_third) {
-                let third = target_third as u8;
-                let gw1 = Ipv4Addr::new(10, current_second, third, 1);
-                let gw254 = Ipv4Addr::new(10, current_second, third, 254);
-                if let Ok(net) = Ipv4Net::new(Ipv4Addr::new(10, current_second, third, 0), 24) {
+    // 4. Heuristic sweep option: strictly opt-in via --heuristic-sweep flag
+    if enable_heuristic_sweep {
+        let octets = parent_cidr.addr().octets();
+        if octets[0] == 192 && octets[1] == 168 {
+            for third in 0..=255 {
+                let gw1 = Ipv4Addr::new(192, 168, third, 1);
+                let gw254 = Ipv4Addr::new(192, 168, third, 254);
+                if let Ok(net) = Ipv4Net::new(Ipv4Addr::new(192, 168, third, 0), 24) {
                     if !parent_cidr.contains(&gw1) {
-                        candidates.insert((gw1, net));
+                        candidates.insert(DiscoveredRoute {
+                            gateway: gw1,
+                            network: net,
+                            source: DiscoverySource::HeuristicSweep,
+                        });
                     }
                     if !parent_cidr.contains(&gw254) {
-                        candidates.insert((gw254, net));
-                    }
-                }
-            }
-        }
-    } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
-        // In 172.16.0.0/12, test adjacent /24s
-        let current_second = octets[1];
-        let current_third = octets[2];
-        for delta in [-1i16, 1] {
-            let target_third = current_third as i16 + delta;
-            if (1..=254).contains(&target_third) {
-                let third = target_third as u8;
-                let gw1 = Ipv4Addr::new(172, current_second, third, 1);
-                let gw254 = Ipv4Addr::new(172, current_second, third, 254);
-                if let Ok(net) = Ipv4Net::new(Ipv4Addr::new(172, current_second, third, 0), 24) {
-                    if !parent_cidr.contains(&gw1) {
-                        candidates.insert((gw1, net));
-                    }
-                    if !parent_cidr.contains(&gw254) {
-                        candidates.insert((gw254, net));
+                        candidates.insert(DiscoveredRoute {
+                            gateway: gw254,
+                            network: net,
+                            source: DiscoverySource::HeuristicSweep,
+                        });
                     }
                 }
             }
@@ -408,5 +418,17 @@ default via 10.0.0.1 dev eth0 proto dhcp metric 100
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].gateway, Some(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(routes[2].destination, Ipv4Net::from_str("172.17.0.0/16").unwrap());
+    }
+
+    #[test]
+    fn test_discovered_route_topology_preservation() {
+        let route = DiscoveredRoute {
+            gateway: Ipv4Addr::new(10, 20, 30, 17),
+            network: Ipv4Net::from_str("10.20.30.0/24").unwrap(),
+            source: DiscoverySource::KernelRoute,
+        };
+        assert_eq!(route.gateway, Ipv4Addr::new(10, 20, 30, 17));
+        assert_eq!(route.source.display_name(), "Kernel Routing Table");
+        assert_ne!(route.gateway, Ipv4Addr::new(10, 20, 30, 1));
     }
 }

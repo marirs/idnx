@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # idNX universal installer for macOS and Linux.
 #
 #   curl -fsSL https://idnx.sh | bash
-#   curl -fsSL https://idnx.sh | VERSION=v0.1.0 bash
+#   curl -fsSL https://idnx.sh | VERSION=v0.2.2 bash
 #   curl -fsSL https://idnx.sh | IDNX_INSTALL_DIR="$HOME/.local/bin" bash
 
 REPO="${IDNX_REPO:-marirs/idnx}"
