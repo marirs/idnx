@@ -242,6 +242,7 @@ async fn harvest_windows_routes() -> Vec<KernelRoute> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiscoverySource {
     KernelRoute,
+    UpstreamHop,
     SnmpRouteTable,
     UpnpSsdp,
     DhcpOption3,
@@ -254,6 +255,7 @@ impl DiscoverySource {
     pub fn display_name(&self) -> &'static str {
         match self {
             DiscoverySource::KernelRoute => "Kernel Routing Table",
+            DiscoverySource::UpstreamHop => "Upstream Routed Gateway (TTL Hop)",
             DiscoverySource::SnmpRouteTable => "SNMP MIB-II ipRouteTable",
             DiscoverySource::UpnpSsdp => "UPnP / SSDP",
             DiscoverySource::DhcpOption3 => "DHCP Default Gateway",
@@ -272,13 +274,79 @@ pub struct DiscoveredRoute {
     pub source: DiscoverySource,
 }
 
+/// Discovers upstream cascaded router gateways by analyzing TTL response hops
+pub async fn harvest_upstream_hops(parent_cidr: &Ipv4Net) -> Vec<Ipv4Addr> {
+    let mut hops = Vec::new();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let output_res = Command::new("traceroute")
+            .args(["-n", "-m", "4", "-q", "1", "-w", "1", "1.1.1.1"])
+            .output()
+            .await;
+
+        if let Ok(out) = output_res
+            && let Ok(text) = String::from_utf8(out.stdout)
+        {
+            for line in text.lines().skip(1) {
+                for token in line.split_whitespace() {
+                    if let Ok(ip) = token.parse::<Ipv4Addr>() {
+                        if is_rfc1918(&ip) && !parent_cidr.contains(&ip) && !hops.contains(&ip) {
+                            hops.push(ip);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output_res = Command::new("tracert")
+            .args(["-d", "-h", "4", "-w", "1000", "1.1.1.1"])
+            .output()
+            .await;
+
+        if let Ok(out) = output_res
+            && let Ok(text) = String::from_utf8(out.stdout)
+        {
+            for line in text.lines() {
+                for token in line.split_whitespace() {
+                    if let Ok(ip) = token.parse::<Ipv4Addr>() {
+                        if is_rfc1918(&ip) && !parent_cidr.contains(&ip) && !hops.contains(&ip) {
+                            hops.push(ip);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    hops
+}
+
 /// Discovers adjacent candidate routes from OS kernel routing tables, network interfaces,
-/// and live wire advertisements (UPnP / SSDP) without blind guessing.
+/// upstream cascaded gateway hops (TTL inference), and live wire advertisements (UPnP / SSDP).
 pub async fn derive_candidate_routes(
     parent_cidr: &Ipv4Net,
     enable_heuristic_sweep: bool,
 ) -> Vec<DiscoveredRoute> {
     let mut candidates = HashSet::new();
+
+    // 1. Ingest upstream cascaded gateways discovered via TTL hop inference
+    let upstream_hops = harvest_upstream_hops(parent_cidr).await;
+    for hop_ip in upstream_hops {
+        let octets = hop_ip.octets();
+        if let Ok(net) = Ipv4Net::new(Ipv4Addr::new(octets[0], octets[1], octets[2], 0), 24) {
+            candidates.insert(DiscoveredRoute {
+                gateway: hop_ip,
+                network: net,
+                source: DiscoverySource::UpstreamHop,
+            });
+        }
+    }
 
     // 1. Ingest all gateways and subnets from OS kernel routing table
     let kernel_routes = harvest_kernel_routes().await;
