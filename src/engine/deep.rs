@@ -81,10 +81,10 @@ pub async fn explore_downstream_networks(
     if let Some(extra) = extra_subnets_opt {
         for part in extra.split(',') {
             let part = part.trim();
-            if let Ok(cidr) = Ipv4Net::from_str(part) {
-                if seen.insert(cidr) {
-                    targets_to_test.push((cidr, format!("Explicit Subnet ({})", cidr)));
-                }
+            if let Ok(cidr) = Ipv4Net::from_str(part)
+                && seen.insert(cidr)
+            {
+                targets_to_test.push((cidr, format!("Explicit Subnet ({})", cidr)));
             }
         }
     }

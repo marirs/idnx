@@ -99,13 +99,12 @@ pub fn parse_lldp_frame(payload: &[u8]) -> Option<LldpNeighbor> {
                     }
                 }
             }
-            8 => {
+            8
                 // Management Address
-                if value.len() >= 6 && value[0] == 5 && value[1] == 1 {
+                if value.len() >= 6 && value[0] == 5 && value[1] == 1 => {
                     // IPv4 management address
                     management_ip = Some(Ipv4Addr::new(value[2], value[3], value[4], value[5]));
                 }
-            }
             _ => {}
         }
     }
@@ -246,10 +245,10 @@ fn capture_macos_bpf(interface: &str, duration: Duration) -> LldpCaptureResult {
                     // Check EtherType at offset 12 in the Ethernet header
                     let ethertype =
                         ((buffer[pkt_start + 12] as u16) << 8) | (buffer[pkt_start + 13] as u16);
-                    if ethertype == 0x88CC {
-                        if let Some(neighbor) = parse_lldp_frame(&buffer[pkt_start..n]) {
-                            neighbors.push(neighbor);
-                        }
+                    if ethertype == 0x88CC
+                        && let Some(neighbor) = parse_lldp_frame(&buffer[pkt_start..n])
+                    {
+                        neighbors.push(neighbor);
                     }
 
                     // Move to next packet

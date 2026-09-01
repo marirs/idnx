@@ -44,6 +44,18 @@ pub fn lookup_vendor(mac: &str) -> Option<String> {
 
 /// Reads the operating system's ARP table
 pub fn read_system_arp_table(interface_filter: Option<&str>) -> Vec<ArpEntry> {
+    // 1. Linux kernel /proc/net/arp (present on all Linux flavours without requiring net-tools)
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/net/arp") {
+            let entries = parse_proc_net_arp(&content, interface_filter);
+            if !entries.is_empty() {
+                return entries;
+            }
+        }
+    }
+
+    // 2. Standard `arp -a` (macOS, BSD, Windows, Linux)
     let output = match Command::new("arp").arg("-a").output() {
         Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
         Err(_) => return Vec::new(),
@@ -52,17 +64,73 @@ pub fn read_system_arp_table(interface_filter: Option<&str>) -> Vec<ArpEntry> {
     parse_arp_output(&output, interface_filter)
 }
 
-/// Parses the standard Unix / macOS `arp -a` output
+/// Parses the Linux `/proc/net/arp` table
+#[allow(dead_code)]
+pub fn parse_proc_net_arp(content: &str, interface_filter: Option<&str>) -> Vec<ArpEntry> {
+    let mut entries = Vec::new();
+    for line in content.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        let ip_str = parts[0];
+        let mac_str = parts[3];
+        let iface = parts[5];
+
+        if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
+            if mac_str == "00:00:00:00:00:00" || ip.is_multicast() || ip.is_broadcast() {
+                continue;
+            }
+            if let Some(target_iface) = interface_filter
+                && !iface.eq_ignore_ascii_case(target_iface)
+            {
+                continue;
+            }
+            let mac = normalize_mac(mac_str);
+            let vendor = lookup_vendor(&mac);
+            entries.push(ArpEntry {
+                ip,
+                mac,
+                hostname: None,
+                interface: iface.to_string(),
+                vendor,
+            });
+        }
+    }
+    entries
+}
+
+/// Parses standard Unix/macOS and Windows `arp -a` output
 pub fn parse_arp_output(output: &str, interface_filter: Option<&str>) -> Vec<ArpEntry> {
     let mut entries = Vec::new();
 
     for line in output.lines() {
-        // Example macOS line:
-        // linksys07877 (192.168.1.1) at 74:12:13:14:75:dc on en0 ifscope [ethernet]
-        // ? (192.168.1.37) at 7a:d5:6:f5:14:6b on en0 ifscope [ethernet]
-        // ? (192.168.1.144) at (incomplete) on en0 ifscope [ethernet]
         let line = line.trim();
         if line.is_empty() || line.contains("(incomplete)") {
+            continue;
+        }
+
+        // Check Windows format: "  192.168.1.1           74-12-13-14-75-dc     dynamic"
+        if !line.contains('(') {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() >= 2
+                && let Ok(ip) = Ipv4Addr::from_str(tokens[0])
+                && tokens[1].contains('-')
+                && tokens[1].len() >= 17
+            {
+                let mac = normalize_mac(&tokens[1].replace('-', ":"));
+                if mac != "ff:ff:ff:ff:ff:ff" && !ip.is_multicast() && !ip.is_broadcast() {
+                    let vendor = lookup_vendor(&mac);
+                    entries.push(ArpEntry {
+                        ip,
+                        mac,
+                        hostname: None,
+                        interface: String::new(),
+                        vendor,
+                    });
+                    continue;
+                }
+            }
             continue;
         }
 
@@ -113,10 +181,10 @@ pub fn parse_arp_output(output: &str, interface_filter: Option<&str>) -> Vec<Arp
             .unwrap_or("")
             .trim();
 
-        if let Some(target_iface) = interface_filter {
-            if !iface_token.eq_ignore_ascii_case(target_iface) {
-                continue;
-            }
+        if let Some(target_iface) = interface_filter
+            && !iface_token.eq_ignore_ascii_case(target_iface)
+        {
+            continue;
         }
 
         if ip.octets()[3] == 255 || mac == "ff:ff:ff:ff:ff:ff" || ip.is_multicast() {
@@ -205,5 +273,36 @@ mod tests {
         assert_eq!(entries[1].ip, Ipv4Addr::new(192, 168, 1, 166));
         assert_eq!(entries[1].hostname.as_deref(), Some("dmaker-fan"));
         assert_eq!(entries[1].vendor.as_deref(), Some("Xiaomi / Smartmi"));
+    }
+
+    #[test]
+    fn test_parse_proc_net_arp_linux() {
+        let sample = "IP address       HW type     Flags       HW address            Mask     Device\n\
+                      192.168.1.1      0x1         0x2         74:12:13:14:75:dc     *        eth0\n\
+                      192.168.1.53     0x1         0x2         a0:ad:9f:e6:38:00     *        eth0\n\
+                      192.168.1.99     0x1         0x0         00:00:00:00:00:00     *        eth0\n";
+
+        let entries = parse_proc_net_arp(sample, Some("eth0"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(entries[0].vendor.as_deref(), Some("Linksys"));
+        assert_eq!(entries[1].ip, Ipv4Addr::new(192, 168, 1, 53));
+        assert_eq!(entries[1].vendor.as_deref(), Some("ASUSTek Computer Inc."));
+    }
+
+    #[test]
+    fn test_parse_windows_arp() {
+        let sample = "Interface: 192.168.1.119 --- 0x10\n\
+                        Internet Address      Physical Address      Type\n\
+                        192.168.1.1           74-12-13-14-75-dc     dynamic\n\
+                        192.168.1.53          a0-ad-9f-e6-38-00     dynamic\n\
+                        192.168.1.255         ff-ff-ff-ff-ff-ff     static\n";
+
+        let entries = parse_arp_output(sample, None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(entries[0].vendor.as_deref(), Some("Linksys"));
+        assert_eq!(entries[1].ip, Ipv4Addr::new(192, 168, 1, 53));
+        assert_eq!(entries[1].vendor.as_deref(), Some("ASUSTek Computer Inc."));
     }
 }

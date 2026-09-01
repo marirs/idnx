@@ -156,22 +156,21 @@ pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration)
                 use tokio::io::AsyncReadExt;
                 let mut buf = [0u8; 128];
                 if let Ok(Ok(n)) = timeout(Duration::from_millis(250), stream.read(&mut buf)).await
+                    && n > 0
                 {
-                    if n > 0 {
-                        let banner = String::from_utf8_lossy(&buf[..n]);
-                        if banner.contains("Ubuntu") {
-                            service = "ssh (Ubuntu Linux)";
-                        } else if banner.contains("Debian") {
-                            service = "ssh (Debian Linux)";
-                        } else if banner.contains("Raspbian") {
-                            service = "ssh (Raspberry Pi)";
-                        } else if banner.contains("FreeBSD") {
-                            service = "ssh (FreeBSD)";
-                        } else if banner.contains("Cisco") {
-                            service = "ssh (Cisco)";
-                        } else if banner.contains("Dropbear") {
-                            service = "ssh (Embedded Linux / Router)";
-                        }
+                    let banner = String::from_utf8_lossy(&buf[..n]);
+                    if banner.contains("Ubuntu") {
+                        service = "ssh (Ubuntu Linux)";
+                    } else if banner.contains("Debian") {
+                        service = "ssh (Debian Linux)";
+                    } else if banner.contains("Raspbian") {
+                        service = "ssh (Raspberry Pi)";
+                    } else if banner.contains("FreeBSD") {
+                        service = "ssh (FreeBSD)";
+                    } else if banner.contains("Cisco") {
+                        service = "ssh (Cisco)";
+                    } else if banner.contains("Dropbear") {
+                        service = "ssh (Embedded Linux / Router)";
                     }
                 }
             } else if port == 80 || port == 8080 {
@@ -180,19 +179,18 @@ pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration)
                 let _ = stream.write_all(req).await;
                 let mut buf = [0u8; 256];
                 if let Ok(Ok(n)) = timeout(Duration::from_millis(250), stream.read(&mut buf)).await
+                    && n > 0
                 {
-                    if n > 0 {
-                        let res = String::from_utf8_lossy(&buf[..n]);
-                        let lower = res.to_ascii_lowercase();
-                        if lower.contains("server: nginx") {
-                            service = "http (nginx)";
-                        } else if lower.contains("server: apache") {
-                            service = "http (Apache)";
-                        } else if lower.contains("server: lighttpd") {
-                            service = "http (Lighttpd)";
-                        } else if lower.contains("server: iis") {
-                            service = "http (Microsoft-IIS)";
-                        }
+                    let res = String::from_utf8_lossy(&buf[..n]);
+                    let lower = res.to_ascii_lowercase();
+                    if lower.contains("server: nginx") {
+                        service = "http (nginx)";
+                    } else if lower.contains("server: apache") {
+                        service = "http (Apache)";
+                    } else if lower.contains("server: lighttpd") {
+                        service = "http (Lighttpd)";
+                    } else if lower.contains("server: iis") {
+                        service = "http (Microsoft-IIS)";
                     }
                 }
             }
@@ -274,7 +272,7 @@ pub async fn scan_host_tcp(
 
 /// Fast ICMP ping probe for discovering live hosts across routed/cascaded subnets
 pub async fn ping_host(ip: Ipv4Addr, timeout_duration: Duration) -> bool {
-    let timeout_ms = (timeout_duration.as_millis() as u64).max(300).min(1500);
+    let timeout_ms = (timeout_duration.as_millis() as u64).clamp(300, 1500);
 
     #[cfg(target_os = "macos")]
     let cmd = tokio::process::Command::new("ping")
@@ -439,7 +437,7 @@ pub async fn scan_subnet(
         crate::net::mdns::resolve_mdns_hostnames(&active_ips, Duration::from_millis(500)).await;
     for (ip, name) in mdns_names {
         if let Some(host) = host_results.get_mut(&ip) {
-            let is_generic = host.hostname.as_deref().map_or(true, |h| {
+            let is_generic = host.hostname.as_deref().is_none_or(|h| {
                 h == "?"
                     || h == "-"
                     || h.eq_ignore_ascii_case("mac")
@@ -468,10 +466,10 @@ pub async fn scan_subnet(
         )
         .await;
         for (ip, name) in dns_ptrs {
-            if let Some(host) = host_results.get_mut(&ip) {
-                if host.hostname.is_none() {
-                    host.hostname = Some(name);
-                }
+            if let Some(host) = host_results.get_mut(&ip)
+                && host.hostname.is_none()
+            {
+                host.hostname = Some(name);
             }
         }
     }
@@ -489,7 +487,7 @@ pub async fn scan_subnet(
                 }
             }
             if let Some(ref fname) = dev.friendly_name {
-                let is_generic = host.hostname.as_deref().map_or(true, |h| {
+                let is_generic = host.hostname.as_deref().is_none_or(|h| {
                     h == "?"
                         || h == "-"
                         || h.eq_ignore_ascii_case("mac")

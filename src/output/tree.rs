@@ -163,7 +163,7 @@ pub fn print_topology_tree(
         println!(
             "{} 🌐 {}",
             branch.bold(),
-            "Cascaded Downstream Networks (Discovered Subnets & Endpoints)"
+            "Cascaded & Adjacent Networks (Upstream / Downstream Subnets)"
                 .bold()
                 .yellow()
         );

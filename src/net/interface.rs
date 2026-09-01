@@ -52,10 +52,10 @@ pub fn detect_local_network() -> Result<LocalNetworkInfo, String> {
     }
 
     // Attempt 1: Query the OS kernel routing table for the outbound IP
-    if let Ok(outbound_ip) = get_outbound_ip() {
-        if let Some(matched) = all_interfaces.iter().find(|info| info.ip == outbound_ip) {
-            return Ok(matched.clone());
-        }
+    if let Ok(outbound_ip) = get_outbound_ip()
+        && let Some(matched) = all_interfaces.iter().find(|info| info.ip == outbound_ip)
+    {
+        return Ok(matched.clone());
     }
 
     // Attempt 2: Pick the first non-virtual / non-loopback interface

@@ -50,7 +50,7 @@ fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<String> {
             if offset + 1 >= packet.len() {
                 return None;
             }
-            let ptr_offset = (((len & 0x3F) << 8) | (packet[offset + 1] as usize)) as usize;
+            let ptr_offset = ((len & 0x3F) << 8) | (packet[offset + 1] as usize);
             if ptr_offset >= packet.len() {
                 return None;
             }

@@ -150,6 +150,16 @@ async fn main() {
             .map(|info| info.interface_name.as_str())
     });
 
+    let iface_name = iface_filter.unwrap_or("en0");
+
+    if let Some(speed_info) = crate::net::link_speed::get_interface_link_speed(iface_name) {
+        println!(
+            "{} Interface Link Speed: {}",
+            "[*]".blue().bold(),
+            speed_info.speed_display.green().bold()
+        );
+    }
+
     println!(
         "{} Target: {} ({} hosts) | Ports: {} probed | Concurrency: {} | Timeout: {}ms",
         "[+]".green().bold(),
@@ -161,7 +171,7 @@ async fn main() {
     );
 
     // Layer 2 Hardware Discovery (LLDP - IEEE 802.1AB)
-    let iface_name = iface_filter.as_deref().unwrap_or("en0");
+    let iface_name = iface_filter.unwrap_or("en0");
     match crate::probes::lldp::capture_lldp_neighbors(iface_name, Duration::from_millis(600)).await
     {
         crate::probes::lldp::LldpCaptureResult::Success(neighbors) => {
@@ -184,8 +194,15 @@ async fn main() {
         }
         crate::probes::lldp::LldpCaptureResult::PermissionDenied => {
             println!(
-                "{} Note: Layer 2 LLDP capture requires root (run with 'sudo idnx' to capture raw IEEE 802.1AB frames)",
-                "[*]".blue().bold()
+                "{} PRIVILEGED DISCOVERY DISABLED (Non-Root / No Sudo):",
+                "[!]".yellow().bold()
+            );
+            println!(
+                "    ├── Layer 2 LLDP/CDP hardware switch discovery: DISABLED (Requires raw BPF / AF_PACKET)"
+            );
+            println!("    ├── Deep switch port map detection: REDUCED");
+            println!(
+                "    └── Recommendation: Run with 'sudo idnx' for full infrastructure visibility."
             );
         }
         crate::probes::lldp::LldpCaptureResult::NotSupported(_) => {}
