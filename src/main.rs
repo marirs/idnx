@@ -5,19 +5,18 @@ use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-const BANNER: &str = r#"
+const BANNER_ART: &str = r#"
   _     _ _   _  __  __
  (_) __| | \ | | \ \/ /
  | |/ _` |  \| |  \  / 
  | | (_| | |\  |  /  \ 
- |_|\__,_|_| \_| /_/\_\  v0.1.0
-"#;
+ |_|\__,_|_| \_| /_/\_\"#;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "idnx",
     author = "Sriram <marirs@gmail.com>",
-    version = "0.1.0",
+    version,
     about = "Network Identification & Deep eXploration Tool",
     long_about = "A fast, asynchronous network scanner and deep infrastructure exploration tool in Rust."
 )]
@@ -83,7 +82,11 @@ struct Cli {
 }
 
 fn print_banner() {
-    println!("{}", BANNER.cyan().bold());
+    println!(
+        "{}  {}\n",
+        BANNER_ART.trim_matches('\n').cyan().bold(),
+        format!("v{}", env!("CARGO_PKG_VERSION")).cyan().bold()
+    );
     println!(
         "{} {}\n",
         "⚡ idNX:".bold(),

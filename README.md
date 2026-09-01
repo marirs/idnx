@@ -6,7 +6,7 @@
  (_) __| | \ | | \ \/ /
  | |/ _` |  \| |  \  / 
  | | (_| | |\  |  /  \ 
- |_|\__,_|_| \_| /_/\_\  v0.1.0
+ |_|\__,_|_| \_| /_/\_\  v0.1.1
 ```
 
 **idNX** is a fast, asynchronous network discovery and deep infrastructure exploration utility and Rust library.
@@ -170,7 +170,7 @@ idnx --list-interfaces
 
 ```toml
 [dependencies]
-idnx = "0.1.0"
+idnx = "0.1.1"
 ```
 
 ```rust
