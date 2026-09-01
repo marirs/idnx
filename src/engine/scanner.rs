@@ -569,6 +569,8 @@ pub struct ScannerBuilder {
     enable_deep: bool,
     subnets: Option<String>,
     snmp_config: Option<crate::engine::deep::SnmpProbeConfig>,
+    recursive: bool,
+    max_depth: usize,
 }
 
 impl Default for ScannerBuilder {
@@ -588,6 +590,8 @@ impl ScannerBuilder {
             enable_deep: true,
             subnets: None,
             snmp_config: Some(crate::engine::deep::SnmpProbeConfig::default()),
+            recursive: false,
+            max_depth: 2,
         }
     }
 
@@ -650,6 +654,18 @@ impl ScannerBuilder {
         self
     }
 
+    /// Enables recursive multi-tier exploration across discovered routed subnets
+    pub fn recursive(mut self, enable: bool) -> Self {
+        self.recursive = enable;
+        self
+    }
+
+    /// Sets the maximum recursion depth for discovered subnets
+    pub fn max_depth(mut self, depth: usize) -> Self {
+        self.max_depth = depth;
+        self
+    }
+
     /// Comma-separated list of extra child subnets to sweep
     pub fn extra_subnets(mut self, subnets: impl Into<String>) -> Self {
         self.subnets = Some(subnets.into());
@@ -680,6 +696,8 @@ impl ScannerBuilder {
             enable_deep: self.enable_deep,
             subnets: self.subnets,
             snmp_config: self.snmp_config,
+            recursive: self.recursive,
+            max_depth: self.max_depth,
         })
     }
 }
@@ -695,6 +713,8 @@ pub struct Scanner {
     pub enable_deep: bool,
     pub subnets: Option<String>,
     pub snmp_config: Option<crate::engine::deep::SnmpProbeConfig>,
+    pub recursive: bool,
+    pub max_depth: usize,
 }
 
 impl Scanner {
@@ -722,6 +742,8 @@ impl Scanner {
                 self.concurrency,
                 self.timeout,
                 self.snmp_config.as_ref(),
+                self.recursive,
+                self.max_depth,
             )
             .await
         } else {

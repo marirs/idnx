@@ -1,18 +1,59 @@
+use std::path::PathBuf;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OuiInfo {
-    pub vendor: Option<&'static str>,
+    pub vendor: Option<String>,
     pub is_randomized: bool,
 }
 
 impl OuiInfo {
     pub fn display_label(&self) -> String {
-        match (self.vendor, self.is_randomized) {
+        match (&self.vendor, self.is_randomized) {
             (Some(v), true) => format!("{} [Randomized MAC]", v),
-            (Some(v), false) => v.to_string(),
+            (Some(v), false) => v.clone(),
             (None, true) => "Private / Randomized MAC".to_string(),
             (None, false) => "Unknown Vendor".to_string(),
         }
     }
+}
+
+/// Returns the path to the user-cached OUI database (~/.cache/idnx/oui.txt)
+pub fn get_oui_cache_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".cache").join("idnx").join("oui.txt"))
+}
+
+/// Downloads and updates the IEEE OUI database to ~/.cache/idnx/oui.txt
+pub async fn update_oui_database() -> Result<usize, String> {
+    let cache_file =
+        get_oui_cache_path().ok_or_else(|| "Could not determine cache path".to_string())?;
+    if let Some(parent) = cache_file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+    }
+
+    let cache_str = cache_file.to_str().ok_or("Invalid cache path string")?;
+    let status = tokio::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "https://standards-oui.ieee.org/oui/oui.txt",
+            "-o",
+            cache_str,
+        ])
+        .status()
+        .await
+        .map_err(|e| format!("Failed to run curl: {}", e))?;
+
+    if !status.success() {
+        return Err("Curl failed to download IEEE OUI registry".to_string());
+    }
+
+    let content = std::fs::read_to_string(&cache_file)
+        .map_err(|e| format!("Failed to read downloaded OUI file: {}", e))?;
+    let count = content.lines().filter(|l| l.contains("(hex)")).count();
+    Ok(count)
 }
 
 /// Parses a MAC address string into 6 bytes
@@ -30,7 +71,8 @@ pub fn parse_mac_bytes(mac_str: &str) -> Option<[u8; 6]> {
     Some(bytes)
 }
 
-/// Zero-allocation, sub-microsecond IEEE OUI lookup via sorted binary search
+/// 2-Tier IEEE OUI lookup: Checks Tier 1 (compiled static table) first,
+/// then falls back to Tier 2 (~/.cache/idnx/oui.txt) if present.
 pub fn lookup_mac(mac_str: &str) -> OuiInfo {
     let bytes = match parse_mac_bytes(mac_str) {
         Some(b) => b,
@@ -44,12 +86,34 @@ pub fn lookup_mac(mac_str: &str) -> OuiInfo {
 
     // IEEE 802 standard: Bit 1 (0x02) of the first octet indicates a Locally Administered (randomized) address
     let is_randomized = (bytes[0] & 0x02) != 0;
-
     let prefix = [bytes[0], bytes[1], bytes[2]];
-    let vendor = match OUI_DATABASE.binary_search_by_key(&prefix, |entry| entry.0) {
-        Ok(idx) => Some(OUI_DATABASE[idx].1),
+
+    // Tier 1: Embedded static OUI table
+    let mut vendor = match OUI_DATABASE.binary_search_by_key(&prefix, |entry| entry.0) {
+        Ok(idx) => Some(OUI_DATABASE[idx].1.to_string()),
         Err(_) => None,
     };
+
+    // Tier 2: User cache database (~/.cache/idnx/oui.txt)
+    if vendor.is_none()
+        && let Some(cache_path) = get_oui_cache_path()
+        && cache_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&cache_path)
+    {
+        let hex_prefix = format!("{:02X}-{:02X}-{:02X}", prefix[0], prefix[1], prefix[2]);
+        for line in content.lines() {
+            if line.starts_with(&hex_prefix)
+                && line.contains("(hex)")
+                && let Some(v) = line.split("(hex)").nth(1)
+            {
+                let trimmed = v.trim();
+                if !trimmed.is_empty() {
+                    vendor = Some(trimmed.to_string());
+                    break;
+                }
+            }
+        }
+    }
 
     OuiInfo {
         vendor,
@@ -144,14 +208,17 @@ mod tests {
     #[test]
     fn test_oui_lookup_asus() {
         let res = lookup_mac("a0:ad:9f:e6:38:00");
-        assert_eq!(res.vendor, Some("ASUSTek Computer Inc."));
+        assert_eq!(res.vendor.as_deref(), Some("ASUSTek Computer Inc."));
         assert!(!res.is_randomized);
     }
 
     #[test]
     fn test_oui_lookup_azurewave_dgx() {
         let res = lookup_mac("58:02:05:d1:70:62");
-        assert_eq!(res.vendor, Some("AzureWave (NVIDIA DGX / Compute Node)"));
+        assert_eq!(
+            res.vendor.as_deref(),
+            Some("AzureWave (NVIDIA DGX / Compute Node)")
+        );
         assert!(!res.is_randomized);
     }
 

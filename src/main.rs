@@ -88,6 +88,18 @@ struct Cli {
     #[arg(long = "export-graph")]
     export_graph: Option<String>,
 
+    /// Recursively pivot into subnets discovered via router routing tables
+    #[arg(long, default_value_t = false)]
+    recursive: bool,
+
+    /// Maximum recursion depth for discovered subnets (default: 2)
+    #[arg(long, default_value_t = 2)]
+    max_depth: usize,
+
+    /// Download and update the local IEEE OUI vendor registry (~/.cache/idnx/oui.txt)
+    #[arg(long = "update-oui", default_value_t = false)]
+    update_oui: bool,
+
     /// List all local network interfaces and exit
     #[arg(long, default_value_t = false)]
     list_interfaces: bool,
@@ -129,6 +141,31 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("{} Failed to list interfaces: {}", "[!]".red().bold(), e);
+            }
+        }
+        return;
+    }
+
+    // If --update-oui requested, download IEEE registry and exit
+    if cli.update_oui {
+        println!(
+            "{} Downloading master IEEE OUI registry to ~/.cache/idnx/oui.txt...",
+            "[*]".blue().bold()
+        );
+        match idnx::fingerprint::oui::update_oui_database().await {
+            Ok(count) => {
+                println!(
+                    "{} Successfully updated IEEE OUI registry ({} vendors indexed)!",
+                    "[+]".green().bold(),
+                    count.to_string().cyan().bold()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} Failed to update IEEE OUI registry: {}",
+                    "[!]".red().bold(),
+                    e
+                );
             }
         }
         return;
@@ -300,6 +337,8 @@ async fn main() {
             cli.concurrency,
             timeout_duration,
             Some(&snmp_cfg),
+            cli.recursive,
+            cli.max_depth,
         )
         .await
     } else {

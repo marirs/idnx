@@ -1,7 +1,7 @@
 use crate::engine::scanner::{HostResult, ScanSummary, scan_subnet};
 use crate::probes::snmp::{SnmpArpEntry, harvest_snmp_device};
 use ipnet::Ipv4Net;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -82,6 +82,7 @@ impl Default for SnmpProbeConfig {
 
 /// Explores downstream and cascaded networks, using SNMP MIB-II walking
 /// to extract router routing tables (`ipRouteTable`) and remote ARP caches (`ipNetToMediaTable`).
+#[allow(clippy::too_many_arguments)]
 pub async fn explore_downstream_networks(
     parent_cidr: &Ipv4Net,
     extra_subnets_opt: Option<&str>,
@@ -89,10 +90,14 @@ pub async fn explore_downstream_networks(
     concurrency: usize,
     timeout_duration: Duration,
     snmp_config: Option<&SnmpProbeConfig>,
+    recursive: bool,
+    max_depth: usize,
 ) -> Vec<ChildNetworkResult> {
-    let mut targets_to_test = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
     let mut seen = HashSet::new();
     seen.insert(*parent_cidr);
+
+    let effective_max_depth = if recursive { max_depth.max(1) } else { 1 };
 
     // Query UPnP / SSDP devices on the network
     let _upnp_devices =
@@ -105,7 +110,7 @@ pub async fn explore_downstream_networks(
             if let Ok(cidr) = Ipv4Net::from_str(part)
                 && seen.insert(cidr)
             {
-                targets_to_test.push((cidr, format!("Explicit Subnet ({})", cidr)));
+                queue.push_back((cidr, format!("Explicit Subnet ({})", cidr), 1));
             }
         }
     }
@@ -115,32 +120,34 @@ pub async fn explore_downstream_networks(
         discover_routed_gateways(parent_cidr, concurrency, timeout_duration).await;
     for subnet in routed_subnets {
         if seen.insert(subnet) {
-            targets_to_test.push((
+            queue.push_back((
                 subnet,
                 format!("Dynamically Discovered Gateway ({})", subnet),
+                1,
             ));
         }
     }
 
-    // 3. SNMP MIB-II Harvesting: Probe gateways on all discovered subnets
-    let mut snmp_arp_by_subnet: HashMap<Ipv4Net, Vec<SnmpArpEntry>> = HashMap::new();
-    let mut snmp_info_by_subnet: HashMap<Ipv4Net, (Option<String>, Option<String>)> =
-        HashMap::new();
+    let mut discovered_networks = Vec::new();
 
-    if let Some(cfg) = snmp_config
-        && cfg.enabled
-    {
-        let mut new_route_targets = Vec::new();
+    while let Some((subnet, label, depth)) = queue.pop_front() {
+        let mut summary =
+            scan_subnet(subnet, ports, None, concurrency, timeout_duration, None).await;
 
-        for (subnet, _) in &targets_to_test {
-            // Standard gateway is typically .1
-            let gw = Ipv4Addr::new(
-                subnet.addr().octets()[0],
-                subnet.addr().octets()[1],
-                subnet.addr().octets()[2],
-                1,
-            );
+        let gw = Ipv4Addr::new(
+            subnet.addr().octets()[0],
+            subnet.addr().octets()[1],
+            subnet.addr().octets()[2],
+            1,
+        );
 
+        let mut sys_name = None;
+        let mut sys_descr = None;
+
+        // 3. SNMP MIB-II Harvesting: Probe gateways on discovered subnets
+        if let Some(cfg) = snmp_config
+            && cfg.enabled
+        {
             for community in &cfg.communities {
                 if let Some(device_info) = harvest_snmp_device(
                     gw,
@@ -150,36 +157,72 @@ pub async fn explore_downstream_networks(
                 )
                 .await
                 {
-                    snmp_info_by_subnet.insert(
-                        *subnet,
-                        (device_info.sys_name.clone(), device_info.sys_descr.clone()),
-                    );
+                    sys_name = device_info.sys_name.clone();
+                    sys_descr = device_info.sys_descr.clone();
 
+                    // Recover stealth firewalled devices from SNMP ARP table
                     if !device_info.arp_cache.is_empty() {
-                        snmp_arp_by_subnet
-                            .entry(*subnet)
-                            .or_default()
-                            .extend(device_info.arp_cache);
+                        let known_ips: HashSet<Ipv4Addr> =
+                            summary.active_hosts.iter().map(|h| h.ip).collect();
+
+                        let missing_entries: Vec<&SnmpArpEntry> = device_info
+                            .arp_cache
+                            .iter()
+                            .filter(|entry| subnet.contains(&entry.ip) && !known_ips.contains(&entry.ip))
+                            .collect();
+
+                        if !missing_entries.is_empty() {
+                            let missing_ips: Vec<Ipv4Addr> =
+                                missing_entries.iter().map(|e| e.ip).collect();
+                            let mut ptr_map = crate::net::dns::resolve_unicast_dns_ptrs(
+                                &missing_ips,
+                                gw,
+                                Duration::from_millis(200),
+                            )
+                            .await;
+
+                            for entry in missing_entries {
+                                let hostname = ptr_map.remove(&entry.ip);
+                                let vendor = crate::fingerprint::oui::lookup_mac(&entry.mac)
+                                    .vendor
+                                    .map(|v| v.to_string());
+
+                                summary.active_hosts.push(HostResult {
+                                    ip: entry.ip,
+                                    is_alive: true,
+                                    hostname,
+                                    mac_address: Some(entry.mac.clone()),
+                                    vendor,
+                                    open_ports: Vec::new(),
+                                    min_latency: None,
+                                });
+                            }
+                        }
                     }
 
-                    // Dynamically uncover additional subnets from the router's `ipRouteTable`
-                    for route in &device_info.routes {
-                        let prefix_len = u32::from(route.mask).count_ones() as u8;
-                        if (16..=30).contains(&prefix_len)
-                            && !route.dest_network.is_unspecified()
-                            && !route.dest_network.is_loopback()
-                            && let Ok(route_cidr) =
-                                Ipv4Net::new(route.dest_network, prefix_len)
-                        {
-                            let trunc = route_cidr.trunc();
-                            if seen.insert(trunc) {
-                                new_route_targets.push((
-                                    trunc,
-                                    format!(
-                                        "SNMP Route via {} ({})",
-                                        gw, trunc
-                                    ),
-                                ));
+                    // Recursive pivot: extract subnets from routing table and enqueue if depth < max_depth
+                    if depth < effective_max_depth {
+                        for route in &device_info.routes {
+                            let prefix_len = u32::from(route.mask).count_ones() as u8;
+                            if (16..=30).contains(&prefix_len)
+                                && !route.dest_network.is_unspecified()
+                                && !route.dest_network.is_loopback()
+                                && let Ok(route_cidr) =
+                                    Ipv4Net::new(route.dest_network, prefix_len)
+                            {
+                                let trunc = route_cidr.trunc();
+                                if seen.insert(trunc) {
+                                    queue.push_back((
+                                        trunc,
+                                        format!(
+                                            "Recursive Pivot (Depth {}) via {} ({})",
+                                            depth + 1,
+                                            gw,
+                                            trunc
+                                        ),
+                                        depth + 1,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -189,73 +232,7 @@ pub async fn explore_downstream_networks(
             }
         }
 
-        targets_to_test.extend(new_route_targets);
-    }
-
-    let mut discovered_networks = Vec::new();
-
-    for (subnet, label) in targets_to_test {
-        let mut summary =
-            scan_subnet(subnet, ports, None, concurrency, timeout_duration, None).await;
-
-        // 4. Enrich hosts with SNMP-harvested ARP cache (recovering stealth firewalled devices)
-        if let Some(arp_entries) = snmp_arp_by_subnet.get(&subnet) {
-            let known_ips: HashSet<Ipv4Addr> =
-                summary.active_hosts.iter().map(|h| h.ip).collect();
-
-            let gw = Ipv4Addr::new(
-                subnet.addr().octets()[0],
-                subnet.addr().octets()[1],
-                subnet.addr().octets()[2],
-                1,
-            );
-
-            let missing_entries: Vec<&SnmpArpEntry> = arp_entries
-                .iter()
-                .filter(|entry| subnet.contains(&entry.ip) && !known_ips.contains(&entry.ip))
-                .collect();
-
-            if !missing_entries.is_empty() {
-                let missing_ips: Vec<Ipv4Addr> =
-                    missing_entries.iter().map(|e| e.ip).collect();
-                let mut ptr_map = crate::net::dns::resolve_unicast_dns_ptrs(
-                    &missing_ips,
-                    gw,
-                    Duration::from_millis(200),
-                )
-                .await;
-
-                for entry in missing_entries {
-                    let hostname = ptr_map.remove(&entry.ip);
-                    let vendor = crate::fingerprint::oui::lookup_mac(&entry.mac)
-                        .vendor
-                        .map(|v| v.to_string());
-
-                    summary.active_hosts.push(HostResult {
-                        ip: entry.ip,
-                        is_alive: true,
-                        hostname,
-                        mac_address: Some(entry.mac.clone()),
-                        vendor,
-                        open_ports: Vec::new(),
-                        min_latency: None,
-                    });
-                }
-            }
-        }
-
         if !summary.active_hosts.is_empty() {
-            let (sys_name, sys_descr) = snmp_info_by_subnet
-                .remove(&subnet)
-                .unwrap_or((None, None));
-
-            let gw = Ipv4Addr::new(
-                subnet.addr().octets()[0],
-                subnet.addr().octets()[1],
-                subnet.addr().octets()[2],
-                1,
-            );
-
             discovered_networks.push(ChildNetworkResult {
                 parent_router_ip: Some(gw),
                 cidr: subnet,

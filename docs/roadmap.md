@@ -16,7 +16,7 @@ This document outlines the milestones and release goals for the **idNX** project
 - [x] Active host discovery (TCP connect / RST alive detection + stealth ICMP echo sweep fallback).
 - [x] Responsive terminal status output & formatted table (`indicatif` & `comfy-table`).
 - [x] Multi-format export engine (`--output json|yaml|xml|csv|text`) with auto-timestamped naming (`idnx_YYYYMMDD.<ext>`).
-- [ ] Ergonomic `ScannerBuilder` API (fluent builder pattern for embedding `idnx` in third-party applications).
+- [x] Ergonomic `ScannerBuilder` API (fluent builder pattern for embedding `idnx` in third-party applications).
 
 ### Milestone 2: Infrastructure Fingerprinting & UPnP -> [COMPLETED]
 - [x] Gateway detection (detect default gateway via routing table/socket).
@@ -43,15 +43,16 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 5: Recursive Pivot & Deep Fingerprinting -> [ACTIVE]
+### Milestone 5: Recursive Pivot & Deep Fingerprinting -> [COMPLETED]
 - [x] Ergonomic `ScannerBuilder` API (fluent builder pattern for embedding `idnx` in Rust applications).
 - [x] Clean-Room Protocol Probes (targeted handshake triggers: TLS ClientHello for X.509 cert extraction, SMB Negotiate for Windows domain/hostname).
 - [x] Interactive Network Topology Graph Export (`--export-graph topology.html` standalone force-directed visualization).
-- [ ] Updatable 2-Tier OUI Engine (`idnx update-oui` fetching master OUI database to `~/.cache/idnx/oui.bin`).
+- [x] Recursive exploration scheduler (`--recursive` & `--max-depth` flags to queue discovered subnets).
+- [x] Updatable 2-Tier OUI Engine (`idnx --update-oui` fetching master OUI database to `~/.cache/idnx/oui.txt`).
 
 ---
 
-### Milestone 6: IPv6 Multi-Stack Engine & Neighbor Discovery -> [PLANNED]
+### Milestone 6: IPv6 Multi-Stack Engine & Neighbor Discovery -> [ACTIVE - NEXT UP]
 - [ ] ICMPv6 Link-Local All-Nodes Multicast Echo Sweep (`ff02::1%<interface>`) for zero-config L2 IPv6 discovery.
 - [ ] Cross-platform NDP (Neighbor Discovery Protocol) cache harvesting (`ndp -an` on macOS, `ip -6 neigh` on Linux, `GetIpNetTable2` on Windows).
 - [ ] mDNS IPv6 resolution (`[ff02::fb]:5353`) for `AAAA` record extraction.
