@@ -146,6 +146,7 @@ pub async fn capture_lldp_neighbors(interface: &str, duration: Duration) -> Lldp
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        let _ = (interface, duration);
         LldpCaptureResult::NotSupported("LLDP raw capture not supported on this OS".to_string())
     }
 }
@@ -275,7 +276,7 @@ fn capture_linux_raw_socket(interface: &str, duration: Duration) -> LldpCaptureR
         libc::socket(
             libc::AF_PACKET,
             libc::SOCK_RAW,
-            (ETH_P_LLDP as u16).to_be() as i32,
+            ETH_P_LLDP.to_be() as i32,
         )
     };
 
@@ -304,7 +305,7 @@ fn capture_linux_raw_socket(interface: &str, duration: Duration) -> LldpCaptureR
     // Bind socket to interface
     let mut sa: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     sa.sll_family = libc::AF_PACKET as u16;
-    sa.sll_protocol = (ETH_P_LLDP as u16).to_be();
+    sa.sll_protocol = ETH_P_LLDP.to_be();
     sa.sll_ifindex = if_index as i32;
 
     if unsafe {
@@ -333,10 +334,10 @@ fn capture_linux_raw_socket(interface: &str, duration: Duration) -> LldpCaptureR
 
     while start.elapsed() < duration {
         let n = unsafe { libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n > 14 {
-            if let Some(neighbor) = parse_lldp_frame(&buf[..n as usize]) {
-                neighbors.push(neighbor);
-            }
+        if n > 14
+            && let Some(neighbor) = parse_lldp_frame(&buf[..n as usize])
+        {
+            neighbors.push(neighbor);
         }
         std::thread::sleep(Duration::from_millis(50));
     }

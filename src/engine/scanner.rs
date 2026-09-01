@@ -281,9 +281,22 @@ pub async fn ping_host(ip: Ipv4Addr, timeout_duration: Duration) -> bool {
         .stderr(std::process::Stdio::null())
         .status();
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     let cmd = tokio::process::Command::new("ping")
-        .args(["-c", "1", "-W", "1", &ip.to_string()])
+        .args(["-n", "1", "-w", &timeout_ms.to_string(), &ip.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let cmd = tokio::process::Command::new("ping")
+        .args([
+            "-c",
+            "1",
+            "-W",
+            &(timeout_ms / 1000).max(1).to_string(),
+            &ip.to_string(),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

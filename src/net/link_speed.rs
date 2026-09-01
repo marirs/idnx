@@ -129,39 +129,39 @@ fn get_macos_link_speed(iface_name: &str) -> Option<LinkSpeedInfo> {
 fn get_linux_link_speed(iface_name: &str) -> Option<LinkSpeedInfo> {
     // 1. Check Ethernet speed via sysfs: /sys/class/net/<iface>/speed
     let speed_path = format!("/sys/class/net/{}/speed", iface_name);
-    if let Ok(speed_str) = std::fs::read_to_string(&speed_path) {
-        if let Ok(speed_mbps) = speed_str.trim().parse::<u64>() {
-            let duplex_path = format!("/sys/class/net/{}/duplex", iface_name);
-            let duplex_str = std::fs::read_to_string(duplex_path).unwrap_or_default();
-            let duplex = if duplex_str.trim().eq_ignore_ascii_case("full") {
-                "Full-Duplex"
-            } else if duplex_str.trim().eq_ignore_ascii_case("half") {
-                "Half-Duplex"
-            } else {
-                ""
-            };
+    if let Ok(speed_str) = std::fs::read_to_string(&speed_path)
+        && let Ok(speed_mbps) = speed_str.trim().parse::<u64>()
+    {
+        let duplex_path = format!("/sys/class/net/{}/duplex", iface_name);
+        let duplex_str = std::fs::read_to_string(duplex_path).unwrap_or_default();
+        let duplex = if duplex_str.trim().eq_ignore_ascii_case("full") {
+            "Full-Duplex"
+        } else if duplex_str.trim().eq_ignore_ascii_case("half") {
+            "Half-Duplex"
+        } else {
+            ""
+        };
 
-            let formatted_speed = if speed_mbps >= 10000 {
-                "10 Gbps".to_string()
-            } else if speed_mbps >= 2500 {
-                "2.5 Gbps".to_string()
-            } else if speed_mbps >= 1000 {
-                "1 Gbps".to_string()
-            } else {
-                format!("{} Mbps", speed_mbps)
-            };
+        let formatted_speed = if speed_mbps >= 10000 {
+            "10 Gbps".to_string()
+        } else if speed_mbps >= 2500 {
+            "2.5 Gbps".to_string()
+        } else if speed_mbps >= 1000 {
+            "1 Gbps".to_string()
+        } else {
+            format!("{} Mbps", speed_mbps)
+        };
 
-            let display = if duplex.is_empty() {
-                formatted_speed
-            } else {
-                format!("{} ({})", formatted_speed, duplex)
-            };
+        let display = if duplex.is_empty() {
+            formatted_speed
+        } else {
+            format!("{} ({})", formatted_speed, duplex)
+        };
 
-            return Some(LinkSpeedInfo {
-                speed_display: display,
-                is_wireless: false,
-            });
-        }
+        return Some(LinkSpeedInfo {
+            speed_display: display,
+            is_wireless: false,
+        });
     }
 
     // 2. Check wireless bitrate via `iw dev <iface> link`
@@ -194,20 +194,21 @@ fn get_windows_link_speed(_iface_name: &str) -> Option<LinkSpeedInfo> {
         let stdout = String::from_utf8_lossy(&out.stdout);
         for line in stdout.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("Transmit rate (Mbps)") {
-                if let Some(val) = trimmed.split(':').nth(1) {
-                    let rate = val.trim();
-                    return Some(LinkSpeedInfo {
-                        speed_display: format!("{} Mbps (Wi-Fi)", rate),
-                        is_wireless: true,
-                    });
-                }
+            if trimmed.starts_with("Transmit rate (Mbps)")
+                && let Some(val) = trimmed.split(':').nth(1)
+            {
+                let rate = val.trim();
+                return Some(LinkSpeedInfo {
+                    speed_display: format!("{} Mbps (Wi-Fi)", rate),
+                    is_wireless: true,
+                });
             }
         }
     }
     None
 }
 
+#[allow(dead_code)]
 fn parse_media_speed(media_str: &str) -> String {
     let lower = media_str.to_lowercase();
     if lower.contains("10gbase") {
