@@ -1,4 +1,4 @@
-use get_if_addrs::{IfAddr, get_if_addrs};
+use if_addrs::{IfAddr, get_if_addrs};
 use ipnet::Ipv4Net;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::str::FromStr;
