@@ -1,138 +1,165 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
-# idNX Installer Script
-# Usage: curl -sSL idnx.sh | bash
-# or:    curl -sSL https://raw.githubusercontent.com/marirs/idnx/master/install.sh | bash
+# idNX universal installer for macOS and Linux.
+#
+#   curl -fsSL https://idnx.sh | bash
+#   curl -fsSL https://idnx.sh | VERSION=v0.1.0 bash
+#   curl -fsSL https://idnx.sh | IDNX_INSTALL_DIR="$HOME/.local/bin" bash
 
-REPO="marirs/idnx"
+REPO="${IDNX_REPO:-marirs/idnx}"
 BIN_NAME="idnx"
+INSTALL_DIR="${IDNX_INSTALL_DIR:-/usr/local/bin}"
+VERSION="${VERSION:-latest}"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  BLUE='\033[0;34m'
+  YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'
+  BOLD='\033[1m'
+  NC='\033[0m'
+else
+  RED='' GREEN='' BLUE='' YELLOW='' CYAN='' BOLD='' NC=''
+fi
 
-echo -e "${CYAN}${BOLD}"
-echo "  _     _ _   _  __  __"
-echo " (_) __| | \ | | \ \/ /"
-echo " | |/ _` |  \| |  \  / "
-echo " | | (_| | |\  |  /  \ "
-echo " |_|\__,_|_| \_| /_/\_\ "
-echo -e "${NC}"
-echo -e "${BLUE}[*]${NC} Installing ${BOLD}idNX${NC} (Network Identification & Deep eXploration Tool)..."
+info() { printf '%b[*]%b %s\n' "$BLUE" "$NC" "$*"; }
+warn() { printf '%b[!]%b %s\n' "$YELLOW" "$NC" "$*" >&2; }
+die()  { printf '%b[!]%b %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 
-# 1. Detect Operating System
-OS="$(uname -s)"
-case "$OS" in
-    Darwin)
-        OS_TARGET="apple-darwin"
-        ;;
-    Linux)
-        OS_TARGET="unknown-linux-gnu"
-        ;;
-    *)
-        echo -e "${RED}[!] Unsupported Operating System: $OS${NC}"
-        echo "idNX currently provides pre-built binaries for macOS and Linux."
-        echo "For Windows, download the latest zip from: https://github.com/${REPO}/releases"
-        exit 1
-        ;;
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+cleanup() {
+  if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+printf '%b%b' "$CYAN" "$BOLD"
+printf '%s\n' \
+  '  _     _ _   _  __  __' \
+  ' (_) __| | \ | | \ \/ /' \
+  ' | |/ _` |  \| |  \  / ' \
+  ' | | (_| | |\  |  /  \ ' \
+  ' |_|\__,_|_| \_| /_/\_\ '
+printf '%b' "$NC"
+info "Installing ${BOLD}idNX${NC} (Network Identification & Deep eXploration Tool)..."
+
+need_cmd uname
+need_cmd curl
+need_cmd tar
+need_cmd mktemp
+
+case "$(uname -s)" in
+  Darwin) OS_TARGET="apple-darwin" ;;
+  Linux)  OS_TARGET="unknown-linux-gnu" ;;
+  *)
+    die "Unsupported operating system: $(uname -s). Pre-built shell installs support macOS and Linux; Windows builds are available from https://github.com/${REPO}/releases"
+    ;;
 esac
 
-# 2. Detect Architecture
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64|amd64)
-        ARCH_TARGET="x86_64"
-        ;;
-    arm64|aarch64)
-        ARCH_TARGET="aarch64"
-        ;;
-    *)
-        echo -e "${RED}[!] Unsupported architecture: $ARCH${NC}"
-        echo "Please build idNX from source using: cargo install --git https://github.com/${REPO}.git"
-        exit 1
-        ;;
+case "$(uname -m)" in
+  x86_64|amd64)  ARCH_TARGET="x86_64" ;;
+  arm64|aarch64) ARCH_TARGET="aarch64" ;;
+  *)
+    die "Unsupported architecture: $(uname -m). Build from source with: cargo install --git https://github.com/${REPO}.git"
+    ;;
 esac
 
 TARGET="${ARCH_TARGET}-${OS_TARGET}"
-echo -e "${BLUE}[*]${NC} Detected platform: ${CYAN}${TARGET}${NC}"
-
-# 3. Determine Latest Release Version
-if [ -z "$VERSION" ]; then
-    echo -e "${BLUE}[*]${NC} Fetching latest release info from GitHub..."
-    LATEST_TAG=$(curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-        echo -e "${YELLOW}[!] Could not resolve latest tag via GitHub API (possibly rate-limited). Falling back to v0.1.0${NC}"
-        VERSION="v0.1.0"
-    else
-        VERSION="$LATEST_TAG"
-    fi
-fi
-
-echo -e "${BLUE}[*]${NC} Target version: ${GREEN}${VERSION}${NC}"
-
-# 4. Download and Extract
 ARCHIVE_NAME="${BIN_NAME}-${TARGET}.tar.gz"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE_NAME}"
 
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-echo -e "${BLUE}[*]${NC} Downloading ${DOWNLOAD_URL}..."
-if ! curl -sSL --fail "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE_NAME"; then
-    echo -e "${RED}[!] Failed to download binary for ${TARGET} (${VERSION}).${NC}"
-    echo "Check available assets at: https://github.com/${REPO}/releases"
-    exit 1
-fi
-
-echo -e "${BLUE}[*]${NC} Extracting archive..."
-tar -xzf "$TMP_DIR/$ARCHIVE_NAME" -C "$TMP_DIR"
-
-if [ ! -f "$TMP_DIR/$BIN_NAME" ]; then
-    echo -e "${RED}[!] Binary $BIN_NAME not found in downloaded archive.${NC}"
-    exit 1
-fi
-
-chmod +x "$TMP_DIR/$BIN_NAME"
-
-# 5. Install Binary
-INSTALL_DIR="/usr/local/bin"
-USE_SUDO=0
-
-if [ -w "$INSTALL_DIR" ]; then
-    cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-elif command -v sudo >/dev/null 2>&1; then
-    echo -e "${YELLOW}[*]${NC} Elevating privileges with sudo to install into ${INSTALL_DIR}..."
-    sudo cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+if [[ "$VERSION" == "latest" ]]; then
+  RELEASE_URL="https://github.com/${REPO}/releases/latest/download"
+  VERSION_LABEL="latest"
 else
-    INSTALL_DIR="$HOME/.local/bin"
+  [[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([._+-][A-Za-z0-9.-]+)?$ ]] \
+    || die "Invalid VERSION value: $VERSION"
+  RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+  VERSION_LABEL="$VERSION"
+fi
+
+ARCHIVE_URL="${RELEASE_URL}/${ARCHIVE_NAME}"
+CHECKSUM_URL="${ARCHIVE_URL}.sha256"
+TMP_DIR="$(mktemp -d)"
+ARCHIVE_PATH="${TMP_DIR}/${ARCHIVE_NAME}"
+CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
+
+info "Detected platform: ${CYAN}${TARGET}${NC}"
+info "Downloading ${VERSION_LABEL} release..."
+curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 1 \
+  "$ARCHIVE_URL" -o "$ARCHIVE_PATH" \
+  || die "No release binary was found for ${TARGET}. Check https://github.com/${REPO}/releases"
+curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 1 \
+  "$CHECKSUM_URL" -o "$CHECKSUM_PATH" \
+  || die "The checksum file is missing: ${ARCHIVE_NAME}.sha256"
+
+info "Verifying SHA-256 checksum..."
+EXPECTED_SHA="$(awk 'NR == 1 { print $1 }' "$CHECKSUM_PATH")"
+[[ "$EXPECTED_SHA" =~ ^[A-Fa-f0-9]{64}$ ]] || die "The published checksum is invalid."
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(sha256sum "$ARCHIVE_PATH" | awk '{ print $1 }')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(shasum -a 256 "$ARCHIVE_PATH" | awk '{ print $1 }')"
+else
+  die "Neither sha256sum nor shasum is available; refusing an unverified install."
+fi
+
+ACTUAL_SHA="$(printf '%s' "$ACTUAL_SHA" | tr '[:upper:]' '[:lower:]')"
+EXPECTED_SHA="$(printf '%s' "$EXPECTED_SHA" | tr '[:upper:]' '[:lower:]')"
+[[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] \
+  || die "Checksum verification failed; the downloaded archive was not installed."
+
+tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
+[[ -f "${TMP_DIR}/${BIN_NAME}" ]] || die "Archive did not contain the ${BIN_NAME} binary."
+chmod 0755 "${TMP_DIR}/${BIN_NAME}"
+
+install_binary() {
+  local destination="${INSTALL_DIR}/${BIN_NAME}"
+  mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+
+  if [[ -d "$INSTALL_DIR" && -w "$INSTALL_DIR" ]]; then
+    install -m 0755 "${TMP_DIR}/${BIN_NAME}" "$destination"
+  elif command -v sudo >/dev/null 2>&1; then
+    info "Installing to ${INSTALL_DIR} with sudo..."
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo install -m 0755 "${TMP_DIR}/${BIN_NAME}" "$destination"
+  elif [[ -z "${IDNX_INSTALL_DIR:-}" ]]; then
+    INSTALL_DIR="${HOME}/.local/bin"
+    destination="${INSTALL_DIR}/${BIN_NAME}"
     mkdir -p "$INSTALL_DIR"
-    cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-    echo -e "${YELLOW}[*]${NC} Installed to user directory: ${INSTALL_DIR}"
-fi
+    install -m 0755 "${TMP_DIR}/${BIN_NAME}" "$destination"
+    warn "sudo is unavailable; installed to ${INSTALL_DIR} instead."
+  else
+    die "Cannot write to ${INSTALL_DIR}, and sudo is unavailable."
+  fi
+}
 
-# 6. Verify Installation
-echo -e "${GREEN}[+]${NC} Verifying installation..."
-if command -v idnx >/dev/null 2>&1; then
-    INSTALLED_VER=$(idnx --version 2>/dev/null || echo "$VERSION")
-    echo -e "${GREEN}${BOLD}✓ idNX (${INSTALLED_VER}) successfully installed to ${INSTALL_DIR}/${BIN_NAME}!${NC}"
+need_cmd install
+install_binary
+
+INSTALLED_PATH="${INSTALL_DIR}/${BIN_NAME}"
+[[ -x "$INSTALLED_PATH" ]] || die "Installation verification failed: ${INSTALLED_PATH} is not executable."
+
+INSTALLED_VERSION="$($INSTALLED_PATH --version 2>/dev/null || true)"
+if [[ -n "$INSTALLED_VERSION" ]]; then
+  printf '%b[+]%b Installed %s to %s\n' "$GREEN" "$NC" "$INSTALLED_VERSION" "$INSTALLED_PATH"
 else
-    echo -e "${GREEN}${BOLD}✓ idNX successfully installed to ${INSTALL_DIR}/${BIN_NAME}!${NC}"
-    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        echo -e "${YELLOW}[!] Warning: ${INSTALL_DIR} is not currently in your \$PATH.${NC}"
-        echo -e "Add it to your shell profile:"
-        echo -e "  export PATH=\"\$PATH:${INSTALL_DIR}\""
-    fi
+  printf '%b[+]%b Installed idNX to %s\n' "$GREEN" "$NC" "$INSTALLED_PATH"
 fi
 
-echo ""
-echo -e "${CYAN}${BOLD}Quick Start:${NC}"
-echo -e "  idnx               # Auto-detect interface & scan local + cascaded subnets"
-echo -e "  sudo idnx          # Full Layer 2 discovery (LLDP / CDP switch ports)"
-echo -e "  idnx --output json # Export complete asset inventory to JSON"
-echo ""
+if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
+  warn "${INSTALL_DIR} is not currently in PATH. Add this to your shell profile:"
+  printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+fi
+
+printf '\n%bQuick start:%b\n' "$CYAN$BOLD" "$NC"
+printf '%s\n' \
+  '  idnx               # Discover the local and cascaded network' \
+  '  sudo idnx          # Include LLDP/CDP/MNDP Layer 2 discovery' \
+  '  idnx --output json # Export the asset inventory to JSON'
