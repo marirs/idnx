@@ -1,8 +1,4 @@
-mod engine;
-mod fingerprint;
-mod net;
-mod output;
-mod probes;
+use idnx::{engine, net, output, probes};
 
 use clap::Parser;
 use colored::*;
@@ -172,9 +168,8 @@ async fn main() {
 
     // Layer 2 Hardware Discovery (LLDP - IEEE 802.1AB)
     let iface_name = iface_filter.unwrap_or("en0");
-    match crate::probes::lldp::capture_lldp_neighbors(iface_name, Duration::from_millis(600)).await
-    {
-        crate::probes::lldp::LldpCaptureResult::Success(neighbors) => {
+    match probes::lldp::capture_lldp_neighbors(iface_name, Duration::from_millis(600)).await {
+        probes::lldp::LldpCaptureResult::Success(neighbors) => {
             if !neighbors.is_empty() {
                 println!(
                     "{} Captured {} Layer 2 LLDP hardware advertisement(s):",
@@ -192,7 +187,7 @@ async fn main() {
                 }
             }
         }
-        crate::probes::lldp::LldpCaptureResult::PermissionDenied => {
+        probes::lldp::LldpCaptureResult::PermissionDenied => {
             println!(
                 "{} PRIVILEGED DISCOVERY DISABLED (Non-Root / No Sudo):",
                 "[!]".yellow().bold()
@@ -205,7 +200,27 @@ async fn main() {
                 "    └── Recommendation: Run with 'sudo idnx' for full infrastructure visibility."
             );
         }
-        crate::probes::lldp::LldpCaptureResult::NotSupported(_) => {}
+        probes::lldp::LldpCaptureResult::NotSupported(_) => {}
+    }
+
+    // MikroTik Neighbor Discovery Protocol (MNDP)
+    let mndp_neighbors = probes::mndp::listen_mndp_neighbors(Duration::from_millis(300)).await;
+    if !mndp_neighbors.is_empty() {
+        println!(
+            "{} Discovered {} MikroTik MNDP neighbor(s):",
+            "[+]".green().bold(),
+            mndp_neighbors.len().to_string().cyan().bold()
+        );
+        for m in &mndp_neighbors {
+            println!(
+                "    └── 📡 [{}] Identity: {} | Version: {} | Board: {} | Iface: {}",
+                m.mac_address.cyan().bold(),
+                m.identity.green().bold(),
+                m.software_version.as_deref().unwrap_or("N/A").dimmed(),
+                m.board_name.as_deref().unwrap_or("MikroTik").yellow(),
+                m.interface_name.as_deref().unwrap_or("N/A")
+            );
+        }
     }
 
     if !cli.no_deep {

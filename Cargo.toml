@@ -3,7 +3,20 @@ name = "idnx"
 version = "0.1.0"
 edition = "2024"
 authors = ["Sriram <marirs@gmail.com>"]
-description = "Network Identification & Deep eXploration Tool"
+description = "Fast, asynchronous network identification and deep infrastructure exploration library."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/marirs/idnx"
+keywords = ["network", "scanner", "lldp", "topology", "discovery"]
+categories = ["network-programming", "command-line-utilities"]
+
+[lib]
+name = "idnx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "idnx"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
