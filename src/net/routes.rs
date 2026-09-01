@@ -100,7 +100,7 @@ fn parse_macos_dest_cidr(dest: &str) -> Option<Ipv4Net> {
     // Handle slash notation e.g. "10.242/16"
     if let Some((ip_part, mask_part)) = dest.split_once('/') {
         let prefix: u8 = mask_part.parse().ok()?;
-        let octets: Vec<u8> = ip_part.split('.').filter_map(|s| s.parse().ok()).collect();
+        let octets: Vec<u8> = ip_part.split('.').filter_map(|s| s.parse::<u8>().ok()).collect();
         let mut full_octets = [0u8; 4];
         for (i, &o) in octets.iter().enumerate().take(4) {
             full_octets[i] = o;
@@ -109,7 +109,7 @@ fn parse_macos_dest_cidr(dest: &str) -> Option<Ipv4Net> {
     }
 
     // Handle abbreviated e.g. "192.168.51" -> /24
-    let octets: Vec<u8> = dest.split('.').filter_map(|s| s.parse().ok()).collect();
+    let octets: Vec<u8> = dest.split('.').filter_map(|s| s.parse::<u8>().ok()).collect();
     match octets.len() {
         1 => Ipv4Net::new(Ipv4Addr::new(octets[0], 0, 0, 0), 8).ok(),
         2 => Ipv4Net::new(Ipv4Addr::new(octets[0], octets[1], 0, 0), 16).ok(),
