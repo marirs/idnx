@@ -200,6 +200,18 @@ mod tests {
     }
 
     #[test]
+    fn only_real_links_are_eligible_for_capture() {
+        // capture_available is what gates whether a device is opened at all, so it must be
+        // false for every vantage that cannot carry link-layer evidence.
+        assert!(!vantage_for("utun3", true).capture_available);
+        assert!(!vantage_for("lo0", true).capture_available);
+        assert!(!vantage_for("docker0", true).capture_available);
+
+        // Unprivileged is ineligible regardless of the link type.
+        assert!(!vantage_for("eth0", false).capture_available);
+    }
+
+    #[test]
     fn virtual_vantage_never_claims_capture() {
         // Even as root there is no link-layer fabric on a tunnel interface.
         let v = vantage_for("utun3", true);

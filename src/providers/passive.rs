@@ -44,6 +44,13 @@ pub struct PassiveObservation {
     /// Frame count sampled at shutdown, so the reported total is final rather than a
     /// reading taken while frames were still arriving.
     final_frames: AtomicU64,
+    /// Topology facts actually accepted from those frames.
+    ///
+    /// A non-zero frame count proves only that the reader delivered packets. It says
+    /// nothing about decoding, draining or absorption, and most traffic on any link is not
+    /// topology evidence at all. Reporting both numbers distinguishes "the link carries no
+    /// discovery protocols" from "the decoder is broken".
+    facts_accepted: AtomicU64,
     stopped: AtomicBool,
 }
 
@@ -73,6 +80,7 @@ impl PassiveObservation {
                 unavailable: None,
                 interface: interface.to_string(),
                 final_frames: AtomicU64::new(0),
+                facts_accepted: AtomicU64::new(0),
                 stopped: AtomicBool::new(false),
             },
             Err(err) => Self {
@@ -81,6 +89,7 @@ impl PassiveObservation {
                 unavailable: Some(err),
                 interface: interface.to_string(),
                 final_frames: AtomicU64::new(0),
+                facts_accepted: AtomicU64::new(0),
                 stopped: AtomicBool::new(true),
             },
         }
@@ -106,9 +115,31 @@ impl PassiveObservation {
             .unwrap_or(0)
     }
 
+    /// Topology facts accepted from observed frames. Final once capture has stopped.
+    pub fn facts_accepted(&self) -> u64 {
+        self.facts_accepted.load(Ordering::Relaxed)
+    }
+
     /// True once capture has been stopped.
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Builds an observation for a vantage where capture was never attempted.
+    ///
+    /// A vantage the engine already knows cannot carry link-layer evidence — a tunnel, a
+    /// loopback, or an unprivileged run — should not have a device opened against it.
+    /// Doing so turns "not applicable here" into what looks like a failure.
+    pub fn not_applicable(interface: &str, reason: impl Into<String>) -> Self {
+        Self {
+            observed: Arc::new(Mutex::new(Observed::default())),
+            session: Mutex::new(None),
+            unavailable: Some(CaptureError::Unsupported(reason.into())),
+            interface: interface.to_string(),
+            final_frames: AtomicU64::new(0),
+            facts_accepted: AtomicU64::new(0),
+            stopped: AtomicBool::new(true),
+        }
     }
 
     /// Stops capture and records the final frame count. Idempotent.
@@ -141,15 +172,21 @@ impl PassiveObservation {
 impl crate::providers::ContinuousSource for PassiveObservation {
     fn drain(&self) -> Vec<TopologyEvidence> {
         let facts = PassiveObservation::drain(self);
-        convert_unscoped(&facts, &self.interface)
+        let evidence = convert_unscoped(&facts, &self.interface);
+        self.facts_accepted
+            .fetch_add(evidence.len() as u64, Ordering::Relaxed);
+        evidence
     }
 
     fn finish(&self) -> Vec<TopologyEvidence> {
         // Stop first, then drain: draining first would race the reader and lose whatever it
-        // decoded between the two calls.
+        // decoded between the two calls. Both counters are therefore final on return.
         self.stop();
         let facts = PassiveObservation::drain(self);
-        convert_unscoped(&facts, &self.interface)
+        let evidence = convert_unscoped(&facts, &self.interface);
+        self.facts_accepted
+            .fetch_add(evidence.len() as u64, Ordering::Relaxed);
+        evidence
     }
 }
 
@@ -702,6 +739,7 @@ mod tests {
             unavailable: Some(CaptureError::PermissionDenied),
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(0),
+            facts_accepted: AtomicU64::new(0),
             stopped: AtomicBool::new(true),
         };
 
@@ -724,6 +762,7 @@ mod tests {
             unavailable: None,
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(11),
+            facts_accepted: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
         };
 
@@ -748,6 +787,7 @@ mod tests {
             unavailable: None,
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(0),
+            facts_accepted: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
         };
 
@@ -757,6 +797,91 @@ mod tests {
 
         // Nothing remains afterwards.
         assert!(ContinuousSource::finish(&observation).is_empty());
+    }
+
+    #[test]
+    fn an_ineligible_vantage_never_opens_a_capture_device() {
+        // No device is opened: the observation is constructed already stopped, with the
+        // reason recorded. Opening one on a tunnel or unprivileged run would report a
+        // failure for something that was never applicable.
+        let observation = PassiveObservation::not_applicable(
+            "utun3",
+            "not applicable from a virtual/VPN vantage",
+        );
+
+        assert!(!observation.is_running());
+        assert!(observation.is_stopped());
+        assert!(
+            observation.session.lock().unwrap().is_none(),
+            "no capture session may exist for an ineligible vantage"
+        );
+        assert_eq!(observation.frames_seen(), 0);
+        assert_eq!(observation.facts_accepted(), 0);
+        assert!(
+            observation
+                .unavailable_reason()
+                .unwrap()
+                .contains("not applicable")
+        );
+    }
+
+    #[test]
+    fn accepted_facts_are_counted_and_frozen_at_finish() {
+        use crate::providers::ContinuousSource;
+
+        let observation = PassiveObservation {
+            observed: Arc::new(Mutex::new(Observed {
+                facts: vec![FrameFact::Vlan { id: 11 }, FrameFact::Vlan { id: 12 }],
+            })),
+            session: Mutex::new(None),
+            unavailable: None,
+            interface: "test0".to_string(),
+            final_frames: AtomicU64::new(0),
+            facts_accepted: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+        };
+
+        let evidence = ContinuousSource::finish(&observation);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(
+            observation.facts_accepted(),
+            2,
+            "accepted facts prove decoding and draining actually worked"
+        );
+
+        // Both counters stay put once capture has stopped.
+        assert!(ContinuousSource::finish(&observation).is_empty());
+        assert_eq!(observation.facts_accepted(), 2);
+    }
+
+    #[test]
+    fn draining_accumulates_accepted_facts_across_polls() {
+        use crate::providers::ContinuousSource;
+
+        let buffer = Arc::new(Mutex::new(Observed {
+            facts: vec![FrameFact::Vlan { id: 21 }],
+        }));
+        let observation = PassiveObservation {
+            observed: Arc::clone(&buffer),
+            session: Mutex::new(None),
+            unavailable: None,
+            interface: "test0".to_string(),
+            final_frames: AtomicU64::new(0),
+            facts_accepted: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+        };
+
+        assert_eq!(ContinuousSource::drain(&observation).len(), 1);
+        assert_eq!(observation.facts_accepted(), 1);
+
+        // A frame arriving between polls is counted too.
+        buffer
+            .lock()
+            .unwrap()
+            .facts
+            .push(FrameFact::Vlan { id: 22 });
+        assert_eq!(ContinuousSource::drain(&observation).len(), 1);
+        assert_eq!(observation.facts_accepted(), 2);
     }
 
     #[test]

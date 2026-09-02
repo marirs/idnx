@@ -63,6 +63,8 @@ pub struct VantageExport {
     pub unavailable: Vec<String>,
     /// Frames passively observed. `None` means capture never started.
     pub observed_frames: Option<u64>,
+    /// Topology facts accepted from those frames.
+    pub accepted_facts: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -323,6 +325,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             blind_to: report.visibility.blind_to.clone(),
             unavailable: report.visibility.unavailable.clone(),
             observed_frames: report.visibility.observed_frames,
+            accepted_facts: report.visibility.accepted_facts,
         },
         networks,
         vlans,
@@ -428,7 +431,11 @@ fn render_text(data: &TopologyExport) -> String {
         t.push_str(&format!("Unavailable: {}\n", note));
     }
     if let Some(frames) = data.vantage.observed_frames {
-        t.push_str(&format!("Passive capture: {} frames observed\n", frames));
+        t.push_str(&format!(
+            "Passive capture: {} frames observed, {} facts accepted\n",
+            frames,
+            data.vantage.accepted_facts.unwrap_or(0)
+        ));
     }
 
     t.push_str("\nNETWORKS\n");
@@ -579,6 +586,7 @@ mod tests {
                 blind_to: vec!["switched unicast".to_string()],
                 unavailable: Vec::new(),
                 observed_frames: Some(42),
+                accepted_facts: Some(3),
             },
             oversized_scopes: Vec::new(),
             converged: true,

@@ -149,8 +149,7 @@ async fn run() {
     if !privileged {
         println!(
             "    {}",
-            "Running unprivileged: link-layer observation is unavailable. `sudo idnx` adds it."
-                .dimmed()
+            "Unprivileged: link-layer observation unavailable. `sudo idnx` adds it.".dimmed()
         );
     }
 
@@ -162,12 +161,36 @@ async fn run() {
     context.privileged = privileged;
     context.snmp_communities = cli.snmp_community.clone();
 
+    // Physical link characteristics of the chosen vantage.
+    if let Some(speed) = net::link_speed::get_interface_link_speed(&start.vantage.interface) {
+        println!(
+            "{} Link: {}",
+            "[*]".blue().bold(),
+            speed.speed_display.green().bold()
+        );
+    }
+
     // Passive observation opens now and runs alongside everything else. It is
-    // opportunistic: if it cannot start, the reason is reported and discovery is otherwise
-    // unaffected. Nothing waits on it, and there is no listening period to sit through.
-    let observation = std::sync::Arc::new(providers::passive::PassiveObservation::start(
-        &start.vantage.interface,
-    ));
+    // opportunistic: nothing waits on it, and there is no listening period to sit through.
+    //
+    // A device is opened only where the vantage can actually carry link-layer evidence.
+    // Attempting capture on a tunnel or an unprivileged run reports a failure for something
+    // that was never applicable, which is noise rather than a finding.
+    let observation = std::sync::Arc::new(if start.vantage.capture_available {
+        providers::passive::PassiveObservation::start(&start.vantage.interface)
+    } else {
+        providers::passive::PassiveObservation::not_applicable(
+            &start.vantage.interface,
+            if privileged {
+                format!(
+                    "not applicable from a {} vantage",
+                    start.vantage.kind.label()
+                )
+            } else {
+                "requires elevated privileges".to_string()
+            },
+        )
+    });
 
     // The engine owns the observation's lifecycle: it polls before every convergence
     // decision and stops capture itself, so no frame is stranded in the buffer.
@@ -185,14 +208,15 @@ async fn run() {
     let mut report = engine.run(context, start.network).await;
 
     if let Some(reason) = observation.unavailable_reason() {
-        report.visibility.unavailable.push(reason);
-    } else {
-        // Read only after the engine stopped capture, so the count is final.
-        debug_assert!(observation.is_stopped());
         report
             .visibility
-            .observed_frames
-            .replace(observation.frames_seen());
+            .unavailable
+            .push(format!("passive capture: {reason}"));
+    } else {
+        // Read only after the engine stopped capture, so both counts are final.
+        debug_assert!(observation.is_stopped());
+        report.visibility.observed_frames = Some(observation.frames_seen());
+        report.visibility.accepted_facts = Some(observation.facts_accepted());
     }
 
     output::topology_view::render(&report, &start);

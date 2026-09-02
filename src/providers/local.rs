@@ -6,8 +6,6 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use ipnet::IpNet;
-
 use super::{DiscoveryContext, DiscoveryProvider, ProviderFuture};
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal};
@@ -72,9 +70,9 @@ impl DiscoveryProvider for InterfaceProvider {
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
         Box::pin(async move {
             let mut out = Vec::new();
-            let Ok(interfaces) = crate::net::interface::list_ipv4_interfaces() else {
-                return out;
-            };
+            // Dual-stack: an IPv6-only prefix on this link is as real as the IPv4 one, and
+            // enumerating a single family hides half the attached topology.
+            let interfaces = crate::net::interface::list_interface_addresses();
 
             for iface in interfaces {
                 // Only the selected vantage. Emitting every interface's network would make
@@ -86,7 +84,7 @@ impl DiscoveryProvider for InterfaceProvider {
                     continue;
                 }
 
-                let prefix = IpNet::V4(iface.cidr);
+                let prefix = iface.cidr;
                 out.push(
                     TopologyEvidence::new(
                         Fact::Network { prefix },
@@ -112,11 +110,11 @@ impl DiscoveryProvider for InterfaceProvider {
                     &context.vantage.interface,
                 ));
 
-                let device = DeviceKey::Address(IpAddr::V4(iface.ip));
+                let device = DeviceKey::scoped_address(iface.ip, Some(&iface.interface_name));
                 out.push(TopologyEvidence::new(
                     Fact::DeviceAddress {
                         device: device.clone(),
-                        address: IpAddr::V4(iface.ip),
+                        address: iface.ip,
                     },
                     EvidenceSource::InterfaceAddress,
                     Confidence::Observed,
@@ -169,14 +167,17 @@ impl DiscoveryProvider for KernelRouteProvider {
                     continue;
                 }
 
-                let prefix_len = route.destination.prefix_len();
+                let prefix = route.destination;
+                let prefix_len = prefix.prefix_len();
+                let host_bits = if prefix.addr().is_ipv4() { 32 } else { 128 };
 
                 // A default route carries no network of its own, but its gateway is the
-                // most important single device on the machine.
-                let is_default = prefix_len == 0;
+                // most important single device on the machine. A host route (/32 or /128)
+                // is a neighbour entry rather than a network.
+                let is_default = route.is_default();
+                let is_network = !is_default && prefix_len < host_bits;
 
-                if !is_default && prefix_len < 32 {
-                    let prefix = IpNet::V4(route.destination);
+                if is_network {
                     out.push(
                         TopologyEvidence::new(
                             Fact::Network { prefix },
@@ -185,7 +186,7 @@ impl DiscoveryProvider for KernelRouteProvider {
                             vantage,
                         )
                         .with_detail(format!(
-                            "kernel route via {}",
+                            "kernel route on {}",
                             route
                                 .interface
                                 .clone()
@@ -194,9 +195,10 @@ impl DiscoveryProvider for KernelRouteProvider {
                     );
                 }
 
-                if let Some(gw) = route.gateway {
-                    let addr = IpAddr::V4(gw);
-                    let device = DeviceKey::Address(addr);
+                if let Some(addr) = route.gateway {
+                    // A link-local next hop is only meaningful within its zone, so identity
+                    // carries it: without that, fe80::1 on two links would be one device.
+                    let device = DeviceKey::scoped_address(addr, route.gateway_zone.as_deref());
 
                     out.push(TopologyEvidence::new(
                         Fact::DeviceAddress {
@@ -211,24 +213,30 @@ impl DiscoveryProvider for KernelRouteProvider {
                     if is_default {
                         out.push(TopologyEvidence::new(
                             Fact::DeviceRoleSignal {
-                                device: device.clone(),
+                                device,
                                 signal: RoleSignal::DefaultGateway,
                             },
                             EvidenceSource::DefaultGateway,
                             Confidence::Observed,
                             vantage,
                         ));
-                    } else if prefix_len < 32 {
-                        out.push(TopologyEvidence::new(
-                            Fact::RoutesTo {
-                                device,
-                                network: IpNet::V4(route.destination),
-                                next_hop: Some(addr),
-                            },
-                            EvidenceSource::KernelRoute,
-                            Confidence::Observed,
-                            vantage,
-                        ));
+                    } else if is_network {
+                        // The routed network and the router that reaches it. This is the
+                        // relationship that exposes a subnet one hop away — including an
+                        // IPv6-only one, which the IPv4-only harvester never saw.
+                        out.push(
+                            TopologyEvidence::new(
+                                Fact::RoutesTo {
+                                    device,
+                                    network: prefix,
+                                    next_hop: Some(addr),
+                                },
+                                EvidenceSource::KernelRoute,
+                                Confidence::Observed,
+                                vantage,
+                            )
+                            .with_detail(format!("kernel route to {prefix} via {addr}")),
+                        );
                     }
                 }
             }

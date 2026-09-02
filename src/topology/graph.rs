@@ -208,7 +208,9 @@ pub struct TopologyGraph {
     edges: BTreeMap<(NodeId, NodeId, Relationship), Edge>,
     /// Maps an address to the device holding it, so a later fact about the same address
     /// merges into the same device rather than creating a second one.
-    address_owner: HashMap<IpAddr, DeviceKey>,
+    /// Keyed by address *and* zone: a link-local address is only unique within its link,
+    /// so a global key would merge unrelated devices that share one.
+    address_owner: HashMap<(IpAddr, Option<String>), DeviceKey>,
     /// VLAN IDs seen without any prefix-bearing evidence.
     vlans_without_prefix: BTreeSet<u16>,
     /// Structured role signals per device. Kept separate from `Node::role_signals`, which
@@ -294,7 +296,13 @@ impl TopologyGraph {
 
     /// Resolves the canonical device key for an address, if one is already known.
     pub fn device_for_address(&self, addr: &IpAddr) -> Option<&DeviceKey> {
-        self.address_owner.get(addr)
+        self.address_owner.get(&(*addr, None)).or_else(|| {
+            // Fall back to any zone when the caller did not supply one.
+            self.address_owner
+                .iter()
+                .find(|((a, _), _)| a == addr)
+                .map(|(_, owner)| owner)
+        })
     }
 
     /// Folds one piece of evidence into the graph.
@@ -338,7 +346,14 @@ impl TopologyGraph {
                 let key = self.canonical_key(&device, Some(address));
                 let id = NodeId::Device(key.clone());
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
-                self.address_owner.insert(address, key);
+                // The evidence's vantage is the zone: a link-local address observed on
+                // this interface belongs to this link and no other.
+                let zone = if crate::topology::evidence::requires_zone(&address) {
+                    Some(ev.vantage.to_ascii_lowercase())
+                } else {
+                    None
+                };
+                self.address_owner.insert((address, zone), key);
                 if let Some(node) = self.nodes.get_mut(&id) {
                     node.addresses.insert(address);
                 }
@@ -499,7 +514,7 @@ impl TopologyGraph {
                         None => format!("{}/{}", port, protocol),
                     });
                 }
-                if let Some(owner) = self.address_owner.get(&address).cloned() {
+                if let Some(owner) = self.owner_of(&address, &ev.vantage) {
                     self.link(
                         NodeId::Device(owner),
                         id,
@@ -510,7 +525,7 @@ impl TopologyGraph {
                 }
             }
             Fact::ResolvedAs { name, address } => {
-                if let Some(owner) = self.address_owner.get(&address).cloned() {
+                if let Some(owner) = self.owner_of(&address, &ev.vantage) {
                     let id = NodeId::Device(owner);
                     self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                     if let Some(node) = self.nodes.get_mut(&id) {
@@ -530,10 +545,23 @@ impl TopologyGraph {
     fn merge_address_identities(&mut self) {
         let mut merges: Vec<(NodeId, NodeId)> = Vec::new();
         for id in self.nodes.keys() {
-            let NodeId::Device(DeviceKey::Address(addr)) = id else {
+            let NodeId::Device(key) = id else {
                 continue;
             };
-            if let Some(owner) = self.address_owner.get(addr)
+            // Scoped identities merge too. A kernel route names its next hop by scoped
+            // address while the neighbour cache names the same device by MAC; without this
+            // the route's relationship stays stranded on a node of its own and the routed
+            // network appears unattached to any router.
+            let lookup = match key {
+                DeviceKey::Address(addr) => Some((*addr, None)),
+                DeviceKey::ScopedAddress(addr, zone) => Some((*addr, Some(zone.clone()))),
+                DeviceKey::Mac(_) => None,
+            };
+            let Some(lookup) = lookup else {
+                continue;
+            };
+
+            if let Some(owner) = self.address_owner.get(&lookup)
                 && matches!(owner, DeviceKey::Mac(_))
             {
                 merges.push((id.clone(), NodeId::Device(owner.clone())));
@@ -645,32 +673,42 @@ impl TopologyGraph {
 
     /// Chooses the canonical device key, merging address-only identities into a MAC when
     /// one is known for that address.
+    ///
+    /// A scoped identity resolves through its own zone: `fe80::1%en0` must never adopt the
+    /// owner recorded for `fe80::1%eth1`, because they are different devices.
     fn canonical_key(&self, key: &DeviceKey, address: Option<IpAddr>) -> DeviceKey {
         match key {
             DeviceKey::Mac(_) => key.clone(),
-            DeviceKey::Address(addr) => {
-                self.address_owner
-                    .get(addr)
-                    .cloned()
-                    .unwrap_or_else(|| match address {
-                        Some(a) => self
-                            .address_owner
-                            .get(&a)
-                            .cloned()
-                            .unwrap_or_else(|| key.clone()),
-                        None => key.clone(),
-                    })
+            DeviceKey::Address(_) | DeviceKey::ScopedAddress(_, _) => {
+                let zone = match key {
+                    DeviceKey::ScopedAddress(_, zone) => Some(zone.clone()),
+                    _ => None,
+                };
+                if let Some(addr) = key.address()
+                    && let Some(owner) = self.address_owner.get(&(addr, zone.clone()))
+                {
+                    return owner.clone();
+                }
+                if let Some(addr) = address
+                    && let Some(owner) = self.address_owner.get(&(addr, zone))
+                {
+                    return owner.clone();
+                }
+                key.clone()
             }
         }
     }
 
-    /// Creates a network node, refusing prefixes that are not real topology.
-    ///
-    /// Every path that can introduce a network goes through here. When the filter lived
-    /// only in the `Network` fact arm, loopback and link-local ranges reappeared through
-    /// the `AttachedTo`, `GatewayFor` and `RoutesTo` arms, which also create network nodes.
-    ///
-    /// Returns false when the prefix was rejected, so callers skip linking to it.
+    /// Resolves who holds an address, honouring the zone when the address needs one.
+    fn owner_of(&self, address: &IpAddr, vantage: &str) -> Option<DeviceKey> {
+        let zone = if crate::topology::evidence::requires_zone(address) {
+            Some(vantage.to_ascii_lowercase())
+        } else {
+            None
+        };
+        self.address_owner.get(&(*address, zone)).cloned()
+    }
+
     fn upsert_network(&mut self, prefix: IpNet, confidence: Confidence, prov: Provenance) -> bool {
         if !is_topology_network(&prefix) {
             return false;
@@ -810,6 +848,134 @@ mod tests {
 
         let node = g.node(&NodeId::Device(mac)).expect("device node");
         assert_eq!(node.kind, NodeKind::Router);
+    }
+
+    #[test]
+    fn a_routed_ipv6_subnet_links_to_the_device_owning_its_gateway() {
+        // The end-to-end shape of the real evidence on en0:
+        //   fd84:3bfe:bf84::/64 via fe80::1812:faa5:e4ee:1b9%en0
+        // where that link-local address belongs to 507-Appt-Room.
+        let mut g = TopologyGraph::new();
+        let router_mac = DeviceKey::mac("c4:f7:c1:0b:7c:69");
+        let gateway: IpAddr = "fe80::1812:faa5:e4ee:1b9".parse().unwrap();
+        let routed: IpNet = "fd84:3bfe:bf84::/64".parse().unwrap();
+
+        // The neighbour cache binds the link-local address to the router's MAC.
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: router_mac.clone(),
+                address: gateway,
+            },
+            EvidenceSource::NdpCache,
+            Confidence::Observed,
+        ));
+        // Its own routable address, and the name it answers to.
+        g.absorb(ev(
+            Fact::DeviceHostname {
+                device: router_mac.clone(),
+                hostname: "507-Appt-Room".to_string(),
+            },
+            EvidenceSource::Mdns,
+            Confidence::Observed,
+        ));
+        // The kernel route, keyed by the scoped gateway address as the provider emits it.
+        g.absorb(ev(
+            Fact::RoutesTo {
+                device: DeviceKey::scoped_address(gateway, Some("test")),
+                network: routed,
+                next_hop: Some(gateway),
+            },
+            EvidenceSource::KernelRoute,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        assert!(
+            g.networks().contains(&routed),
+            "the routed IPv6 subnet must become a network node"
+        );
+
+        // The RoutesTo edge must land on the MAC-keyed router, not a second node.
+        let router = NodeId::Device(router_mac);
+        let linked = g.edges().any(|e| {
+            e.relationship == Relationship::RoutesTo
+                && e.from == router
+                && e.to == NodeId::Network(routed)
+        });
+        assert!(
+            linked,
+            "the subnet must be linked through the device that owns the gateway address"
+        );
+
+        let node = g.node(&router).expect("router node");
+        assert!(node.hostnames.contains("507-Appt-Room"));
+    }
+
+    #[test]
+    fn link_local_identities_stay_interface_scoped() {
+        // fe80::1 exists on almost every link. Keying it globally merged unrelated routers
+        // from different interfaces into one node.
+        let mut g = TopologyGraph::new();
+        let addr: IpAddr = "fe80::1".parse().unwrap();
+
+        g.absorb(TopologyEvidence::new(
+            Fact::DeviceAddress {
+                device: DeviceKey::mac("aa:aa:aa:00:00:01"),
+                address: addr,
+            },
+            EvidenceSource::NdpCache,
+            Confidence::Observed,
+            "en0",
+        ));
+        g.absorb(TopologyEvidence::new(
+            Fact::DeviceAddress {
+                device: DeviceKey::mac("bb:bb:bb:00:00:02"),
+                address: addr,
+            },
+            EvidenceSource::NdpCache,
+            Confidence::Observed,
+            "eth1",
+        ));
+
+        let holders = g.nodes().filter(|n| n.addresses.contains(&addr)).count();
+        assert_eq!(
+            holders, 2,
+            "the same link-local address on two links is two devices"
+        );
+    }
+
+    #[test]
+    fn an_address_never_migrates_between_two_macs() {
+        // A neighbour solicitation once attributed the queried host's address to the
+        // sender, which merged unrelated devices. Identity must follow the MAC.
+        let mut g = TopologyGraph::new();
+        let a = DeviceKey::mac("aa:aa:aa:00:00:01");
+        let b = DeviceKey::mac("bb:bb:bb:00:00:02");
+        let addr: IpAddr = "fdc5::42".parse().unwrap();
+
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: a.clone(),
+                address: addr,
+            },
+            EvidenceSource::NdpCache,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: b.clone(),
+                address: "fdc5::99".parse().unwrap(),
+            },
+            EvidenceSource::NdpCache,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        let node_b = g.node(&NodeId::Device(b)).expect("second device");
+        assert!(
+            !node_b.addresses.contains(&addr),
+            "one device's address must never appear on another"
+        );
     }
 
     #[test]

@@ -95,6 +95,64 @@ pub fn detect_local_network() -> Result<LocalNetworkInfo, String> {
     Ok(res)
 }
 
+/// An address configured on a local interface, in either family.
+#[derive(Debug, Clone)]
+pub struct InterfaceAddress {
+    pub interface_name: String,
+    pub ip: std::net::IpAddr,
+    pub cidr: ipnet::IpNet,
+}
+
+/// Lists every non-loopback address on every interface, IPv4 and IPv6.
+///
+/// The IPv4-only view hid attached IPv6 prefixes entirely, so a link carrying only an IPv6
+/// network appeared to have none at all.
+pub fn list_interface_addresses() -> Vec<InterfaceAddress> {
+    let Ok(ifaddrs) = get_if_addrs() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for iface in ifaddrs {
+        if iface.is_loopback() {
+            continue;
+        }
+        let (ip, prefix_len): (std::net::IpAddr, u8) = match &iface.addr {
+            IfAddr::V4(v4) => {
+                if v4.ip.is_link_local() || v4.ip.is_unspecified() {
+                    continue;
+                }
+                (
+                    std::net::IpAddr::V4(v4.ip),
+                    u32::from(v4.netmask).count_ones() as u8,
+                )
+            }
+            IfAddr::V6(v6) => {
+                if v6.ip.is_unspecified() {
+                    continue;
+                }
+                // Link-local addresses identify the host on this link but are not a
+                // network anyone routes to, so they are not emitted as prefixes.
+                if (v6.ip.segments()[0] & 0xffc0) == 0xfe80 {
+                    continue;
+                }
+                let bits: u32 = u128::from(v6.netmask).count_ones();
+                (std::net::IpAddr::V6(v6.ip), bits as u8)
+            }
+        };
+
+        if let Ok(cidr) = ipnet::IpNet::new(ip, prefix_len) {
+            out.push(InterfaceAddress {
+                interface_name: iface.name.clone(),
+                ip,
+                cidr: cidr.trunc(),
+            });
+        }
+    }
+
+    out
+}
+
 /// Lists all non-loopback IPv4 network interfaces
 pub fn list_ipv4_interfaces() -> Result<Vec<LocalNetworkInfo>, String> {
     let ifaddrs =

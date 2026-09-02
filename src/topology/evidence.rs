@@ -138,11 +138,46 @@ impl fmt::Display for EvidenceSource {
 pub enum DeviceKey {
     Mac(String),
     Address(IpAddr),
+    /// An address that is only meaningful inside a zone.
+    ///
+    /// `fe80::1%en0` and `fe80::1%eth1` are different devices on different links. Keying
+    /// link-local addresses globally would merge them into one node.
+    ScopedAddress(IpAddr, String),
 }
 
 impl DeviceKey {
     pub fn mac(raw: &str) -> Self {
         DeviceKey::Mac(raw.to_ascii_lowercase())
+    }
+
+    /// Builds an address identity, attaching the zone only where it actually disambiguates.
+    ///
+    /// A globally unique address needs no zone; a link-local one is meaningless without it.
+    pub fn scoped_address(addr: IpAddr, zone: Option<&str>) -> Self {
+        match (requires_zone(&addr), zone) {
+            (true, Some(zone)) => DeviceKey::ScopedAddress(addr, zone.to_ascii_lowercase()),
+            _ => DeviceKey::Address(addr),
+        }
+    }
+
+    /// The address this key refers to, if it is address-based.
+    pub fn address(&self) -> Option<IpAddr> {
+        match self {
+            DeviceKey::Address(a) | DeviceKey::ScopedAddress(a, _) => Some(*a),
+            DeviceKey::Mac(_) => None,
+        }
+    }
+}
+
+/// True when an address is ambiguous without an interface zone.
+pub fn requires_zone(addr: &IpAddr) -> bool {
+    match addr {
+        // IPv4 link-local is not zoned in practice on a single-homed scope.
+        IpAddr::V4(_) => false,
+        IpAddr::V6(v6) => {
+            // fe80::/10 link-local, and ff02::/16 link-local multicast.
+            (v6.segments()[0] & 0xffc0) == 0xfe80 || (v6.segments()[0] & 0xff0f) == 0xff02
+        }
     }
 }
 
@@ -151,6 +186,7 @@ impl fmt::Display for DeviceKey {
         match self {
             DeviceKey::Mac(m) => write!(f, "{}", m),
             DeviceKey::Address(a) => write!(f, "{}", a),
+            DeviceKey::ScopedAddress(a, zone) => write!(f, "{}%{}", a, zone),
         }
     }
 }

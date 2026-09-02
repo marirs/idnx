@@ -476,6 +476,7 @@ mod tests {
                 blind_to: vec!["switched unicast".to_string()],
                 unavailable: Vec::new(),
                 observed_frames: Some(7),
+                accepted_facts: Some(3),
             },
             oversized_scopes: Vec::new(),
             converged: true,

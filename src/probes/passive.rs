@@ -408,18 +408,32 @@ fn decode_ipv6(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
                 prefixes,
             });
         }
-        // Neighbour Solicitation / Advertisement.
-        135 | 136 => {
+        // Neighbour Solicitation.
+        //
+        // The target address is who the sender is *looking for*, not an address the sender
+        // holds. Binding it to the sender's MAC attributes one host's address to another,
+        // which merged unrelated devices into one node. The sender's own address is the
+        // IPv6 source, which is unspecified during duplicate address detection.
+        135 => {
+            if !source_address.is_unspecified() {
+                facts.push(FrameFact::Neighbor {
+                    mac: source_mac.to_string(),
+                    address: source_address,
+                    is_router: false,
+                });
+            }
+        }
+        // Neighbour Advertisement: here the target address *is* the sender's own.
+        136 => {
             if icmp.len() < 24 {
                 return;
             }
             let mut target = [0u8; 16];
             target.copy_from_slice(&icmp[8..24]);
-            let is_router = icmp[0] == 136 && (icmp[4] & 0x80) != 0;
             facts.push(FrameFact::Neighbor {
                 mac: source_mac.to_string(),
                 address: Ipv6Addr::from(target),
-                is_router,
+                is_router: (icmp[4] & 0x80) != 0,
             });
         }
         _ => {}
@@ -746,6 +760,78 @@ mod tests {
                 assert_eq!(*router_address, Some(src));
             }
             other => panic!("expected an RA, got {:?}", other),
+        }
+    }
+
+    /// Wraps an ICMPv6 body in IPv6 and Ethernet headers.
+    fn icmpv6_frame(src_mac: [u8; 6], src_ip: &str, icmp: &[u8]) -> Vec<u8> {
+        let mut ipv6 = vec![0x60, 0, 0, 0];
+        ipv6.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+        ipv6.push(58);
+        ipv6.push(255);
+        let src: Ipv6Addr = src_ip.parse().unwrap();
+        ipv6.extend_from_slice(&src.octets());
+        ipv6.extend_from_slice(&Ipv6Addr::UNSPECIFIED.octets());
+        ipv6.extend_from_slice(icmp);
+
+        let mut frame = eth([0x33, 0x33, 0, 0, 0, 1], src_mac, ETHERTYPE_IPV6);
+        frame.extend_from_slice(&ipv6);
+        frame
+    }
+
+    #[test]
+    fn a_solicitation_does_not_bind_the_target_to_the_sender() {
+        // The classic error: NS asks "who has X?", and treating X as the sender's own
+        // address attributes one host's address to another and merges unrelated devices.
+        let target: Ipv6Addr = "fdc5::dead".parse().unwrap();
+        let mut icmp = vec![135, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&target.octets());
+
+        let facts = decode_frame(&icmpv6_frame([0xaa, 0xaa, 0xaa, 0, 0, 1], "fdc5::1", &icmp));
+
+        match facts.as_slice() {
+            [FrameFact::Neighbor { mac, address, .. }] => {
+                assert_eq!(mac, "aa:aa:aa:00:00:01");
+                assert_eq!(
+                    *address,
+                    "fdc5::1".parse::<Ipv6Addr>().unwrap(),
+                    "a solicitation binds only the sender's own source address"
+                );
+                assert_ne!(*address, target);
+            }
+            other => panic!("expected one neighbour binding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn duplicate_address_detection_binds_nothing() {
+        // DAD sends from :: , which identifies no one.
+        let target: Ipv6Addr = "fdc5::dead".parse().unwrap();
+        let mut icmp = vec![135, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&target.octets());
+
+        let facts = decode_frame(&icmpv6_frame([0xaa; 6], "::", &icmp));
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn an_advertisement_binds_the_target_to_the_sender() {
+        // In an NA the target address is the sender's own, so the binding is valid.
+        let own: Ipv6Addr = "fdc5::42".parse().unwrap();
+        let mut icmp = vec![136, 0, 0, 0, 0x80, 0, 0, 0]; // router flag set
+        icmp.extend_from_slice(&own.octets());
+
+        let facts = decode_frame(&icmpv6_frame([0xbb; 6], "fdc5::42", &icmp));
+        match facts.as_slice() {
+            [
+                FrameFact::Neighbor {
+                    address, is_router, ..
+                },
+            ] => {
+                assert_eq!(*address, own);
+                assert!(*is_router, "the router flag must be read from an NA");
+            }
+            other => panic!("expected a neighbour binding, got {:?}", other),
         }
     }
 

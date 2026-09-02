@@ -5,6 +5,7 @@
 //! shown distinctly, so a partial map is never presented as a complete one.
 
 use colored::*;
+use comfy_table::{Cell, Color as TableColor, ContentArrangement, Table, presets::UTF8_FULL};
 use ipnet::IpNet;
 
 use crate::engine::orchestrator::{DiscoveryReport, is_virtual_network};
@@ -19,6 +20,7 @@ pub fn render(report: &DiscoveryReport, start: &StartingScope) {
     render_infrastructure(&report.graph);
     render_hosts(&report.graph);
     render_boundaries(&report.graph);
+    render_device_table(&report.graph);
     render_coverage(report);
 }
 
@@ -44,18 +46,16 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
 
     // An empty capture and an absent capture produce identical topology, so the two are
     // reported differently and never conflated.
-    match report.visibility.observed_frames {
-        Some(0) => println!(
-            "    {} {}",
-            "Passive capture:".dimmed(),
-            "active; no frames observed on this link".dimmed()
-        ),
-        Some(n) => println!(
-            "    {} {}",
-            "Passive capture:".dimmed(),
-            format!("active; {} frames observed", n).dimmed()
-        ),
-        None => {}
+    // Frames prove the reader delivered packets; accepted facts prove the whole path
+    // through decoding, draining and absorption actually worked.
+    if let Some(frames) = report.visibility.observed_frames {
+        let accepted = report.visibility.accepted_facts.unwrap_or(0);
+        let detail = match (frames, accepted) {
+            (0, _) => "active; no frames observed on this link".to_string(),
+            (f, 0) => format!("active; {f} frames observed, no topology evidence among them"),
+            (f, a) => format!("active; {f} frames observed, {a} facts accepted"),
+        };
+        println!("    {} {}", "Passive capture:".dimmed(), detail.dimmed());
     }
 }
 
@@ -79,7 +79,11 @@ fn render_networks(report: &DiscoveryReport) {
         println!("\n{}", "Networks".bold().green());
         for net in &physical {
             let oversized = report.oversized_scopes.contains(net);
-            let note = if oversized {
+            let note = if net.addr().is_ipv6() {
+                // IPv6 host space is never swept: it is not a size limit but a design
+                // choice, since devices arrive from neighbour and advertisement evidence.
+                " (devices from neighbour evidence; IPv6 host space is not swept)".to_string()
+            } else if oversized {
                 " (too large to enumerate; devices come from neighbour evidence)".to_string()
             } else {
                 String::new()
@@ -255,6 +259,114 @@ fn render_boundaries(graph: &TopologyGraph) {
             println!("  │     └── {}", reason.yellow());
         }
     }
+}
+
+/// Detailed per-device table with the services observed on each.
+///
+/// The tree shows relationships; this shows the inventory. Services live on their own nodes
+/// in the graph, so they are gathered back onto their owning device here rather than being
+/// stored twice.
+fn render_device_table(graph: &TopologyGraph) {
+    let mut devices: Vec<&crate::topology::Node> = graph
+        .nodes()
+        .filter(|n| {
+            matches!(
+                n.kind,
+                NodeKind::Router | NodeKind::Switch | NodeKind::Host | NodeKind::OpaqueBoundary
+            )
+        })
+        .filter(|n| {
+            n.addresses
+                .iter()
+                .any(crate::topology::graph::is_interrogable)
+        })
+        .collect();
+    if devices.is_empty() {
+        return;
+    }
+    devices.sort_by_key(|n| n.addresses.iter().next().copied());
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Role").fg(TableColor::Cyan),
+            Cell::new("Address").fg(TableColor::Cyan),
+            Cell::new("Name").fg(TableColor::Cyan),
+            Cell::new("MAC / Vendor").fg(TableColor::Cyan),
+            Cell::new("Services").fg(TableColor::Cyan),
+            Cell::new("Evidence").fg(TableColor::Cyan),
+        ]);
+
+    for node in devices {
+        let address = node
+            .addresses
+            .iter()
+            .find(|a| crate::topology::graph::is_interrogable(a))
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+
+        let services = services_for(graph, node);
+        let identity = match (&node.id, &node.vendor) {
+            (NodeId::Device(key), Some(vendor)) => format!("{key}\n{vendor}"),
+            (NodeId::Device(key), None) => key.to_string(),
+            (_, Some(vendor)) => vendor.clone(),
+            _ => String::new(),
+        };
+
+        table.add_row(vec![
+            Cell::new(node.kind.label()).fg(match node.kind {
+                NodeKind::Router => TableColor::Blue,
+                NodeKind::Switch => TableColor::Magenta,
+                NodeKind::OpaqueBoundary => TableColor::Yellow,
+                _ => TableColor::White,
+            }),
+            Cell::new(address),
+            Cell::new(
+                node.hostnames
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::new(identity),
+            Cell::new(if services.is_empty() {
+                "-".to_string()
+            } else {
+                services.join(", ")
+            }),
+            Cell::new(if node.role_signals.is_empty() {
+                "-".to_string()
+            } else {
+                node.role_signals
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        ]);
+    }
+
+    println!("\n{}", "Device inventory".bold().green());
+    println!("{table}");
+}
+
+/// Service descriptions belonging to a device, gathered from its addresses.
+fn services_for(graph: &TopologyGraph, node: &crate::topology::Node) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for service in graph.nodes_of_kind(NodeKind::Service) {
+        let NodeId::Service(addr, _) = &service.id else {
+            continue;
+        };
+        if !node.addresses.contains(addr) {
+            continue;
+        }
+        out.extend(service.descriptions.iter().cloned());
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn render_coverage(report: &DiscoveryReport) {

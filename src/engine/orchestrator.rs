@@ -58,6 +58,12 @@ pub struct VisibilityReport {
     /// Reported so that "the link was quiet" is distinguishable from "nothing was
     /// listening", which produce identical topology otherwise.
     pub observed_frames: Option<u64>,
+    /// Topology facts accepted from those frames.
+    ///
+    /// A frame count alone proves the reader delivered packets and nothing more. Most
+    /// traffic on any link is not discovery evidence, so this second number separates "no
+    /// discovery protocols on this link" from "the decoding path is broken".
+    pub accepted_facts: Option<u64>,
 }
 
 /// Result of a complete discovery run.
@@ -342,6 +348,7 @@ impl DiscoveryEngine {
                 blind_to,
                 unavailable,
                 observed_frames: None,
+                accepted_facts: None,
             },
             oversized_scopes: oversized,
             converged,
