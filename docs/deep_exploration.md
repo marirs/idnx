@@ -28,16 +28,34 @@ Discovery distinguishes two things that are easy to conflate:
 * A **route** is a network whose prefix is actually known.
 * A **pivot** is a router address we have evidence for, whose attached networks are *not* yet known.
 
-A traceroute hop, an LLDP/CDP management address, a DHCP option 3 router and a UPnP responder are all pivots. They prove a device exists; they say nothing about which prefixes hang off it. idNX interrogates pivots (SNMP) to turn them into routes. It does not widen a router address into an assumed `/24` unless you pass `--infer-hop-subnets`, and results obtained that way are labelled `inferred`.
+An LLDP/CDP management address, a DHCP option 3 router, an IPv6 router advertisement and a UPnP InternetGatewayDevice are all pivots. Each proves a device exists and behaves as infrastructure; none says which prefixes hang off it. idNX interrogates pivots to learn that, and never widens a router address into an assumed `/24`.
 
 Every reported network carries a confidence grade:
 
 | Grade | Marker | Meaning |
 | --- | --- | --- |
-| `verified` | `*` | The local kernel holds a route for it, or we reached it ourselves. |
+| `observed` | `*` | Seen directly: a frame on the wire, a kernel table entry, or a live response. |
 | `advertised` | `+` | A control-plane source asserted it (SNMP route/address table, LLDP/CDP, DHCP). We believe the device but have not reached the network. |
 | `user-supplied` | `=` | You passed it via `--subnets`. |
 | `inferred` | `~` | Derived by assumption, never by observation. Opt-in only. |
+
+### 2.1a What passive observation can and cannot establish
+
+Passive capture is opportunistic and vantage-dependent. It reveals only traffic that
+reaches the capture point:
+
+| Signal | Establishes | Does not establish |
+| --- | --- | --- |
+| STP/RSTP BPDU | A bridge exists on this segment, and its claimed bridge/root identity | Routing behaviour, any subnet, or the full fabric beyond what is observed |
+| 802.1Q / QinQ tag | The VLAN ID exists on this link | The VLAN's prefix, until DHCP, an RA or IP traffic supplies one |
+| DHCP option 1 | A network prefix | Anything about networks the server did not mention |
+| DHCP option 3 / 121 | A router, and explicit routes | A prefix for anything else |
+| IPv6 RA | The sender is a router (observed) and its claimed prefixes (advertised) | That the prefixes are reachable from here |
+| ARP / NDP | An address-to-MAC binding on this segment | Anything across a routing boundary |
+
+A wireless station receives none of the wired link-layer signals. Traffic isolated behind
+another router's boundary never arrives at this capture point at all, so listening on the
+parent side cannot reveal what that router does not forward.
 
 ### 2.2 Unexplored Boundaries
 
@@ -58,34 +76,43 @@ identified it and the reason it could not be explored:
 
 Router evidence, all observed rather than assumed:
 
-| Signal | Strength |
+| Signal | Weight |
 | --- | --- |
-| Sets the RFC 4861 `isRouter` bit in the kernel IPv6 neighbour table | Strong - the device advertised itself as a router |
-| Is this machine's default gateway | Strong |
-| Serves DNS (53) *and* a web admin interface | Moderate - the classic SOHO router signature |
-| Hardware vendor is a router/AP vendor | Weak - only ever supporting evidence |
-| Advertises a name containing "router" | Weak |
+| Is this machine's default gateway | 100 |
+| Reports IP forwarding over SNMP | 90 |
+| Emits spanning-tree BPDUs (bridge, not router) | 90 |
+| Advertises a UPnP InternetGatewayDevice | 80 |
+| Acts as a DHCP router or server | 80 |
+| Sends IPv6 router advertisements, or sets the RFC 4861 `isRouter` bit | 70 |
+| LLDP/CDP capability bits | 70 |
+| Observed forwarding traffic on a path | 60 |
+| Serves DNS *and* a web management interface | 30 |
+
+**Hardware vendor is not on this list and never contributes.** An OUI identifies the
+manufacturer only. The threshold requires corroboration, so no single weak signal promotes
+a device on its own.
 
 The `isRouter` bit is read strictly from the `Flgs` column of the neighbour table. The
 `St` (state) column also uses `R`, there meaning REACHABLE; conflating the two reports
 every recently-contacted phone and laptop as network infrastructure.
 
-### 2.3 Gateway Interrogation Order
+### 2.3 How Infrastructure Is Interrogated
 
-Deep exploration seeds from the OS default gateway first — it is the one router guaranteed to know what lies upstream — then interrogates every other pivot:
+Discovery seeds from local OS state, then runs a fixed-point loop. Any device that shows
+infrastructure behaviour becomes a pivot and is interrogated directly; whatever it discloses
+is folded back into the graph, which may produce further networks and further pivots. The
+loop ends when a pass adds nothing new, or when the safety budget is reached.
 
-1. OS default gateway (kernel routing table).
-2. Kernel routes with an off-subnet next hop.
-3. DHCP option 3 routers, read from the lease the OS already holds.
-4. LLDP/CDP management addresses from Layer 2 neighbours.
-5. UPnP/SSDP responders outside the local subnet.
-6. Upstream TTL hops.
+Pivot membership comes from observed behaviour only — being the default gateway, serving
+DHCP, advertising as an IPv6 router, announcing a UPnP InternetGatewayDevice, reporting SNMP
+forwarding, emitting BPDUs, or LLDP/CDP capability bits. A device is never queued because of
+its manufacturer.
 
-Each pivot is queried over **UDP 161**. Candidate gateways are liveness-checked on TCP 80/443/53/22 *and* via a real SNMP exchange; a TCP probe of port 161 is not a valid SNMP check and is not used.
+SNMP, where a community is available, is queried over **UDP 161**. A TCP probe of port 161 is
+not a valid SNMP check and is not used. SNMP is one provider among several: when it does not
+answer, every other provider continues and the outcome is reported rather than dropped.
 
-TTL hop discovery needs an off-link destination. idNX takes the first public nameserver from the system resolver configuration rather than shipping a hardcoded third-party address, and **skips hop discovery entirely** when every configured resolver is private. Override with `--trace-target`.
-
-A brute-force `192.168.x.1/.254` sweep is available behind `--heuristic-sweep`. It is guessing, is confined to `192.168.0.0/16`, and everything it produces is graded `inferred`.
+Ordering is deterministic, so two runs over an unchanged network produce the same output.
 
 ### 2.4 Dual-Mode Name Synthesis (Overcoming Multicast Barriers)
 * **Local Subnet**: `idNX` uses Multicast DNS (RFC 6762 on `224.0.0.251:5353`) to resolve Apple, Linux, and IoT `.local` names.
@@ -124,7 +151,7 @@ When a router has its WAN firewall in strict stealth mode (dropping both TCP and
 3. **Routing Table Extraction (`ipRouteTable` — `1.3.6.1.2.1.4.21`)**:
    Everything the router forwards toward, including networks reached via a further next hop. A zero next hop means the route is directly connected on the queried router.
 
-Both tables are graded `advertised`, not `verified`: the device asserted them, and idNX has not yet reached them itself. Reaching a network during the subsequent scan is what promotes it to `verified`.
+Both tables are graded `advertised`, not `observed`: the device asserted them, and idNX has not reached them itself.
 
 ### Requirements and limits
 

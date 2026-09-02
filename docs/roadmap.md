@@ -73,18 +73,32 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ### Milestone 8: Evidence-Graded Topology Model -> [COMPLETED]
 - [x] Split discovery into **routes** (networks whose prefix is known) and **pivots** (routers whose networks are not yet known), so a router address is never widened into a network by assumption.
-- [x] Confidence grading on every network — `verified`, `advertised`, `user-supplied`, `inferred` — surfaced in the topology tree, HTML graph and every export format.
+- [x] Confidence grading on every network, surfaced in the topology view, HTML graph and every export format. (The grade names settled as `observed`, `advertised`, `inferred` and `user-supplied` in Milestone 9.)
 - [x] Default gateway seeded as the first topology pivot; SNMP checked over UDP 161 rather than by probing TCP 161.
 - [x] `ipAddrTable` consumed as directly-attached-network evidence, with the router's real interface address as the gateway.
 - [x] DHCP option 3 routers ingested from the OS lease (`ipconfig getoption` on macOS, dhclient leases on Linux, `ipconfig /all` on Windows).
 - [x] LLDP/CDP management addresses fed back into discovery as pivots instead of being printed and discarded.
-- [x] TTL hop discovery targets a public resolver derived from the system configuration, and is skipped when none exists, rather than tracing to a hardcoded address.
+- [x] Removed the hardcoded traceroute target. (TTL hop inference was retired entirely in Milestone 9: a hop proves a router interface on one path and nothing about any prefix.)
 - [x] Auto-discovered networks bounded by `--max-sweep-hosts` so a `/16` VM bridge in the kernel table cannot stall a run.
 - [x] Deterministic resolver selection and deterministic route/pivot ordering, so repeated runs on an unchanged network produce identical output.
 
 ---
 
-### Milestone 9: Switch Port Mapping & Change Detection -> [PLANNED]
+### Milestone 9: Vendor-Neutral Evidence Graph -> [COMPLETED]
+- [x] One `TopologyEvidence` record emitted by every source; providers cannot report results any other way.
+- [x] `TopologyGraph` with Interface, Network, VLAN, Router, Switch, Host, Service and OpaqueBoundary nodes and typed relationships.
+- [x] Role scoring from corroborated behaviour with explicit weights; the rule that classified every ASUS/Linksys/MikroTik/Ubiquiti OUI as a router is removed.
+- [x] Network nodes only from prefix-bearing evidence; a VLAN tag yields the VLAN ID and never a prefix.
+- [x] Automatic fixed-point work queue with a bounded safety budget. Recursion always on; no user-facing depth, thread or provider flags.
+- [x] Passive link-layer observation as an opportunistic provider: Ethernet II, LLC/SNAP, 802.1Q/QinQ, STP/RSTP, LLDP, CDP, ARP, DHCPv4 (options 1/3/121), IPv6 RA and NDP, MNDP — with byte-level fixtures.
+- [x] Vantage classification and explicit visibility reporting; an empty capture is distinguished from an absent one.
+- [x] Virtual and VPN networks classified by the interface they are reached through, never by address range.
+- [x] Per-scope and per-pivot provider outcomes reported, including providers that returned nothing.
+- [x] Every export format and the interactive HTML graph rebuilt on the graph, preserving kinds, relationships, evidence, confidence and coverage.
+
+---
+
+### Milestone 10: Switch Port Mapping & Change Detection -> [PLANNED]
 - [ ] BRIDGE-MIB forwarding tables (`dot1dTpFdbAddress` / `dot1dTpFdbPort`) to place a device on a specific switch port.
 - [ ] LLDP-MIB (`lldpRemTable`) read over SNMP to reconstruct switch-to-switch relationships beyond the local link.
 - [ ] `ifName`, interface speed and operational state for named, typed uplinks.
@@ -96,7 +110,7 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 10: Container & Orchestrator Topology Mapping -> [PLANNED]
+### Milestone 11: Container & Orchestrator Topology Mapping -> [PLANNED]
 - [ ] Docker, Podman, and containerd runtime socket / port detection.
 - [ ] Kubernetes Node & Kubelet (`10250`, `10255`) infrastructure probing.
 - [ ] Virtualized container bridge subnet identification (`cni0`, `docker0`).

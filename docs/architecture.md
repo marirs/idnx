@@ -47,9 +47,22 @@ idNX is architected as a high-performance, asynchronous Rust library (`idnx`) wi
 
 ## 2. Core Modules (`idnx::*`)
 
+### 2.0 `topology` and `providers`
+
+* **`topology::evidence`**: The single record every source emits. A provider cannot report a
+  result any other way, which structurally prevents a working decoder from feeding nothing.
+* **`topology::graph`**: Correlates evidence into nodes and relationships, owns device
+  identity (addresses merge onto one device via MAC), and enforces two rules: a network node
+  requires prefix-bearing evidence, and loopback/link-local/multicast ranges are not topology.
+* **`topology::role`**: Scores device roles from corroborated behaviour with explicit
+  weights. Manufacturer is never an input.
+* **`providers`**: One trait for local, credential-free network, passive and optional
+  amplifier sources. No vendor is privileged in the graph or the scheduler.
+
+
 ### 2.1 `engine`
-* **`scanner`**: Drives data-plane discovery using bounded semaphore worker pools. Coordinates Layer 2 ARP population, parallel TCP SYN/connect sweeps, asynchronous ICMP echo sweeps for stealth hosts, and service banner grabbing.
-* **`deep`**: Interrogates routers it has evidence for — the OS default gateway first, then DHCP option 3 routers, LLDP/CDP management addresses, UPnP responders and TTL hops — to learn the networks each one is attached to or forwards toward. Distinguishes *routes* (networks whose prefix is known) from *pivots* (routers whose networks are not yet known), and grades every result `verified`, `advertised`, `user-supplied` or `inferred`. See `docs/deep_exploration.md`.
+* **`scanner`**: Data-plane probing used for *enrichment only*. Host sweeps, TCP connect probes and ICMP fallbacks validate and describe devices that discovery has already found; they are not a discovery mechanism.
+* **`orchestrator`**: The automatic discovery engine. Runs every applicable provider to a fixed point over each discovered network and infrastructure device, under a bounded safety budget. Recursion is internal and always enabled; there is no depth or thread count to configure.
 
 ### 2.2 `probes`
 * **`lldp`**: Berkeley Packet Filter (macOS `/dev/bpf*`) and raw packet socket (Linux `AF_PACKET`) frame listener that decodes IEEE 802.1AB LLDP TLVs (Chassis ID, Port ID, System Name, System Description, Capabilities).
@@ -70,13 +83,7 @@ idNX is architected as a high-performance, asynchronous Rust library (`idnx`) wi
 
 ### 2.4 `fingerprint`
 * **`oui`**: Embedded, binary-searchable IEEE OUI vendor database. Automatically checks for IEEE 802 local/randomized MAC addresses (`mac[0] & 0x02 != 0`).
-* **`classifier`**: Multi-signal heuristic device classifier assigning nodes into:
-  * Gateways & Routers
-  * Managed Switches
-  * Workstations, Laptops & Servers (including DGX / AI compute nodes)
-  * IoT & Connected Smart Devices (air purifiers, hubs, smart bulbs, TVs)
-
-### 2.5 `output`
+* **`topology::role`**: Assigns device roles by scoring corroborated behaviour with explicit weights. Manufacturer is never an input; the previous OUI-based classifier has been removed.
 * **`tree`**: Renders the complete multi-tier network hierarchy in Unicode showing Gateway $\to$ Workstations $\to$ Smart Devices $\to$ Cascaded & Adjacent Networks.
 * **`terminal`**: Renders a synchronized, formatted tabular overview (`comfy-table`) with network origin, IP, hostname, MAC/vendor, open ports, and latency.
 
