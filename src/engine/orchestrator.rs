@@ -49,6 +49,11 @@ pub struct VisibilityReport {
     pub blind_to: Vec<String>,
     /// Providers that were skipped, and why.
     pub unavailable: Vec<String>,
+    /// Frames passively observed, when capture ran. `None` means capture never started.
+    ///
+    /// Reported so that "the link was quiet" is distinguishable from "nothing was
+    /// listening", which produce identical topology otherwise.
+    pub observed_frames: Option<u64>,
 }
 
 /// Result of a complete discovery run.
@@ -260,14 +265,9 @@ impl DiscoveryEngine {
             .map(|s| s.to_string())
             .collect();
 
-        let mut unavailable = Vec::new();
-        if !context.privileged {
-            unavailable.push(
-                "raw link-layer capture (LLDP/CDP/STP): requires elevated privileges".to_string(),
-            );
-        } else if !context.vantage.capture_available {
-            unavailable.push("raw link-layer capture: not supported on this interface".to_string());
-        }
+        // Left empty on purpose: whether capture actually started is known only to the
+        // caller that attempted to open it, and is appended to this list afterwards.
+        let unavailable = Vec::new();
 
         DiscoveryReport {
             graph,
@@ -277,6 +277,7 @@ impl DiscoveryEngine {
                 vantage: context.vantage.clone(),
                 blind_to,
                 unavailable,
+                observed_frames: None,
             },
             oversized_scopes: oversized,
             converged,

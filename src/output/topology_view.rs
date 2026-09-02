@@ -41,6 +41,22 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
     for note in &report.visibility.unavailable {
         println!("    {} {}", "Unavailable:".dimmed(), note.dimmed());
     }
+
+    // An empty capture and an absent capture produce identical topology, so the two are
+    // reported differently and never conflated.
+    match report.visibility.observed_frames {
+        Some(0) => println!(
+            "    {} {}",
+            "Passive capture:".dimmed(),
+            "active; no frames observed on this link".dimmed()
+        ),
+        Some(n) => println!(
+            "    {} {}",
+            "Passive capture:".dimmed(),
+            format!("active; {} frames observed", n).dimmed()
+        ),
+        None => {}
+    }
 }
 
 fn render_networks(report: &DiscoveryReport) {

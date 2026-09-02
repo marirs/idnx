@@ -1,4 +1,5 @@
 pub mod arp;
+pub mod capture;
 pub mod dns;
 pub mod interface;
 pub mod ipv6;

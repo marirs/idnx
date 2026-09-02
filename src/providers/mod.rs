@@ -7,6 +7,7 @@
 
 pub mod local;
 pub mod network;
+pub mod passive;
 
 use std::future::Future;
 use std::net::IpAddr;

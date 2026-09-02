@@ -162,13 +162,35 @@ async fn run() {
     context.privileged = privileged;
     context.snmp_communities = cli.snmp_community.clone();
 
+    // Passive observation opens now and runs alongside everything else. It is
+    // opportunistic: if it cannot start, the reason is reported and discovery is otherwise
+    // unaffected. Nothing waits on it, and there is no listening period to sit through.
+    let observation = std::sync::Arc::new(providers::passive::PassiveObservation::start(
+        &start.vantage.interface,
+    ));
+
+    let mut scope_providers = providers::network::network_providers();
+    if observation.is_running() {
+        scope_providers.push(Box::new(providers::passive::PassiveProvider::new(
+            std::sync::Arc::clone(&observation),
+        )));
+    }
+
     let engine = engine::orchestrator::DiscoveryEngine::new(
         providers::local::local_providers(),
-        providers::network::network_providers(),
+        scope_providers,
     );
 
     println!("{} Discovering topology...", "[*]".blue().bold());
-    let report = engine.run(context, start.network).await;
+    let mut report = engine.run(context, start.network).await;
+
+    // Convergence is the stopping condition for observation too.
+    let frames_seen = observation.frames_seen();
+    if let Some(reason) = observation.unavailable_reason() {
+        report.visibility.unavailable.push(reason);
+    } else {
+        report.visibility.observed_frames.replace(frames_seen);
+    }
 
     output::topology_view::render(&report, &start);
 
