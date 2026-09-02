@@ -284,11 +284,27 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].ip, Ipv4Addr::new(192, 168, 1, 1));
         assert_eq!(entries[0].hostname.as_deref(), Some("linksys07877"));
-        assert_eq!(entries[0].vendor.as_deref(), Some("Linksys"));
+        // The exact organization string comes from the registry, not from this parser, so
+        // the assertion is on attribution rather than on a hard-coded spelling.
+        assert!(
+            entries[0]
+                .vendor
+                .as_deref()
+                .is_some_and(|v| v.contains("Linksys")),
+            "vendor should be attributed from the OUI registry"
+        );
 
         assert_eq!(entries[1].ip, Ipv4Addr::new(192, 168, 1, 166));
         assert_eq!(entries[1].hostname.as_deref(), Some("dmaker-fan"));
-        assert_eq!(entries[1].vendor.as_deref(), Some("Xiaomi / Smartmi"));
+        // "Xiaomi / Smartmi" was an invented product label; the registry records the
+        // organization that holds the block.
+        assert!(
+            entries[1]
+                .vendor
+                .as_deref()
+                .is_some_and(|v| v.contains("Xiaomi")),
+            "vendor should be attributed from the OUI registry"
+        );
     }
 
     #[test]
@@ -301,9 +317,23 @@ mod tests {
         let entries = parse_proc_net_arp(sample, Some("eth0"));
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].ip, Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(entries[0].vendor.as_deref(), Some("Linksys"));
+        // The exact organization string comes from the registry, not from this parser, so
+        // the assertion is on attribution rather than on a hard-coded spelling.
+        assert!(
+            entries[0]
+                .vendor
+                .as_deref()
+                .is_some_and(|v| v.contains("Linksys")),
+            "vendor should be attributed from the OUI registry"
+        );
         assert_eq!(entries[1].ip, Ipv4Addr::new(192, 168, 1, 53));
-        assert_eq!(entries[1].vendor.as_deref(), Some("ASUSTek Computer Inc."));
+        assert!(
+            entries[1]
+                .vendor
+                .as_deref()
+                .is_some_and(|v| v.contains("ASUSTek")),
+            "vendor should be attributed from the OUI registry"
+        );
     }
 
     #[test]
@@ -317,8 +347,22 @@ mod tests {
         let entries = parse_arp_output(sample, None);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].ip, Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(entries[0].vendor.as_deref(), Some("Linksys"));
+        // The exact organization string comes from the registry, not from this parser, so
+        // the assertion is on attribution rather than on a hard-coded spelling.
+        assert!(
+            entries[0]
+                .vendor
+                .as_deref()
+                .is_some_and(|v| v.contains("Linksys")),
+            "vendor should be attributed from the OUI registry"
+        );
         assert_eq!(entries[1].ip, Ipv4Addr::new(192, 168, 1, 53));
-        assert_eq!(entries[1].vendor.as_deref(), Some("ASUSTek Computer Inc."));
+        assert!(
+            entries[1]
+                .vendor
+                .as_deref()
+                .is_some_and(|v| v.contains("ASUSTek")),
+            "vendor should be attributed from the OUI registry"
+        );
     }
 }

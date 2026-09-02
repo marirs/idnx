@@ -1,306 +1,416 @@
+//! MAC address to registered organization lookup.
+//!
+//! An OUI identifies the organization that registered an address block. That is all. It
+//! does not establish that a device is a router, a switch, an access point, a compute node
+//! or any other product: the previous hand-written table asserted things like
+//! "AzureWave (NVIDIA DGX / Compute Node)" from a prefix registered simply to AzureWave
+//! Technology, and being hand-written it could never be corrected by an update.
+//!
+//! Two tiers, longest match first:
+//!
+//! 1. The IEEE registry cached on disk, covering MA-L (24-bit), MA-M (28-bit) and MA-S
+//!    (36-bit) assignments and preserving the exact registered organization name.
+//! 2. A bundled offline snapshot, so a fresh install with no network still identifies
+//!    hardware. Its names are normalized short forms rather than the exact registrations.
+//!
+//! The cache always wins where it has an answer, which is what makes a stale or wrong
+//! bundled value correctable.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// Where a vendor attribution came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VendorSource {
+    /// The IEEE registry cached on this machine. Exact registered name.
+    IeeeRegistry,
+    /// The offline snapshot compiled into the binary. Normalized name.
+    BundledSnapshot,
+}
+
+impl VendorSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            VendorSource::IeeeRegistry => "IEEE registry",
+            VendorSource::BundledSnapshot => "bundled OUI snapshot",
+        }
+    }
+}
+
+/// The result of a lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OuiInfo {
+    /// The organization that registered the address block. Never a product or a role.
     pub vendor: Option<String>,
+    pub source: Option<VendorSource>,
+    /// True for a locally administered address, which identifies no organization at all.
     pub is_randomized: bool,
 }
 
 impl OuiInfo {
     pub fn display_label(&self) -> String {
         match (&self.vendor, self.is_randomized) {
-            (Some(v), true) => format!("{} [Randomized MAC]", v),
+            (Some(v), true) => format!("{} [randomized MAC]", v),
             (Some(v), false) => v.clone(),
-            (None, true) => "Private / Randomized MAC".to_string(),
-            (None, false) => "Unknown Vendor".to_string(),
+            (None, true) => "Private / randomized MAC".to_string(),
+            (None, false) => "Unknown manufacturer".to_string(),
         }
     }
 }
 
-/// Returns the path to the user-cached OUI database (%LOCALAPPDATA%\idnx\oui.txt on Windows, ~/.cache/idnx/oui.txt on Unix)
+/// Path of the cached IEEE registry.
 pub fn get_oui_cache_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
-    {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            return Some(PathBuf::from(local_app_data).join("idnx").join("oui.txt"));
-        }
-    }
+    let base = std::env::var("LOCALAPPDATA").ok().map(PathBuf::from);
 
-    let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg)
-    } else if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        PathBuf::from(home).join(".cache")
-    } else {
-        return None;
-    };
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".cache"));
 
-    Some(base.join("idnx").join("oui.txt"))
+    base.map(|p| p.join("idnx").join("oui.txt"))
 }
 
-/// Downloads and updates the IEEE OUI database to ~/.cache/idnx/oui.txt
+/// Parses a MAC address into its six octets.
+fn parse_mac_bytes(mac: &str) -> Option<[u8; 6]> {
+    let cleaned: String = mac
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>();
+    if cleaned.len() < 12 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Looks up the organization that registered a MAC address's block.
+pub fn lookup_mac(mac_str: &str) -> OuiInfo {
+    let Some(bytes) = parse_mac_bytes(mac_str) else {
+        return OuiInfo {
+            vendor: None,
+            source: None,
+            is_randomized: false,
+        };
+    };
+
+    // IEEE 802: bit 1 of the first octet marks a locally administered address. Such an
+    // address is chosen by the host, so no registry entry describes it.
+    let is_randomized = (bytes[0] & 0x02) != 0;
+
+    if is_randomized {
+        return OuiInfo {
+            vendor: None,
+            source: None,
+            is_randomized: true,
+        };
+    }
+
+    // The cached registry first, longest prefix wins, so a 36-bit MA-S assignment beats
+    // the 24-bit block it sits inside.
+    if let Some(vendor) = lookup_in_cache(&bytes) {
+        return OuiInfo {
+            vendor: Some(vendor),
+            source: Some(VendorSource::IeeeRegistry),
+            is_randomized,
+        };
+    }
+
+    match macaddr_ouidb::OUI_DB.lookup(bytes) {
+        Some(name) => OuiInfo {
+            vendor: Some(name.to_string()),
+            source: Some(VendorSource::BundledSnapshot),
+            is_randomized,
+        },
+        None => OuiInfo {
+            vendor: None,
+            source: None,
+            is_randomized,
+        },
+    }
+}
+
+/// Longest-prefix lookup against the cached IEEE registry: 36-bit, then 28-bit, then 24-bit.
+fn lookup_in_cache(bytes: &[u8; 6]) -> Option<String> {
+    let index = ieee_cache_index();
+    if index.is_empty() {
+        return None;
+    }
+
+    let as_u64 = |b: &[u8; 6]| -> u64 {
+        ((b[0] as u64) << 40)
+            | ((b[1] as u64) << 32)
+            | ((b[2] as u64) << 24)
+            | ((b[3] as u64) << 16)
+            | ((b[4] as u64) << 8)
+            | (b[5] as u64)
+    };
+    let value = as_u64(bytes);
+
+    for bits in [36u32, 28, 24] {
+        let key = value & (!0u64 << (48 - bits)) & 0xFFFF_FFFF_FFFF;
+        if let Some(name) = index.get(&(bits, key)) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// The cached registry, parsed once per process.
+///
+/// Re-reading and rescanning a multi-megabyte registry on every lookup made a scan of a
+/// populated neighbour table quadratic; it is parsed once into a map instead.
+fn ieee_cache_index() -> &'static HashMap<(u32, u64), String> {
+    static CACHE: OnceLock<HashMap<(u32, u64), String>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut map = HashMap::new();
+        let Some(path) = get_oui_cache_path() else {
+            return map;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return map;
+        };
+        parse_ieee_registry(&content, &mut map);
+        map
+    })
+}
+
+/// Parses IEEE registry text into prefix-length-aware entries.
+///
+/// Handles both the MA-L form `AA-BB-CC   (hex)  Organization` and the MA-M/MA-S form
+/// `AA-BB-CC-D0-00-00/28   (hex)  Organization`, which is why entries are keyed by prefix
+/// length rather than by a bare 24-bit value.
+pub fn parse_ieee_registry(content: &str, map: &mut HashMap<(u32, u64), String>) {
+    for line in content.lines() {
+        let Some((prefix_part, org_part)) = line.split_once("(hex)") else {
+            continue;
+        };
+        let organization = org_part.trim();
+        if organization.is_empty() {
+            continue;
+        }
+
+        let prefix_text = prefix_part.trim();
+        let (address_text, bits) = match prefix_text.split_once('/') {
+            Some((addr, len)) => match len.trim().parse::<u32>() {
+                Ok(b) => (addr, b),
+                Err(_) => continue,
+            },
+            None => (prefix_text, 24),
+        };
+
+        let hex: String = address_text
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        if hex.len() < 6 {
+            continue;
+        }
+        // Pad to a full 48-bit value so every prefix length shares one key space.
+        let padded = format!("{:0<12}", &hex[..hex.len().min(12)]);
+        let Ok(value) = u64::from_str_radix(&padded, 16) else {
+            continue;
+        };
+        let key = value & (!0u64 << (48 - bits)) & 0xFFFF_FFFF_FFFF;
+        map.entry((bits, key))
+            .or_insert_with(|| organization.to_string());
+    }
+}
+
+/// Downloads the IEEE MA-L, MA-M and MA-S registries into the cache.
+///
+/// Run opportunistically; a failure leaves the bundled snapshot in place and discovery
+/// continues unaffected.
 pub async fn update_oui_database() -> Result<usize, String> {
     let cache_file =
         get_oui_cache_path().ok_or_else(|| "Could not determine cache path".to_string())?;
     if let Some(parent) = cache_file.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+            .map_err(|e| format!("Failed to create cache directory: {e}"))?;
     }
 
-    let cache_str = cache_file.to_str().ok_or("Invalid cache path string")?;
-    let status = tokio::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "https://standards-oui.ieee.org/oui/oui.txt",
-            "-o",
-            cache_str,
-        ])
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run curl: {}", e))?;
+    // All three assignment sizes, so a 28- or 36-bit registration is not reported under the
+    // larger block it sits inside.
+    const SOURCES: &[&str] = &[
+        "https://standards-oui.ieee.org/oui/oui.txt",
+        "https://standards-oui.ieee.org/oui28/mam.txt",
+        "https://standards-oui.ieee.org/oui36/oui36.txt",
+    ];
 
-    if !status.success() {
-        return Err("Curl failed to download IEEE OUI registry".to_string());
-    }
-
-    let content = std::fs::read_to_string(&cache_file)
-        .map_err(|e| format!("Failed to read downloaded OUI file: {}", e))?;
-    let count = content.lines().filter(|l| l.contains("(hex)")).count();
-    Ok(count)
-}
-
-/// Parses a MAC address string into 6 bytes
-pub fn parse_mac_bytes(mac_str: &str) -> Option<[u8; 6]> {
-    let mut bytes = [0u8; 6];
-    let parts: Vec<&str> = mac_str.split(':').collect();
-    if parts.len() != 6 {
-        return None;
-    }
-
-    for (i, part) in parts.iter().enumerate() {
-        bytes[i] = u8::from_str_radix(part, 16).ok()?;
-    }
-
-    Some(bytes)
-}
-
-/// 2-Tier IEEE OUI lookup: Checks Tier 1 (compiled static table) first,
-/// then falls back to Tier 2 (~/.cache/idnx/oui.txt) if present.
-pub fn lookup_mac(mac_str: &str) -> OuiInfo {
-    let bytes = match parse_mac_bytes(mac_str) {
-        Some(b) => b,
-        None => {
-            return OuiInfo {
-                vendor: None,
-                is_randomized: false,
-            };
+    let mut combined = String::new();
+    for url in SOURCES {
+        let output = tokio::process::Command::new("curl")
+            .args(["-fsSL", url])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run curl: {e}"))?;
+        if output.status.success() {
+            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+            combined.push('\n');
         }
-    };
-
-    // IEEE 802 standard: Bit 1 (0x02) of the first octet indicates a Locally Administered (randomized) address
-    let is_randomized = (bytes[0] & 0x02) != 0;
-    let prefix = [bytes[0], bytes[1], bytes[2]];
-
-    // Tier 1: Embedded static OUI table
-    let mut vendor = match OUI_DATABASE.binary_search_by_key(&prefix, |entry| entry.0) {
-        Ok(idx) => Some(OUI_DATABASE[idx].1.to_string()),
-        Err(_) => None,
-    };
-
-    // Tier 2: User cache database (~/.cache/idnx/oui.txt), parsed once per process.
-    if vendor.is_none()
-        && let Some(v) = oui_cache_index().get(&prefix)
-    {
-        vendor = Some(v.clone());
     }
 
-    OuiInfo {
-        vendor,
-        is_randomized,
+    if combined.trim().is_empty() {
+        return Err("Could not download any IEEE registry".to_string());
     }
+
+    std::fs::write(&cache_file, &combined)
+        .map_err(|e| format!("Failed to write OUI cache: {e}"))?;
+
+    let mut map = HashMap::new();
+    parse_ieee_registry(&combined, &mut map);
+    Ok(map.len())
 }
-
-/// Lazily parsed index of the user OUI cache, built at most once per process.
-///
-/// This was previously read and linearly scanned from disk on *every* cache miss. The
-/// IEEE registry is several megabytes and a scan of a populated ARP table produces
-/// thousands of misses, so the old path re-read and re-scanned the whole file thousands
-/// of times per run. Parsing once into a map keeps `lookup_mac` a pure in-memory
-/// operation after the first call.
-fn oui_cache_index() -> &'static HashMap<[u8; 3], String> {
-    static CACHE: OnceLock<HashMap<[u8; 3], String>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let mut map = HashMap::new();
-        let Some(cache_path) = get_oui_cache_path() else {
-            return map;
-        };
-        let Ok(content) = std::fs::read_to_string(&cache_path) else {
-            return map;
-        };
-        for line in content.lines() {
-            // Registry lines look like: "00-11-22   (hex)		Vendor Name"
-            let Some((prefix_part, vendor_part)) = line.split_once("(hex)") else {
-                continue;
-            };
-            let vendor = vendor_part.trim();
-            if vendor.is_empty() {
-                continue;
-            }
-            let Some(prefix) = parse_hex_oui_prefix(prefix_part.trim()) else {
-                continue;
-            };
-            map.entry(prefix).or_insert_with(|| vendor.to_string());
-        }
-        map
-    })
-}
-
-/// Parses an IEEE registry prefix such as `00-1A-2B` into raw bytes.
-fn parse_hex_oui_prefix(text: &str) -> Option<[u8; 3]> {
-    let mut octets = [0u8; 3];
-    let mut parts = text.split('-');
-    for octet in octets.iter_mut() {
-        *octet = u8::from_str_radix(parts.next()?.trim(), 16).ok()?;
-    }
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(octets)
-}
-
-/// Pre-sorted compile-time static IEEE OUI table
-/// Keys MUST be kept strictly sorted by [u8; 3] for binary_search_by_key to work
-static OUI_DATABASE: &[([u8; 3], &str)] = &[
-    ([0x00, 0x00, 0x0C], "Cisco Systems"),
-    ([0x00, 0x01, 0x42], "Cisco Systems"),
-    ([0x00, 0x01, 0x64], "Cisco Systems"),
-    ([0x00, 0x01, 0xC7], "Cisco Systems"),
-    ([0x00, 0x03, 0x93], "Apple"),
-    ([0x00, 0x04, 0x4B], "NVIDIA"),
-    ([0x00, 0x06, 0x25], "Linksys"),
-    ([0x00, 0x06, 0x5B], "Dell"),
-    ([0x00, 0x08, 0x74], "Dell"),
-    ([0x00, 0x09, 0x5B], "Netgear"),
-    ([0x00, 0x0A, 0x95], "Apple"),
-    ([0x00, 0x0C, 0x29], "VMware"),
-    ([0x00, 0x0C, 0x42], "MikroTik"),
-    ([0x00, 0x0E, 0x0C], "Intel"),
-    ([0x00, 0x0F, 0x66], "Linksys"),
-    ([0x00, 0x11, 0x24], "Apple"),
-    ([0x00, 0x11, 0x32], "Synology"),
-    ([0x00, 0x11, 0x43], "Dell"),
-    ([0x00, 0x13, 0x02], "Intel"),
-    ([0x00, 0x13, 0xE8], "Intel"),
-    ([0x00, 0x14, 0xBF], "Linksys"),
-    ([0x00, 0x15, 0x00], "Intel"),
-    ([0x00, 0x15, 0x65], "Yealink (Teams Phone)"),
-    ([0x00, 0x17, 0x88], "Philips Lighting"),
-    ([0x00, 0x1A, 0x2B], "Cisco Systems"),
-    ([0x00, 0x1E, 0x67], "NVIDIA"),
-    ([0x00, 0x26, 0x86], "Netgear"),
-    ([0x00, 0x27, 0x22], "Ubiquiti"),
-    ([0x04, 0x42, 0x1A], "ASUSTek Computer Inc."),
-    ([0x04, 0xD9, 0xF5], "ASUSTek Computer Inc."),
-    ([0x04, 0xE4, 0xB6], "Samsung Electronics"),
-    ([0x08, 0x55, 0x31], "TP-Link"),
-    ([0x10, 0x7B, 0x44], "ASUSTek Computer Inc."),
-    ([0x10, 0xBF, 0x48], "ASUSTek Computer Inc."),
-    ([0x14, 0x91, 0x82], "Linksys"),
-    ([0x14, 0xD8, 0x81], "Xiaomi / Smartmi"),
-    ([0x18, 0xE8, 0x29], "Ubiquiti"),
-    ([0x20, 0xE5, 0x2A], "Netgear"),
-    ([0x24, 0xA0, 0x74], "Ubiquiti"),
-    ([0x28, 0xCD, 0xC1], "Raspberry Pi"),
-    ([0x2C, 0xFD, 0xA1], "ASUSTek Computer Inc."),
-    ([0x38, 0x2C, 0x4A], "ASUSTek Computer Inc."),
-    ([0x40, 0x16, 0x7E], "ASUSTek Computer Inc."),
-    ([0x48, 0x8F, 0x5A], "MikroTik"),
-    ([0x48, 0xB0, 0x2D], "NVIDIA"),
-    ([0x50, 0x46, 0x5D], "ASUSTek Computer Inc."),
-    ([0x50, 0xC7, 0xBF], "TP-Link"),
-    ([0x58, 0x02, 0x05], "AzureWave (NVIDIA DGX / Compute Node)"),
-    ([0x60, 0x32, 0xB1], "TP-Link"),
-    ([0x60, 0xA4, 0x4C], "ASUSTek Computer Inc."),
-    // 60:CF:84 confirmed against an RT-BE92U whose own UPnP device description reported
-    // manufacturer "ASUSTeK Computer Inc."; it was absent here, so its WAN-side interface
-    // appeared as an unidentified device with no vendor.
-    ([0x60, 0xCF, 0x84], "ASUSTek Computer Inc."),
-    ([0x64, 0x90, 0xC1], "Xiaomi"),
-    ([0x64, 0xD1, 0x54], "MikroTik"),
-    ([0x68, 0x5E, 0xDD], "Apple"),
-    ([0x70, 0x4D, 0x7B], "ASUSTek Computer Inc."),
-    ([0x70, 0x4F, 0x57], "TP-Link"),
-    ([0x74, 0x12, 0x13], "Linksys"),
-    ([0x74, 0xC6, 0x3B], "AzureWave Technology"),
-    ([0x78, 0x8A, 0x20], "Ubiquiti"),
-    ([0x78, 0x9A, 0x18], "MikroTik"),
-    ([0x7C, 0xC2, 0x94], "Xiaomi / Smartmi"),
-    ([0x80, 0x5E, 0xC0], "Yealink (Teams Phone)"),
-    ([0x98, 0xFC, 0x11], "Netgear"),
-    ([0xA0, 0xAD, 0x9F], "ASUSTek Computer Inc."),
-    ([0xB0, 0x7D, 0x64], "AzureWave Technology"),
-    ([0xB4, 0xFB, 0xE4], "Ubiquiti"),
-    ([0xB8, 0x27, 0xEB], "Raspberry Pi"),
-    ([0xB8, 0x69, 0xF4], "MikroTik"),
-    ([0xC4, 0xF7, 0xC1], "Apple"),
-    ([0xCC, 0x2D, 0xE0], "MikroTik"),
-    ([0xD4, 0xDC, 0xCD], "Apple"),
-    ([0xDC, 0xA6, 0x32], "Raspberry Pi"),
-    ([0xE4, 0x5F, 0x01], "Raspberry Pi"),
-    ([0xEC, 0x08, 0x6B], "TP-Link"),
-    ([0xF0, 0x9F, 0xC2], "Ubiquiti"),
-    ([0xFC, 0xEC, 0xDA], "Ubiquiti"),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_hex_oui_prefix() {
-        assert_eq!(parse_hex_oui_prefix("00-1A-2B"), Some([0x00, 0x1A, 0x2B]));
-        assert_eq!(parse_hex_oui_prefix("FF-FF-FF"), Some([0xFF, 0xFF, 0xFF]));
-        // Malformed registry lines must be skipped, not panic or half-parse.
-        assert_eq!(parse_hex_oui_prefix("00-1A"), None);
-        assert_eq!(parse_hex_oui_prefix("00-1A-2B-3C"), None);
-        assert_eq!(parse_hex_oui_prefix("ZZ-1A-2B"), None);
-    }
+    fn bundled_snapshot_reports_the_registered_organization_only() {
+        // These are the exact devices on the test network. Each must resolve to the
+        // organization that registered the block, with no product claim attached.
+        let apple = lookup_mac("c4:f7:c1:0b:7c:69");
+        assert!(apple.vendor.as_deref().unwrap().contains("Apple"));
 
-    #[test]
-    fn test_oui_lookup_asus() {
-        let res = lookup_mac("a0:ad:9f:e6:38:00");
-        assert_eq!(res.vendor.as_deref(), Some("ASUSTek Computer Inc."));
-        assert!(!res.is_randomized);
-    }
-
-    #[test]
-    fn test_oui_lookup_azurewave_dgx() {
-        let res = lookup_mac("58:02:05:d1:70:62");
-        assert_eq!(
-            res.vendor.as_deref(),
-            Some("AzureWave (NVIDIA DGX / Compute Node)")
+        let azurewave = lookup_mac("58:02:05:d1:70:62");
+        let name = azurewave.vendor.as_deref().unwrap();
+        assert!(name.contains("AzureWave"));
+        assert!(
+            !name.contains("DGX") && !name.contains("NVIDIA"),
+            "an OUI cannot establish a product; got {name}"
         );
-        assert!(!res.is_randomized);
-    }
 
-    #[test]
-    fn test_oui_lookup_randomized_mac() {
-        // 7a:d5:06... -> 0x7a in binary is 0111 1010 -> bit 1 is set -> randomized!
-        let res = lookup_mac("7a:d5:06:f5:14:6b");
-        assert!(res.is_randomized);
-        assert_eq!(res.display_label(), "Private / Randomized MAC");
-    }
-
-    #[test]
-    fn test_database_is_strictly_sorted() {
-        for window in OUI_DATABASE.windows(2) {
+        for asus in ["60:cf:84:37:1b:70", "a0:ad:9f:e6:38:00"] {
+            let found = lookup_mac(asus);
             assert!(
-                window[0].0 < window[1].0,
-                "OUI database must be strictly sorted: {:?} >= {:?}",
-                window[0].0,
-                window[1].0
+                found.vendor.as_deref().unwrap().contains("ASUSTek"),
+                "{asus} must resolve to ASUSTek"
             );
         }
+    }
+
+    #[test]
+    fn no_vendor_name_encodes_a_role_or_product() {
+        // A vendor string must never smuggle in a device role.
+        for mac in [
+            "c4:f7:c1:0b:7c:69",
+            "60:cf:84:37:1b:70",
+            "58:02:05:d1:70:62",
+            "74:12:13:14:75:dc",
+        ] {
+            let name = lookup_mac(mac).vendor.unwrap_or_default().to_lowercase();
+            for forbidden in [
+                "router",
+                "switch",
+                "gateway",
+                "access point",
+                "compute node",
+            ] {
+                assert!(
+                    !name.contains(forbidden),
+                    "{mac} vendor '{name}' must not assert a role"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_locally_administered_address_identifies_no_organization() {
+        let info = lookup_mac("5e:8e:44:c6:c7:da");
+        assert!(info.is_randomized);
+        assert!(info.vendor.is_none());
+        assert_eq!(info.display_label(), "Private / randomized MAC");
+    }
+
+    #[test]
+    fn registry_parsing_honours_prefix_length() {
+        // MA-L, MA-M and MA-S in one file. Each must be keyed by its own prefix length so
+        // that longest-match can prefer the more specific registration.
+        let sample = "\
+00-1A-2B   (hex)\t\tExample MA-L Corp
+AA-BB-C0-00-00-00/28   (hex)\t\tExample MA-M Corp
+AA-BB-CC-D0-00-00/36   (hex)\t\tExample MA-S Corp
+";
+        let mut map = HashMap::new();
+        parse_ieee_registry(sample, &mut map);
+
+        assert_eq!(map.len(), 3);
+        assert!(map.values().any(|v| v == "Example MA-L Corp"));
+        assert!(map.keys().any(|(bits, _)| *bits == 28));
+        assert!(map.keys().any(|(bits, _)| *bits == 36));
+    }
+
+    #[test]
+    fn longest_prefix_wins_over_the_enclosing_block() {
+        let sample = "\
+AA-BB-CC   (hex)\t\tBlock Owner
+AA-BB-CC-D0-00-00/36   (hex)\t\tSpecific Assignee
+";
+        let mut map = HashMap::new();
+        parse_ieee_registry(sample, &mut map);
+
+        // A /36 fixes nine nibbles, so this address must begin AA:BB:CC:D0:0_ to fall
+        // inside the specific assignment rather than only the enclosing /24.
+        let bytes = [0xAA, 0xBB, 0xCC, 0xD0, 0x0A, 0xBC];
+        let value = ((bytes[0] as u64) << 40)
+            | ((bytes[1] as u64) << 32)
+            | ((bytes[2] as u64) << 24)
+            | ((bytes[3] as u64) << 16)
+            | ((bytes[4] as u64) << 8)
+            | (bytes[5] as u64);
+
+        let mut resolved = None;
+        for bits in [36u32, 28, 24] {
+            let key = value & (!0u64 << (48 - bits)) & 0xFFFF_FFFF_FFFF;
+            if let Some(name) = map.get(&(bits, key)) {
+                resolved = Some(name.clone());
+                break;
+            }
+        }
+        assert_eq!(resolved.as_deref(), Some("Specific Assignee"));
+
+        // An address inside the /24 but outside the /36 falls back to the block owner.
+        let outside = [0xAA, 0xBB, 0xCC, 0xD5, 0x11, 0x22];
+        let value = ((outside[0] as u64) << 40)
+            | ((outside[1] as u64) << 32)
+            | ((outside[2] as u64) << 24)
+            | ((outside[3] as u64) << 16)
+            | ((outside[4] as u64) << 8)
+            | (outside[5] as u64);
+        let mut resolved = None;
+        for bits in [36u32, 28, 24] {
+            let key = value & (!0u64 << (48 - bits)) & 0xFFFF_FFFF_FFFF;
+            if let Some(name) = map.get(&(bits, key)) {
+                resolved = Some(name.clone());
+                break;
+            }
+        }
+        assert_eq!(resolved.as_deref(), Some("Block Owner"));
+    }
+
+    #[test]
+    fn malformed_registry_lines_are_skipped() {
+        let sample = "\
+not a registry line
+ZZ-ZZ-ZZ   (hex)\t\tBad Hex
+00-11-22   (hex)\t\t
+00-11-33   (hex)\t\tGood Corp
+";
+        let mut map = HashMap::new();
+        parse_ieee_registry(sample, &mut map);
+        assert_eq!(map.len(), 1);
+        assert!(map.values().any(|v| v == "Good Corp"));
+    }
+
+    #[test]
+    fn an_unparseable_mac_yields_nothing() {
+        let info = lookup_mac("not-a-mac");
+        assert!(info.vendor.is_none());
+        assert!(!info.is_randomized);
     }
 }

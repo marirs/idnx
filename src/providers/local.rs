@@ -8,7 +8,9 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use super::{DiscoveryContext, DiscoveryProvider, ProviderFuture};
 use crate::topology::TopologyEvidence;
-use crate::topology::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal};
+use crate::topology::evidence::{
+    Capability, Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal,
+};
 
 /// IPv4 addresses configured on the selected interface.
 ///
@@ -213,8 +215,18 @@ impl DiscoveryProvider for KernelRouteProvider {
                     if is_default {
                         out.push(TopologyEvidence::new(
                             Fact::DeviceRoleSignal {
-                                device,
+                                device: device.clone(),
                                 signal: RoleSignal::DefaultGateway,
+                            },
+                            EvidenceSource::DefaultGateway,
+                            Confidence::Observed,
+                            vantage,
+                        ));
+                        out.push(TopologyEvidence::new(
+                            Fact::DeviceCapability {
+                                device,
+                                capability: Capability::DefaultGateway,
+                                detail: None,
                             },
                             EvidenceSource::DefaultGateway,
                             Confidence::Observed,
@@ -227,7 +239,7 @@ impl DiscoveryProvider for KernelRouteProvider {
                         out.push(
                             TopologyEvidence::new(
                                 Fact::RoutesTo {
-                                    device,
+                                    device: device.clone(),
                                     network: prefix,
                                     next_hop: Some(addr),
                                 },
@@ -237,6 +249,33 @@ impl DiscoveryProvider for KernelRouteProvider {
                             )
                             .with_detail(format!("kernel route to {prefix} via {addr}")),
                         );
+
+                        // Being the next hop is itself forwarding evidence. Without this a
+                        // router that had left the neighbour table still showed its route
+                        // but was no longer recognised as a router at all.
+                        out.push(TopologyEvidence::new(
+                            Fact::DeviceRoleSignal {
+                                device: device.clone(),
+                                signal: RoleSignal::KernelNextHop,
+                            },
+                            EvidenceSource::KernelRoute,
+                            Confidence::Observed,
+                            vantage,
+                        ));
+                        out.push(TopologyEvidence::new(
+                            Fact::DeviceCapability {
+                                device,
+                                capability: if prefix.addr().is_ipv6() {
+                                    Capability::Ipv6Router
+                                } else {
+                                    Capability::Ipv4Forwarding
+                                },
+                                detail: Some(format!("next hop for {prefix}")),
+                            },
+                            EvidenceSource::KernelRoute,
+                            Confidence::Observed,
+                            vantage,
+                        ));
                     }
                 }
             }

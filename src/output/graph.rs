@@ -95,6 +95,9 @@ fn build_data(report: &DiscoveryReport) -> GraphData {
         for addr in &node.addresses {
             detail.push(addr.to_string());
         }
+        for capability in &node.capabilities {
+            detail.push(format!("capability: {capability}"));
+        }
         for signal in &node.role_signals {
             detail.push(format!("role: {signal}"));
         }

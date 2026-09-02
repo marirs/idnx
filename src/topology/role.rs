@@ -49,6 +49,7 @@ pub fn score_role(signals: &BTreeSet<RoleSignal>) -> DeviceRole {
                 | RoleSignal::InternetGatewayDevice
                 | RoleSignal::SnmpForwarding
                 | RoleSignal::ObservedForwarding
+                | RoleSignal::KernelNextHop
         ) || matches!(s, RoleSignal::LinkLayerCapability(c) if c.contains("Router"))
     });
 
@@ -106,6 +107,16 @@ mod tests {
                 RoleSignal::ManagementSurface,
                 RoleSignal::ObservedForwarding,
             ])),
+            DeviceRole::Router
+        );
+    }
+
+    #[test]
+    fn a_kernel_next_hop_alone_is_a_router() {
+        // The OS installed the route because the device advertised itself as the way to
+        // reach that prefix. That is not ambiguous the way a management surface is.
+        assert_eq!(
+            score_role(&signals(&[RoleSignal::KernelNextHop])),
             DeviceRole::Router
         );
     }

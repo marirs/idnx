@@ -211,6 +211,11 @@ pub enum RoleSignal {
     SnmpForwarding,
     /// Appeared as an intermediate hop on a path, so it forwarded our traffic.
     ObservedForwarding,
+    /// The OS installed a route to a network through this device.
+    ///
+    /// Unambiguous: the kernel records a next hop because the device advertised itself as
+    /// the way to reach that prefix. It stands on its own, unlike a management surface.
+    KernelNextHop,
     /// Emitted spanning-tree BPDUs, which only a bridge does.
     SpanningTreeBridge,
     /// Serves DNS and a web management interface: the common SOHO router shape.
@@ -231,6 +236,7 @@ impl RoleSignal {
             RoleSignal::DhcpRouter => 80,
             RoleSignal::RouterAdvertisement => 70,
             RoleSignal::LinkLayerCapability(_) => 70,
+            RoleSignal::KernelNextHop => 70,
             RoleSignal::ObservedForwarding => 60,
             RoleSignal::ManagementSurface => 30,
         }
@@ -251,10 +257,54 @@ impl RoleSignal {
             }
             RoleSignal::SnmpForwarding => "SNMP reports IP forwarding".to_string(),
             RoleSignal::ObservedForwarding => "observed forwarding traffic on a path".to_string(),
+            RoleSignal::KernelNextHop => {
+                "is the kernel's next hop for a routed network".to_string()
+            }
             RoleSignal::SpanningTreeBridge => "emits spanning-tree BPDUs".to_string(),
             RoleSignal::ManagementSurface => {
                 "serves DNS and a web management interface".to_string()
             }
+        }
+    }
+}
+
+/// Something a device was observed to *do*, independent of what it is.
+///
+/// Roles collapse a device into one word; capabilities do not. A device can route IPv6,
+/// bridge, serve DHCP and host an AI runtime at once, and an Apple IoT device acting as a
+/// Thread border router genuinely routes IPv6 without being the Internet gateway.
+/// Reporting capabilities keeps those distinctions instead of flattening them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Capability {
+    DefaultGateway,
+    Ipv4Forwarding,
+    Ipv6Router,
+    NatGateway,
+    DhcpServer,
+    DnsServer,
+    Bridge,
+    WirelessAp,
+    ManagementInterface,
+    AiRuntime,
+    AiAgent,
+    McpServer,
+}
+
+impl Capability {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Capability::DefaultGateway => "default gateway",
+            Capability::Ipv4Forwarding => "IPv4 forwarding",
+            Capability::Ipv6Router => "IPv6 router",
+            Capability::NatGateway => "NAT gateway",
+            Capability::DhcpServer => "DHCP server",
+            Capability::DnsServer => "DNS server",
+            Capability::Bridge => "bridge",
+            Capability::WirelessAp => "wireless AP",
+            Capability::ManagementInterface => "management interface",
+            Capability::AiRuntime => "AI runtime",
+            Capability::AiAgent => "AI agent",
+            Capability::McpServer => "MCP server",
         }
     }
 }
@@ -293,6 +343,15 @@ pub enum Fact {
     DeviceRoleSignal {
         device: DeviceKey,
         signal: RoleSignal,
+    },
+
+    /// Something the device was observed doing, carried alongside its role rather than
+    /// collapsed into it.
+    DeviceCapability {
+        device: DeviceKey,
+        capability: Capability,
+        /// What established the capability, in the operator's words.
+        detail: Option<String>,
     },
 
     /// A device is the gateway for a network.

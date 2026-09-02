@@ -101,6 +101,9 @@ pub struct DeviceExport {
     pub descriptions: Vec<String>,
     /// Behaviour that established this device's role. Vendor is never among them.
     pub role_evidence: Vec<String>,
+    /// What the device was observed doing, independent of the single word its role
+    /// collapses to.
+    pub capabilities: Vec<String>,
     /// Why visibility stops here, when it does.
     pub opaque_reason: Option<String>,
     pub confidence: String,
@@ -238,6 +241,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             vendor: node.vendor.clone(),
             descriptions: node.descriptions.iter().cloned().collect(),
             role_evidence: node.role_signals.iter().cloned().collect(),
+            capabilities: node.capabilities.iter().cloned().collect(),
             opaque_reason: node.opaque_reason.clone(),
             confidence: node.confidence.label().to_string(),
             evidence: evidence_of(&node.provenance),
@@ -386,6 +390,7 @@ fn render_csv(data: &TopologyExport) -> Result<String, String> {
         "Hostnames",
         "Vendor",
         "Confidence",
+        "Capabilities",
         "Role Evidence",
         "Evidence Sources",
         "Opaque Reason",
@@ -401,6 +406,7 @@ fn render_csv(data: &TopologyExport) -> Result<String, String> {
             &d.hostnames.join("; "),
             d.vendor.as_deref().unwrap_or(""),
             &d.confidence,
+            &d.capabilities.join("; "),
             &d.role_evidence.join("; "),
             &sources.join("; "),
             d.opaque_reason.as_deref().unwrap_or(""),
@@ -465,6 +471,9 @@ fn render_text(data: &TopologyExport) -> String {
             d.addresses.join(","),
             d.id
         ));
+        for c in &d.capabilities {
+            t.push_str(&format!("      capability: {}\n", c));
+        }
         for e in &d.role_evidence {
             t.push_str(&format!("      role: {}\n", e));
         }

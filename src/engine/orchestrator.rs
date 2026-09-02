@@ -195,14 +195,27 @@ impl DiscoveryEngine {
 
             let pending: Vec<IpNet> = queue.drain(..).filter(|n| !processed.contains(n)).collect();
 
-            // Devices showing infrastructure behaviour are interrogated directly. This is
-            // the path that turns a router into new networks, and it never depends on any
-            // one provider succeeding.
-            let pivots: Vec<std::net::IpAddr> = graph
+            // Two queues, deliberately.
+            //
+            // Established pivots have positive routing or bridging evidence. Candidates
+            // merely look like they might be network equipment — an unfamiliar appliance,
+            // a networking manufacturer, a router-ish name, several addresses. Asking only
+            // the first group is circular: a device needs router evidence to be
+            // interrogated, and interrogation is how that evidence is obtained, so a silent
+            // appliance was never asked anything at all.
+            //
+            // A candidate hint changes who gets asked and nothing else. Confidence and role
+            // still come only from what the answers contain.
+            let mut pivots: Vec<std::net::IpAddr> = graph
                 .pivot_addresses()
                 .into_iter()
                 .filter(|a| !interrogated.contains(a))
                 .collect();
+            for candidate in graph.candidate_addresses() {
+                if !interrogated.contains(&candidate) && !pivots.contains(&candidate) {
+                    pivots.push(candidate);
+                }
+            }
 
             if pending.is_empty() && pivots.is_empty() {
                 if !continuous_finished {

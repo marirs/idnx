@@ -12,6 +12,40 @@ use ipnet::IpNet;
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
 use super::role::{DeviceRole, score_role};
 
+/// Manufacturers whose registrations commonly cover network equipment.
+///
+/// Used only to decide who is worth interrogating. It never contributes to a role: plenty
+/// of these organizations also make laptops, cameras and NAS boxes, and a router from an
+/// unlisted manufacturer is still a router once it behaves like one.
+const NETWORK_EQUIPMENT_VENDORS: &[&str] = &[
+    "asustek",
+    "asus",
+    "linksys",
+    "netgear",
+    "tp-link",
+    "d-link",
+    "mikrotik",
+    "ubiquiti",
+    "cisco",
+    "meraki",
+    "zyxel",
+    "draytek",
+    "fortinet",
+    "juniper",
+    "aruba",
+    "ruckus",
+    "belkin",
+    "tenda",
+    "huawei",
+    "openwrt",
+    "netcomm",
+    "sagemcom",
+    "technicolor",
+    "arris",
+    "actiontec",
+    "eero",
+];
+
 /// True when a prefix represents real topology.
 ///
 /// Loopback, link-local, multicast and unspecified ranges are protocol machinery, not
@@ -150,6 +184,8 @@ pub struct Node {
     pub descriptions: BTreeSet<String>,
     /// Behaviour observed for this device, used by role scoring.
     pub role_signals: BTreeSet<String>,
+    /// What the device was observed doing, rendered alongside its role.
+    pub capabilities: BTreeSet<String>,
     /// Reason this node terminates visibility, when it does.
     pub opaque_reason: Option<String>,
     /// Best (strongest) confidence supporting the node's existence.
@@ -167,6 +203,7 @@ impl Node {
             vendor: None,
             descriptions: BTreeSet::new(),
             role_signals: BTreeSet::new(),
+            capabilities: BTreeSet::new(),
             opaque_reason: None,
             confidence,
             provenance: Vec::new(),
@@ -275,10 +312,10 @@ impl TopologyGraph {
             .collect()
     }
 
-    /// Addresses of devices that show any infrastructure behaviour.
+    /// Addresses of devices with established infrastructure behaviour.
     ///
-    /// These are the pivots the engine interrogates. Membership comes from observed
-    /// behaviour only, so a device is never queued because of who manufactured it.
+    /// These have positive evidence of routing or bridging. Membership comes from observed
+    /// behaviour only, so a device is never here because of who manufactured it.
     pub fn pivot_addresses(&self) -> Vec<IpAddr> {
         let mut out: Vec<IpAddr> = self
             .role_weights
@@ -292,6 +329,67 @@ impl TopologyGraph {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Addresses worth interrogating for control-plane evidence they may not yet show.
+    ///
+    /// Interrogating only devices that already carry a role signal is circular: a device
+    /// needs router evidence to be interrogated, and interrogation is how router evidence
+    /// is obtained. An unknown appliance sitting silently in the ARP table — exactly the
+    /// ASUS case — was therefore never asked anything.
+    ///
+    /// A candidate hint schedules work and nothing more. It never raises confidence and
+    /// never appears as topology; only what the interrogation returns can do that.
+    pub fn candidate_addresses(&self) -> Vec<IpAddr> {
+        let established: std::collections::HashSet<IpAddr> =
+            self.pivot_addresses().into_iter().collect();
+
+        let mut out: Vec<IpAddr> = self
+            .nodes
+            .values()
+            .filter(|node| self.is_infrastructure_candidate(node))
+            .flat_map(|node| node.addresses.iter().copied())
+            .filter(is_interrogable)
+            .filter(|a| !established.contains(a))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Weak hints that a device may be network equipment.
+    ///
+    /// Manufacturer is deliberately included here and nowhere else: it is worthless as
+    /// proof but useful for deciding who to ask. The distinction between "worth asking"
+    /// and "established fact" is what keeps a vendor name out of the topology.
+    fn is_infrastructure_candidate(&self, node: &Node) -> bool {
+        if node.kind == NodeKind::Service {
+            return false;
+        }
+
+        if let Some(vendor) = &node.vendor {
+            let lowered = vendor.to_ascii_lowercase();
+            if NETWORK_EQUIPMENT_VENDORS
+                .iter()
+                .any(|v| lowered.contains(v))
+            {
+                return true;
+            }
+        }
+
+        if node.hostnames.iter().any(|h| {
+            let h = h.to_ascii_lowercase();
+            h.contains("router")
+                || h.contains("gateway")
+                || h.contains("switch")
+                || h.contains("ap")
+        }) {
+            return true;
+        }
+
+        // A device holding several addresses is more likely to be multi-homed
+        // infrastructure than an ordinary endpoint.
+        node.addresses.iter().filter(|a| is_interrogable(a)).count() > 1
     }
 
     /// Resolves the canonical device key for an address, if one is already known.
@@ -396,6 +494,21 @@ impl TopologyGraph {
                     .entry(id)
                     .or_default()
                     .insert(signal.clone());
+            }
+            Fact::DeviceCapability {
+                device,
+                capability,
+                detail,
+            } => {
+                let key = self.canonical_key(&device, None);
+                let id = NodeId::Device(key);
+                self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
+                if let Some(node) = self.nodes.get_mut(&id) {
+                    node.capabilities.insert(match detail {
+                        Some(d) => format!("{} ({})", capability.label(), d),
+                        None => capability.label().to_string(),
+                    });
+                }
             }
             Fact::GatewayFor { device, network } => {
                 let key = self.canonical_key(&device, None);
@@ -581,6 +694,7 @@ impl TopologyGraph {
                 target.hostnames.extend(source.hostnames);
                 target.descriptions.extend(source.descriptions);
                 target.role_signals.extend(source.role_signals);
+                target.capabilities.extend(source.capabilities);
                 target.provenance.extend(source.provenance);
                 if target.vendor.is_none() {
                     target.vendor = source.vendor;
@@ -975,6 +1089,105 @@ mod tests {
         assert!(
             !node_b.addresses.contains(&addr),
             "one device's address must never appear on another"
+        );
+    }
+
+    #[test]
+    fn a_vendor_hint_schedules_interrogation_without_asserting_a_role() {
+        // The ASUS case. Previously this device was never interrogated, because only
+        // devices that already had router evidence were queued, and it had none.
+        let mut g = TopologyGraph::new();
+        let mac = DeviceKey::mac("60:cf:84:37:1b:70");
+
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: mac.clone(),
+                address: "192.168.1.125".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceVendor {
+                device: mac.clone(),
+                vendor: "ASUSTek Computer".to_string(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        // It must be queued for interrogation...
+        assert!(
+            g.candidate_addresses()
+                .contains(&"192.168.1.125".parse().unwrap()),
+            "a networking manufacturer must schedule interrogation"
+        );
+        // ...but must not have become a pivot, which requires positive evidence.
+        assert!(g.pivot_addresses().is_empty());
+        // ...and must still be an unclassified host.
+        assert_eq!(
+            g.node(&NodeId::Device(mac)).unwrap().kind,
+            NodeKind::Host,
+            "a manufacturer must never establish a role"
+        );
+    }
+
+    #[test]
+    fn an_established_pivot_is_not_repeated_as_a_candidate() {
+        let mut g = TopologyGraph::new();
+        let mac = DeviceKey::mac("74:12:13:14:75:dc");
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: mac.clone(),
+                address: "192.168.1.1".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceRoleSignal {
+                device: mac,
+                signal: RoleSignal::DefaultGateway,
+            },
+            EvidenceSource::DefaultGateway,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        let gateway: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(g.pivot_addresses().contains(&gateway));
+        assert!(
+            !g.candidate_addresses().contains(&gateway),
+            "an established pivot must not be queued twice"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_endpoint_is_not_a_candidate() {
+        let mut g = TopologyGraph::new();
+        let mac = DeviceKey::mac("04:e4:b6:db:57:98");
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: mac.clone(),
+                address: "192.168.1.130".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceVendor {
+                device: mac,
+                vendor: "Samsung Electronics".to_string(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        assert!(
+            g.candidate_addresses().is_empty(),
+            "a consumer endpoint should not consume interrogation budget"
         );
     }
 

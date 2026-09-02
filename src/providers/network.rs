@@ -12,7 +12,9 @@ use ipnet::IpNet;
 
 use super::{DiscoveryContext, DiscoveryProvider, ProviderFuture};
 use crate::topology::TopologyEvidence;
-use crate::topology::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal};
+use crate::topology::evidence::{
+    Capability, Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal,
+};
 
 /// SSDP/UPnP discovery.
 ///
@@ -109,6 +111,16 @@ impl DiscoveryProvider for SsdpProvider {
                                 .unwrap_or_else(|| "InternetGatewayDevice".to_string()),
                         ),
                     );
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceCapability {
+                            device: DeviceKey::Address(addr),
+                            capability: Capability::NatGateway,
+                            detail: Some("UPnP InternetGatewayDevice".to_string()),
+                        },
+                        EvidenceSource::Ssdp,
+                        Confidence::Advertised,
+                        vantage,
+                    ));
                 }
             }
 
@@ -479,12 +491,20 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                 };
 
                 if !host.ip.is_unspecified() {
+                    // Attribute the address to how it was actually established. Labelling
+                    // every host as an ICMP result was simply false for the many found via
+                    // ARP or a TCP response, and it made the evidence trail useless.
+                    let source = match (&host.mac_address, host.open_ports.is_empty()) {
+                        (Some(_), _) => EvidenceSource::ArpCache,
+                        (None, false) => EvidenceSource::TcpProbe,
+                        (None, true) => EvidenceSource::IcmpProbe,
+                    };
                     out.push(TopologyEvidence::new(
                         Fact::DeviceAddress {
                             device: device.clone(),
                             address: IpAddr::V4(host.ip),
                         },
-                        EvidenceSource::IcmpProbe,
+                        source,
                         Confidence::Observed,
                         vantage,
                     ));
@@ -509,12 +529,19 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                     .clone()
                     .filter(|n| !n.starts_with('[') && !n.trim().is_empty())
                 {
+                    // A `.local` name is mDNS; anything else came from unicast PTR. Marking
+                    // every name as mDNS misattributed the resolver that actually answered.
+                    let source = if name.ends_with(".local") || name.ends_with(".local.") {
+                        EvidenceSource::Mdns
+                    } else {
+                        EvidenceSource::UnicastDns
+                    };
                     out.push(TopologyEvidence::new(
                         Fact::DeviceHostname {
                             device: device.clone(),
                             hostname: name,
                         },
-                        EvidenceSource::Mdns,
+                        source,
                         Confidence::Observed,
                         vantage,
                     ));
@@ -552,6 +579,50 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                     ));
                 }
 
+                // AI runtime evidence was previously computed by the scanner and then
+                // dropped on the floor, so no AI fact ever reached the graph.
+                if let Some(ai) = &host.ai_runtime {
+                    // Attribute the finding to the port it was confirmed on.
+                    let ai_port = host
+                        .open_ports
+                        .iter()
+                        .map(|p| p.port)
+                        .find(|p| matches!(p, 11434 | 1234 | 8000 | 8080 | 5000 | 3000))
+                        .unwrap_or_else(|| host.open_ports.first().map(|p| p.port).unwrap_or(0));
+                    out.extend(ai_evidence(
+                        ai,
+                        &device,
+                        IpAddr::V4(host.ip),
+                        ai_port,
+                        vantage,
+                    ));
+                }
+
+                if serves_dns {
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceCapability {
+                            device: device.clone(),
+                            capability: Capability::DnsServer,
+                            detail: Some("answered on TCP 53".to_string()),
+                        },
+                        EvidenceSource::TcpProbe,
+                        Confidence::Observed,
+                        vantage,
+                    ));
+                }
+                if serves_admin {
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceCapability {
+                            device: device.clone(),
+                            capability: Capability::ManagementInterface,
+                            detail: Some("HTTP(S) management port open".to_string()),
+                        },
+                        EvidenceSource::TcpProbe,
+                        Confidence::Observed,
+                        vantage,
+                    ));
+                }
+
                 // Weak on its own by design: it needs corroboration to promote a device.
                 if serves_dns && serves_admin {
                     out.push(TopologyEvidence::new(
@@ -569,6 +640,82 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             out
         })
     }
+}
+
+/// Converts an AI runtime finding into graph evidence.
+///
+/// Modelled as capabilities and services on the owning device rather than as a separate
+/// node, so an AI host still appears once with everything known about it.
+fn ai_evidence(
+    ai: &crate::probes::ai::AiRuntimeInfo,
+    device: &DeviceKey,
+    address: IpAddr,
+    port: u16,
+    vantage: &str,
+) -> Vec<TopologyEvidence> {
+    let mut out = Vec::new();
+
+    out.push(
+        TopologyEvidence::new(
+            Fact::DeviceCapability {
+                device: device.clone(),
+                capability: Capability::AiRuntime,
+                detail: Some(ai.summary_label()),
+            },
+            EvidenceSource::TcpProbe,
+            // The runtime answered its own protocol endpoint, so this is observed.
+            Confidence::Observed,
+            vantage,
+        )
+        .with_detail(format!(
+            "{} on port {}",
+            ai.runtime_type.display_name(),
+            port
+        )),
+    );
+
+    out.push(TopologyEvidence::new(
+        Fact::Service {
+            address,
+            port,
+            protocol: "tcp",
+            detail: Some(ai.summary_label()),
+        },
+        EvidenceSource::TcpProbe,
+        Confidence::Observed,
+        vantage,
+    ));
+
+    // The model catalogue is what the runtime reported about itself.
+    for model in &ai.models {
+        out.push(TopologyEvidence::new(
+            Fact::DeviceDescription {
+                device: device.clone(),
+                text: format!("model: {model}"),
+            },
+            EvidenceSource::TcpProbe,
+            Confidence::Advertised,
+            vantage,
+        ));
+    }
+
+    if !ai.mcp_endpoints.is_empty() {
+        out.push(TopologyEvidence::new(
+            Fact::DeviceCapability {
+                device: device.clone(),
+                capability: Capability::McpServer,
+                detail: Some(format!(
+                    "Model Context Protocol endpoints: {}",
+                    ai.mcp_endpoints.join(", ")
+                )),
+            },
+            EvidenceSource::TcpProbe,
+            Confidence::Observed,
+            vantage,
+        ));
+    }
+
+    out
 }
 
 /// Providers that examine a network scope or a specific device.

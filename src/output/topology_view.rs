@@ -163,6 +163,20 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node) {
             .unwrap_or_default()
             .dimmed()
     );
+    // Capabilities first: they say what the device does, which is more precise than the
+    // single word its role collapses to.
+    if !node.capabilities.is_empty() {
+        println!(
+            "  │     {} {}",
+            "Capabilities:".bold(),
+            node.capabilities
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+                .green()
+        );
+    }
     for signal in &node.role_signals {
         println!("  │     • {}", signal.dimmed());
     }
@@ -235,6 +249,17 @@ fn render_hosts(graph: &TopologyGraph) {
         for extra in addrs.iter().skip(1) {
             println!("  │     {}", extra.dimmed());
         }
+        if !node.capabilities.is_empty() {
+            println!(
+                "  │     {}",
+                node.capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                    .green()
+            );
+        }
     }
 }
 
@@ -295,6 +320,7 @@ fn render_device_table(graph: &TopologyGraph) {
             Cell::new("Address").fg(TableColor::Cyan),
             Cell::new("Name").fg(TableColor::Cyan),
             Cell::new("MAC / Vendor").fg(TableColor::Cyan),
+            Cell::new("Capabilities").fg(TableColor::Cyan),
             Cell::new("Services").fg(TableColor::Cyan),
             Cell::new("Evidence").fg(TableColor::Cyan),
         ]);
@@ -331,6 +357,15 @@ fn render_device_table(graph: &TopologyGraph) {
                     .unwrap_or_else(|| "-".to_string()),
             ),
             Cell::new(identity),
+            Cell::new(if node.capabilities.is_empty() {
+                "-".to_string()
+            } else {
+                node.capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
             Cell::new(if services.is_empty() {
                 "-".to_string()
             } else {
@@ -412,42 +447,88 @@ fn render_coverage(report: &DiscoveryReport) {
         }
     }
 
-    let counts = grade_counts(&report.graph);
+    // Three separate tallies. A node carries only its strongest supporting grade, so
+    // counting nodes alone reported "0 advertised" on a run that was displaying advertised
+    // RA prefixes and gateway relationships.
+    let nodes = grade_counts_nodes(&report.graph);
+    let facts = grade_counts_facts(&report.graph);
+    let edges = grade_counts_edges(&report.graph);
+
     println!(
-        "\n  {} observed · {} advertised · {} inferred · {} nodes total{}",
-        counts.observed.to_string().green().bold(),
-        counts.advertised.to_string().cyan().bold(),
-        counts.inferred.to_string().yellow().bold(),
-        report.graph.node_count().to_string().bold(),
-        if report.converged {
-            String::new()
-        } else {
-            " (stopped at the safety budget)".to_string()
-        }
-        .dimmed()
+        "\n  {:<16}{} observed · {} advertised · {} inferred",
+        "Nodes:".bold(),
+        nodes.observed.to_string().green().bold(),
+        nodes.advertised.to_string().cyan().bold(),
+        nodes.inferred.to_string().yellow().bold(),
     );
+    println!(
+        "  {:<16}{} observed · {} advertised · {} inferred",
+        "Facts:".bold(),
+        facts.observed.to_string().green().bold(),
+        facts.advertised.to_string().cyan().bold(),
+        facts.inferred.to_string().yellow().bold(),
+    );
+    println!(
+        "  {:<16}{} observed · {} advertised · {} inferred",
+        "Relationships:".bold(),
+        edges.observed.to_string().green().bold(),
+        edges.advertised.to_string().cyan().bold(),
+        edges.inferred.to_string().yellow().bold(),
+    );
+    if !report.converged {
+        println!("  {}", "(stopped at the safety budget)".dimmed());
+    }
 }
 
+#[derive(Default)]
 struct GradeCounts {
     observed: usize,
     advertised: usize,
     inferred: usize,
 }
 
-fn grade_counts(graph: &TopologyGraph) -> GradeCounts {
-    use crate::topology::Confidence;
-    let mut c = GradeCounts {
-        observed: 0,
-        advertised: 0,
-        inferred: 0,
-    };
-    for node in graph.nodes() {
-        match node.confidence {
-            Confidence::Observed => c.observed += 1,
-            Confidence::Advertised => c.advertised += 1,
-            Confidence::Inferred => c.inferred += 1,
+impl GradeCounts {
+    fn tally(&mut self, confidence: crate::topology::Confidence) {
+        use crate::topology::Confidence;
+        match confidence {
+            Confidence::Observed => self.observed += 1,
+            Confidence::Advertised => self.advertised += 1,
+            Confidence::Inferred => self.inferred += 1,
             Confidence::UserSupplied => {}
         }
+    }
+}
+
+/// Nodes by their single strongest supporting grade.
+fn grade_counts_nodes(graph: &TopologyGraph) -> GradeCounts {
+    let mut c = GradeCounts::default();
+    for node in graph.nodes() {
+        c.tally(node.confidence);
+    }
+    c
+}
+
+/// Individual facts, which is where advertised evidence actually lives.
+fn grade_counts_facts(graph: &TopologyGraph) -> GradeCounts {
+    let mut c = GradeCounts::default();
+    for node in graph.nodes() {
+        for p in &node.provenance {
+            c.tally(p.confidence);
+        }
+    }
+    for edge in graph.edges() {
+        for p in &edge.provenance {
+            c.tally(p.confidence);
+        }
+    }
+    c
+}
+
+/// Relationships by their strongest supporting grade.
+fn grade_counts_edges(graph: &TopologyGraph) -> GradeCounts {
+    let mut c = GradeCounts::default();
+    for edge in graph.edges() {
+        c.tally(edge.confidence);
     }
     c
 }
