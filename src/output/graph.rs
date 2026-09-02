@@ -483,6 +483,7 @@ mod tests {
                 },
                 blind_to: vec!["switched unicast".to_string()],
                 unavailable: Vec::new(),
+                binding_mode: crate::net::socket::BindingMode::SourceAddress,
                 observed_frames: Some(7),
                 accepted_facts: Some(3),
             },

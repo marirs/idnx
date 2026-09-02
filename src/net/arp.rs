@@ -4,8 +4,8 @@ use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
-use tokio::sync::Semaphore;
+
+use crate::net::socket::ProbeChannel;
 
 #[derive(Debug, Clone)]
 pub struct ArpEntry {
@@ -226,18 +226,21 @@ pub fn parse_arp_output(output: &str, interface_filter: Option<&str>) -> Vec<Arp
 /// Sends high-speed, non-blocking UDP discovery packets (mDNS 5353 / NetBIOS 137)
 /// to each target IP. Because the packets are addressed to the local link, the host OS kernel
 /// immediately broadcasts an ARP "Who has IP?" packet for every target.
-pub async fn trigger_kernel_arp_sweep(cidr: Ipv4Net, concurrency: usize) {
+pub async fn trigger_kernel_arp_sweep(cidr: Ipv4Net, channel: &ProbeChannel) {
     let hosts: Vec<Ipv4Addr> = cidr.hosts().collect();
     if hosts.is_empty() {
         return;
     }
 
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Bound to the selected interface: the point of this sweep is to populate *this*
+    // link's ARP table, and a datagram leaving through another interface populates that
+    // link's instead while the result is attributed here.
+    let socket = match channel.binding.udp_bound_v4(0).await {
         Ok(s) => Arc::new(s),
         Err(_) => return,
     };
 
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let semaphore = Arc::clone(&channel.permits);
     let mut tasks = Vec::with_capacity(hosts.len());
 
     // Payload: lightweight probe

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 /// Builds a DNS PTR query for `<ip>.in-addr.arpa`
@@ -82,14 +81,16 @@ fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<String> {
 /// Discovers mDNS hostnames for all provided IPs using multicast DNS queries
 pub async fn resolve_mdns_hostnames(
     ips: &[Ipv4Addr],
+    binding: &crate::net::socket::SocketBinding,
     timeout_duration: Duration,
 ) -> HashMap<Ipv4Addr, String> {
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Multicast egress is set explicitly. Binding the source alone leaves the kernel to
+    // pick the outgoing interface from its own routing state, so an mDNS query could be
+    // answered by devices on a link this vantage never claimed to see.
+    let socket = match binding.udp_multicast_v4(0).await {
         Ok(s) => s,
         Err(_) => return HashMap::new(),
     };
-
-    let _ = socket.set_broadcast(true);
     let mdns_dest = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353);
 
     // Send PTR query for each IP
@@ -224,15 +225,22 @@ pub fn build_ipv6_ptr_query(ip: std::net::Ipv6Addr) -> Vec<u8> {
 /// Discovers mDNS hostnames for all provided IPv6 addresses using multicast DNS queries over IPv6 ([ff02::fb]:5353)
 pub async fn resolve_ipv6_mdns_hostnames(
     ips: &[std::net::Ipv6Addr],
+    binding: &crate::net::socket::SocketBinding,
     timeout_duration: Duration,
 ) -> HashMap<std::net::Ipv6Addr, String> {
     use std::net::{Ipv6Addr, SocketAddrV6};
-    let socket = match UdpSocket::bind("[::]:0").await {
+    let socket = match binding.udp_multicast_v6(0).await {
         Ok(s) => s,
         Err(_) => return HashMap::new(),
     };
 
-    let mdns_dest = SocketAddrV6::new(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb), 5353, 0, 0);
+    // ff02::fb is link-scoped, so it needs the scope index of the link being asked.
+    let mdns_dest = SocketAddrV6::new(
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb),
+        5353,
+        0,
+        binding.index,
+    );
 
     for &ip in ips {
         let q = build_ipv6_ptr_query(ip);

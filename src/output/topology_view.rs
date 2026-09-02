@@ -36,6 +36,15 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
         start.reason.dimmed()
     );
 
+    // Says which guarantee actually applies to active probes, rather than implying the
+    // strongest one. Source binding constrains egress only as far as the routing table
+    // agrees; the kernel pinning the interface is stronger and is not available everywhere.
+    println!(
+        "    {} {}",
+        "Active probes:".dimmed(),
+        report.visibility.binding_mode.label().dimmed()
+    );
+
     if !report.visibility.blind_to.is_empty() {
         println!(
             "    {} {}",

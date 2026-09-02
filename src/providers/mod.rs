@@ -140,12 +140,20 @@ impl DiscoveryContext {
             concurrency,
             binding: Arc::new(crate::net::socket::SocketBinding::for_interface(
                 &interface,
-                &crate::net::interface::list_interface_addresses(),
+                &crate::net::interface::list_socket_sources(),
                 index,
             )),
             probe_permits: Arc::new(Semaphore::new(concurrency.max(1))),
             snmp_communities: Vec::new(),
             privileged: false,
+        }
+    }
+
+    /// The binding and probe budget as one value, for paths that need both.
+    pub fn probe_channel(&self) -> crate::net::socket::ProbeChannel {
+        crate::net::socket::ProbeChannel {
+            binding: Arc::clone(&self.binding),
+            permits: Arc::clone(&self.probe_permits),
         }
     }
 

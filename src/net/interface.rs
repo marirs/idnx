@@ -105,9 +105,39 @@ pub struct InterfaceAddress {
 
 /// Lists every non-loopback address on every interface, IPv4 and IPv6.
 ///
+/// Two different questions are asked of a local address, and they do not have the same
+/// answer. This one asks *what networks is this host attached to*, so it excludes addresses
+/// that name no routable network. Use [`list_socket_sources`] to ask *what can a probe
+/// originate from*, which is a strictly larger set.
+///
 /// The IPv4-only view hid attached IPv6 prefixes entirely, so a link carrying only an IPv6
 /// network appeared to have none at all.
 pub fn list_interface_addresses() -> Vec<InterfaceAddress> {
+    list_addresses(AddressUse::NetworkPrefix)
+}
+
+/// Lists every address a probe can originate from, per interface.
+///
+/// Includes link-local addresses, which [`list_interface_addresses`] deliberately omits. A
+/// link-local address names no network anyone routes to -- emitting it as a prefix would
+/// invent a network -- but it is a perfectly good source address, and on many links it is
+/// the only IPv6 source a host has. Filtering it out before socket binding left those
+/// interfaces with no IPv6 source at all.
+pub fn list_socket_sources() -> Vec<InterfaceAddress> {
+    list_addresses(AddressUse::SocketSource)
+}
+
+/// Which question is being asked of a local address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressUse {
+    /// Networks this host is attached to. Link-local addresses are excluded: they name no
+    /// network, and treating one as a prefix would create a Network node for a fiction.
+    NetworkPrefix,
+    /// Addresses a probe can be sent from. Link-local addresses are included.
+    SocketSource,
+}
+
+fn list_addresses(purpose: AddressUse) -> Vec<InterfaceAddress> {
     let Ok(ifaddrs) = get_if_addrs() else {
         return Vec::new();
     };
@@ -119,7 +149,12 @@ pub fn list_interface_addresses() -> Vec<InterfaceAddress> {
         }
         let (ip, prefix_len): (std::net::IpAddr, u8) = match &iface.addr {
             IfAddr::V4(v4) => {
-                if v4.ip.is_link_local() || v4.ip.is_unspecified() {
+                if v4.ip.is_unspecified() {
+                    continue;
+                }
+                // An IPv4 link-local address means DHCP failed. It is not a network, and
+                // it is not a source anything useful can be reached from either.
+                if v4.ip.is_link_local() {
                     continue;
                 }
                 (
@@ -131,9 +166,9 @@ pub fn list_interface_addresses() -> Vec<InterfaceAddress> {
                 if v6.ip.is_unspecified() {
                     continue;
                 }
-                // Link-local addresses identify the host on this link but are not a
-                // network anyone routes to, so they are not emitted as prefixes.
-                if (v6.ip.segments()[0] & 0xffc0) == 0xfe80 {
+                if crate::net::endpoint::is_link_local(&v6.ip)
+                    && purpose == AddressUse::NetworkPrefix
+                {
                     continue;
                 }
                 let bits: u32 = u128::from(v6.netmask).count_ones();

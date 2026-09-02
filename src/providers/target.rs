@@ -454,10 +454,11 @@ async fn sweep_ports(
     let mut tasks = Vec::with_capacity(ports.len());
     for &port in ports {
         let permits = Arc::clone(&context.probe_permits);
+        let binding = Arc::clone(&context.binding);
         let socket = target.socket_addr(port);
         tasks.push(tokio::spawn(async move {
             let _hold = permits.acquire().await.ok()?;
-            let probe = crate::engine::scanner::probe_tcp_socket(socket, timeout).await;
+            let probe = crate::engine::scanner::probe_tcp_socket(socket, &binding, timeout).await;
             (probe.status == crate::engine::scanner::PortStatus::Open).then_some(port)
         }));
     }

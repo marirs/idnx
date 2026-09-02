@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 /// Asynchronously resolves reverse DNS (PTR) records for a list of IPv4 addresses
@@ -9,6 +8,7 @@ use tokio::time::timeout;
 pub async fn resolve_unicast_dns_ptrs(
     ips: &[Ipv4Addr],
     dns_server: Ipv4Addr,
+    binding: &crate::net::socket::SocketBinding,
     timeout_duration: Duration,
 ) -> HashMap<Ipv4Addr, String> {
     let mut results = HashMap::new();
@@ -16,12 +16,14 @@ pub async fn resolve_unicast_dns_ptrs(
         return results;
     }
 
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    let server_addr = SocketAddrV4::new(dns_server, 53);
+    let socket = match binding
+        .udp_socket(&std::net::SocketAddr::V4(server_addr))
+        .await
+    {
         Ok(s) => s,
         Err(_) => return results,
     };
-
-    let server_addr = SocketAddrV4::new(dns_server, 53);
 
     for (idx, &ip) in ips.iter().enumerate() {
         let octets = ip.octets();

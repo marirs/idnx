@@ -140,6 +140,12 @@ mod tests {
         assert!(v4.zone.is_none());
     }
 
+    /// Unix only: resolving an interface *name* to an index is a Unix facility.
+    ///
+    /// Windows has no such lookup -- a zone there is the numeric index itself -- so
+    /// asserting a name resolves is asserting something that cannot hold on that platform.
+    /// The Windows behaviour is pinned separately below.
+    #[cfg(unix)]
     #[test]
     fn a_link_local_socket_carries_a_scope_index() {
         // Which index depends on the host, but a named loopback interface always exists and
@@ -155,6 +161,31 @@ mod tests {
         };
         assert_eq!(v6.port(), 80);
         assert_ne!(v6.scope_id(), 0, "{name} did not resolve to a scope index");
+    }
+
+    /// Windows writes a zone as the numeric scope index, so that is what must round-trip.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_numeric_zone_is_carried_through_as_the_scope_index() {
+        let endpoint = Endpoint::new("fe80::1".parse().unwrap(), Some("12".to_string()));
+        let SocketAddr::V6(v6) = endpoint.socket_addr(80) else {
+            panic!("expected an IPv6 socket address");
+        };
+        assert_eq!(v6.port(), 80);
+        assert_eq!(v6.scope_id(), 12);
+    }
+
+    /// The index the vantage supplies is used verbatim on every platform.
+    ///
+    /// This is the path the engine actually takes: the scope index is obtained once from
+    /// the platform and carried, rather than re-derived from a name at the socket.
+    #[test]
+    fn a_supplied_scope_index_is_used_directly() {
+        let endpoint = Endpoint::scoped("fe80::1".parse().unwrap(), Some("any".to_string()), 9);
+        let SocketAddr::V6(v6) = endpoint.socket_addr(80) else {
+            panic!("expected an IPv6 socket address");
+        };
+        assert_eq!(v6.scope_id(), 9);
     }
 
     #[test]

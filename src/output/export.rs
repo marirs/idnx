@@ -95,6 +95,10 @@ pub struct VantageExport {
     pub blind_to: Vec<String>,
     /// Sources that were unavailable, and why.
     pub unavailable: Vec<String>,
+    /// How strictly active probes were tied to this interface: `unbound (ordinary
+    /// routing)`, `source-address bound`, or `interface bound`. A consumer merging results
+    /// from several vantages needs to know which guarantee actually held.
+    pub binding_mode: String,
     /// Frames passively observed. `None` means capture never started.
     pub observed_frames: Option<u64>,
     /// Topology facts accepted from those frames.
@@ -430,6 +434,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             kind: report.visibility.vantage.kind.label().to_string(),
             blind_to: report.visibility.blind_to.clone(),
             unavailable: report.visibility.unavailable.clone(),
+            binding_mode: report.visibility.binding_mode.label().to_string(),
             observed_frames: report.visibility.observed_frames,
             accepted_facts: report.visibility.accepted_facts,
         },
@@ -702,6 +707,7 @@ mod tests {
                 },
                 blind_to: vec!["switched unicast".to_string()],
                 unavailable: Vec::new(),
+                binding_mode: crate::net::socket::BindingMode::SourceAddress,
                 observed_frames: Some(42),
                 accepted_facts: Some(3),
             },

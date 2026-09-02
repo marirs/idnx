@@ -443,7 +443,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                 scope,
                 &self.ports,
                 Some(&context.vantage.interface),
-                context.concurrency,
+                &context.probe_channel(),
                 context.timeout,
                 None,
                 true,

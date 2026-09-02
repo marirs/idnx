@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,9 +144,15 @@ pub fn parse_ports(input: &str) -> Result<Vec<u16>, String> {
 }
 
 /// Probes a single TCP port using asynchronous connect with timeout
-pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration) -> PortInfo {
+pub async fn probe_tcp_port(
+    ip: Ipv4Addr,
+    port: u16,
+    binding: &crate::net::socket::SocketBinding,
+    timeout_duration: Duration,
+) -> PortInfo {
     probe_tcp_socket(
         SocketAddr::V4(SocketAddrV4::new(ip, port)),
+        binding,
         timeout_duration,
     )
     .await
@@ -157,12 +162,16 @@ pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration)
 ///
 /// Address-family neutral, so an IPv6 neighbour is interrogated exactly as an IPv4 one is.
 /// A link-local destination carries its scope index in the socket address already.
-pub async fn probe_tcp_socket(addr: SocketAddr, timeout_duration: Duration) -> PortInfo {
+pub async fn probe_tcp_socket(
+    addr: SocketAddr,
+    binding: &crate::net::socket::SocketBinding,
+    timeout_duration: Duration,
+) -> PortInfo {
     let port = addr.port();
     let start = Instant::now();
 
-    match timeout(timeout_duration, tokio::net::TcpStream::connect(addr)).await {
-        Ok(Ok(mut stream)) => {
+    match binding.tcp_connect(addr, timeout_duration).await {
+        Ok(mut stream) => {
             let elapsed = start.elapsed();
             let mut service = lookup_service(port);
 
@@ -221,23 +230,14 @@ pub async fn probe_tcp_socket(addr: SocketAddr, timeout_duration: Duration) -> P
                 service,
             }
         }
-        Ok(Err(e)) => {
-            if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                PortInfo {
-                    port,
-                    status: PortStatus::Closed,
-                    latency: Some(start.elapsed()),
-                    service: lookup_service(port),
-                }
-            } else {
-                PortInfo {
-                    port,
-                    status: PortStatus::Filtered,
-                    latency: None,
-                    service: lookup_service(port),
-                }
-            }
-        }
+        // A refusal proves the host is alive; a timeout, or an interface with no source
+        // address for this family, proves nothing about it.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => PortInfo {
+            port,
+            status: PortStatus::Closed,
+            latency: Some(start.elapsed()),
+            service: lookup_service(port),
+        },
         Err(_) => PortInfo {
             port,
             status: PortStatus::Filtered,
@@ -251,16 +251,17 @@ pub async fn probe_tcp_socket(addr: SocketAddr, timeout_duration: Duration) -> P
 pub async fn scan_host_tcp(
     ip: Ipv4Addr,
     ports: &[u16],
-    semaphore: Arc<Semaphore>,
+    channel: &crate::net::socket::ProbeChannel,
     timeout_duration: Duration,
 ) -> (bool, Vec<PortInfo>, Option<Duration>) {
     let mut tasks = Vec::with_capacity(ports.len());
 
     for &port in ports {
-        let sem = Arc::clone(&semaphore);
+        let sem = Arc::clone(&channel.permits);
+        let binding = Arc::clone(&channel.binding);
         tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            probe_tcp_port(ip, port, timeout_duration).await
+            let _permit = sem.acquire().await.ok()?;
+            Some(probe_tcp_port(ip, port, &binding, timeout_duration).await)
         }));
     }
 
@@ -269,7 +270,7 @@ pub async fn scan_host_tcp(
     let mut min_latency: Option<Duration> = None;
 
     for task in tasks {
-        if let Ok(info) = task.await {
+        if let Ok(Some(info)) = task.await {
             if info.status == PortStatus::Open {
                 is_alive = true;
                 if let Some(lat) = info.latency {
@@ -339,7 +340,7 @@ pub async fn scan_subnet(
         cidr,
         ports,
         interface_filter,
-        concurrency,
+        &crate::net::socket::ProbeChannel::unbound(concurrency),
         timeout_duration,
         progress_bar,
         true,
@@ -348,11 +349,12 @@ pub async fn scan_subnet(
 }
 
 /// Core asynchronous scanning engine with optional IPv6 discovery control
+#[allow(clippy::too_many_arguments)]
 pub async fn scan_subnet_ext(
     cidr: Ipv4Net,
     ports: &[u16],
     interface_filter: Option<&str>,
-    concurrency: usize,
+    channel: &crate::net::socket::ProbeChannel,
     timeout_duration: Duration,
     progress_bar: Option<ProgressBar>,
     enable_ipv6: bool,
@@ -362,7 +364,7 @@ pub async fn scan_subnet_ext(
     let total_hosts = hosts.len();
 
     // 1. Trigger kernel-level ARP broadcast sweep for local subnets
-    trigger_kernel_arp_sweep(cidr, concurrency).await;
+    trigger_kernel_arp_sweep(cidr, channel).await;
 
     // 2. Read system ARP table to find all live L2 devices
     let arp_entries = read_system_arp_table(interface_filter);
@@ -373,19 +375,20 @@ pub async fn scan_subnet_ext(
         }
     }
 
-    // 3. Scan TCP ports across all hosts concurrently
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    // 3. Scan TCP ports across all hosts concurrently, on the run-wide probe budget. A
+    // semaphore of this scanner's own let its traffic exceed the limit every other path
+    // observes.
     let ports_arc = Arc::new(ports.to_vec());
     let mut tcp_tasks = Vec::with_capacity(total_hosts);
 
     for ip in &hosts {
         let ip = *ip;
-        let sem = Arc::clone(&semaphore);
+        let chan = channel.clone();
         let p_list = Arc::clone(&ports_arc);
         let pb = progress_bar.clone();
 
         tcp_tasks.push(tokio::spawn(async move {
-            let res = scan_host_tcp(ip, &p_list, sem, timeout_duration).await;
+            let res = scan_host_tcp(ip, &p_list, &chan, timeout_duration).await;
             if let Some(ref bar) = pb {
                 bar.inc(1);
             }
@@ -457,7 +460,7 @@ pub async fn scan_subnet_ext(
         .collect();
 
     if !missing_liveness.is_empty() {
-        let ping_sem = Arc::new(Semaphore::new(concurrency.min(64)));
+        let ping_sem = Arc::clone(&channel.permits);
         let mut ping_tasks = Vec::with_capacity(missing_liveness.len());
         for &ip in &missing_liveness {
             let p_sem = Arc::clone(&ping_sem);
@@ -494,8 +497,12 @@ pub async fn scan_subnet_ext(
 
     // 4. Resolve mDNS hostnames for all active hosts (e.g. Srirams-Mac-Studio)
     let active_ips: Vec<Ipv4Addr> = host_results.keys().copied().collect();
-    let mdns_names =
-        crate::net::mdns::resolve_mdns_hostnames(&active_ips, Duration::from_millis(500)).await;
+    let mdns_names = crate::net::mdns::resolve_mdns_hostnames(
+        &active_ips,
+        &channel.binding,
+        Duration::from_millis(500),
+    )
+    .await;
     for (ip, name) in mdns_names {
         if let Some(host) = host_results.get_mut(&ip) {
             let is_generic = host.hostname.as_deref().is_none_or(|h| {
@@ -547,6 +554,7 @@ pub async fn scan_subnet_ext(
             let dns_ptrs = crate::net::dns::resolve_unicast_dns_ptrs(
                 &missing_ips,
                 gw_ip,
+                &channel.binding,
                 Duration::from_millis(400),
             )
             .await;
@@ -561,11 +569,9 @@ pub async fn scan_subnet_ext(
     }
 
     // 5. Query UPnP / SSDP device descriptions for rich hardware metadata
-    let upnp_devices = crate::probes::upnp::discover_upnp_devices(
-        &crate::net::socket::SocketBinding::unbound(),
-        Duration::from_millis(500),
-    )
-    .await;
+    let upnp_devices =
+        crate::probes::upnp::discover_upnp_devices(&channel.binding, Duration::from_millis(500))
+            .await;
     for dev in upnp_devices {
         if let Some(host) = host_results.get_mut(&dev.ip) {
             let model_opt = dev.model_description.or(dev.model_name);
@@ -601,7 +607,7 @@ pub async fn scan_subnet_ext(
             && let Some(smb_info) = crate::probes::smb::probe_smb(
                 &crate::net::endpoint::Endpoint::global(std::net::IpAddr::V4(host.ip)),
                 445,
-                &crate::net::socket::SocketBinding::unbound(),
+                &channel.binding,
                 Duration::from_millis(400),
             )
             .await
@@ -630,7 +636,7 @@ pub async fn scan_subnet_ext(
             && let Some(tls_info) = crate::probes::tls::probe_tls_certificate(
                 &crate::net::endpoint::Endpoint::global(std::net::IpAddr::V4(host.ip)),
                 p,
-                &crate::net::socket::SocketBinding::unbound(),
+                &channel.binding,
                 Duration::from_millis(400),
             )
             .await
@@ -664,9 +670,12 @@ pub async fn scan_subnet_ext(
 
         // Collect all discovered IPv6 addresses for reverse mDNS PTR resolution
         let all_ipv6s: Vec<std::net::Ipv6Addr> = ndp_entries.iter().map(|e| e.ip).collect();
-        let ipv6_mdns_names =
-            crate::net::mdns::resolve_ipv6_mdns_hostnames(&all_ipv6s, Duration::from_millis(400))
-                .await;
+        let ipv6_mdns_names = crate::net::mdns::resolve_ipv6_mdns_hostnames(
+            &all_ipv6s,
+            &channel.binding,
+            Duration::from_millis(400),
+        )
+        .await;
 
         // Apply resolved IPv6 mDNS names to matched dual-stack hosts if missing hostname
         for host in host_results.values_mut() {

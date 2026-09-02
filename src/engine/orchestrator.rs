@@ -61,6 +61,12 @@ pub struct VisibilityReport {
     /// Reported so that "the link was quiet" is distinguishable from "nothing was
     /// listening", which produce identical topology otherwise.
     pub observed_frames: Option<u64>,
+    /// How strictly active probes were tied to the selected interface.
+    ///
+    /// Reported rather than assumed: source binding constrains egress only as far as the
+    /// routing table agrees, which is a weaker guarantee than the kernel pinning the
+    /// interface. Claiming the stronger one where only the weaker holds would be dishonest.
+    pub binding_mode: crate::net::socket::BindingMode,
     /// Topology facts accepted from those frames.
     ///
     /// A frame count alone proves the reader delivered packets and nothing more. Most
@@ -405,6 +411,14 @@ impl DiscoveryEngine {
                 vantage: context.vantage.clone(),
                 blind_to,
                 unavailable,
+                binding_mode: context.binding.mode(&std::net::SocketAddr::new(
+                    context
+                        .binding
+                        .v4_source
+                        .map(std::net::IpAddr::V4)
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    0,
+                )),
                 observed_frames: None,
                 accepted_facts: None,
             },
