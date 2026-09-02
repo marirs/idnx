@@ -53,12 +53,19 @@ pub fn detect_local_network() -> Result<LocalNetworkInfo, String> {
         return Err("No active IPv4 network interfaces found on system.".to_string());
     }
 
-    // Attempt 1: Query the OS kernel routing table for the default route without external network packets
-    if let Some((iface_name, gw_opt)) = get_kernel_default_route()
-        && let Some(matched) = all_interfaces.iter().find(|info| info.interface_name.eq_ignore_ascii_case(&iface_name))
+    // Attempt 1: Query the OS kernel routing table for the default route without external
+    // network packets.
+    let kernel_default_route = get_kernel_default_route();
+    let default_gateway = kernel_default_route.as_ref().and_then(|(_, gw)| *gw);
+
+    if let Some((iface_identifier, gw_opt)) = kernel_default_route.as_ref()
+        && let Some(matched) = all_interfaces.iter().find(|info| {
+            info.interface_name.eq_ignore_ascii_case(iface_identifier)
+                || info.ip.to_string() == *iface_identifier
+        })
     {
         let mut res = matched.clone();
-        res.default_gateway = gw_opt;
+        res.default_gateway = *gw_opt;
         return Ok(res);
     }
 
@@ -72,12 +79,20 @@ pub fn detect_local_network() -> Result<LocalNetworkInfo, String> {
             && !name.contains("vbox")
     });
 
+    // The default gateway is a property of the system, not of whichever interface these
+    // fallbacks happen to select, so it is carried through rather than dropped. It is the
+    // first pivot the deep engine interrogates; losing it here silently removes the single
+    // most informative router from discovery.
     if let Some(info) = preferred {
-        return Ok(info.clone());
+        let mut res = info.clone();
+        res.default_gateway = default_gateway;
+        return Ok(res);
     }
 
     // Fallback: Return the first available IPv4 interface
-    Ok(all_interfaces[0].clone())
+    let mut res = all_interfaces[0].clone();
+    res.default_gateway = default_gateway;
+    Ok(res)
 }
 
 /// Lists all non-loopback IPv4 network interfaces
@@ -131,28 +146,20 @@ pub fn resolve_target(
         return Ok((info.cidr, Some(info)));
     }
 
-    // Handle user inputs like "192.168.1.1/0" or "192.168.1.0/0"
+    // Reject ambiguous user inputs like "192.168.1.1/0" or "192.168.1.0/0"
     if target.ends_with("/0") {
-        let base_ip = target.trim_end_matches("/0");
-        if let Ok(ip) = Ipv4Addr::from_str(base_ip) {
-            // If it's a private subnet, assume /24
-            let cidr = Ipv4Net::new(ip, 24)
-                .map_err(|e| format!("Invalid IP: {}", e))?
-                .trunc();
-            eprintln!(
-                "Note: Converting non-routable prefix '{}/0' to standard local subnet '{}'",
-                base_ip, cidr
-            );
-            return Ok((cidr, None));
-        }
+        return Err(format!(
+            "Ambiguous target '{}': /0 prefix is not a valid local subnet. Please specify an explicit CIDR (e.g. 192.168.1.0/24).",
+            target
+        ));
     }
 
-    // Handle target ending in .0 with no slash (e.g. 192.168.1.0)
+    // Reject target ending in .0 with no slash (e.g. 192.168.1.0)
     if target.ends_with(".0") && !target.contains('/') {
-        let normalized = format!("{}/24", target);
-        let cidr = Ipv4Net::from_str(&normalized)
-            .map_err(|e| format!("Invalid CIDR '{}': {}", normalized, e))?;
-        return Ok((cidr, None));
+        return Err(format!(
+            "Ambiguous target '{}': IP addresses ending in .0 must specify an explicit prefix length (e.g. {}/24).",
+            target, target
+        ));
     }
 
     // Standard CIDR or single IP
@@ -258,15 +265,11 @@ mod tests {
 
     #[test]
     fn test_resolve_target_slash_zero() {
-        let (cidr, _) = resolve_target(Some("192.168.1.1/0"), None).unwrap();
-        assert_eq!(cidr.network(), Ipv4Addr::new(192, 168, 1, 0));
-        assert_eq!(cidr.prefix_len(), 24);
+        assert!(resolve_target(Some("192.168.1.1/0"), None).is_err());
     }
 
     #[test]
     fn test_resolve_target_dot_zero() {
-        let (cidr, _) = resolve_target(Some("192.168.1.0"), None).unwrap();
-        assert_eq!(cidr.network(), Ipv4Addr::new(192, 168, 1, 0));
-        assert_eq!(cidr.prefix_len(), 24);
+        assert!(resolve_target(Some("192.168.1.0"), None).is_err());
     }
 }
