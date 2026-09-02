@@ -412,6 +412,41 @@ pub struct TopologyEvidence {
     pub observed_at: SystemTime,
     /// Human-readable justification, rendered by the explain view.
     pub detail: Option<String>,
+    /// The peer that asserted this, when it did not come from this machine.
+    ///
+    /// `None` means locally observed. Carried on the record itself rather than tracked
+    /// alongside, because a fact merged from a peer must remain distinguishable from one
+    /// this vantage saw for as long as it exists -- including after it has been folded into
+    /// a node that also holds local evidence.
+    pub origin: Option<PeerOrigin>,
+}
+
+/// Where a remote fact came from.
+///
+/// Enough to attribute the claim and to reproduce the receiver's decision: which peer, from
+/// which of its vantages, in which bundle, and when the peer said it observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerOrigin {
+    /// The peer's public key, hex. Full, not truncated: a short form is for display only.
+    pub peer: String,
+    /// The peer's own name for the interface it observed from.
+    pub vantage: String,
+    /// Sequence number of the bundle this arrived in.
+    pub sequence: u64,
+    /// Seconds since the epoch, as the peer's clock reported.
+    pub published_at: u64,
+}
+
+impl PeerOrigin {
+    /// Short form for display.
+    pub fn short(&self) -> String {
+        let peer = if self.peer.len() > 16 {
+            &self.peer[..16]
+        } else {
+            &self.peer
+        };
+        format!("peer {peer} via {}", self.vantage)
+    }
 }
 
 impl TopologyEvidence {
@@ -428,7 +463,19 @@ impl TopologyEvidence {
             vantage: vantage.into(),
             observed_at: SystemTime::now(),
             detail: None,
+            origin: None,
         }
+    }
+
+    /// Marks this record as asserted by a peer rather than observed here.
+    pub fn from_peer(mut self, origin: PeerOrigin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// Whether this came from another machine.
+    pub fn is_remote(&self) -> bool {
+        self.origin.is_some()
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {

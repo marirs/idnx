@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod federation;
 pub mod fingerprint;
 pub mod net;
 pub mod output;

@@ -293,6 +293,15 @@ pub struct Provenance {
     pub confidence: Confidence,
     pub vantage: String,
     pub detail: Option<String>,
+    /// The peer that asserted this, when it was not observed here.
+    pub origin: Option<crate::topology::evidence::PeerOrigin>,
+}
+
+impl Provenance {
+    /// Whether this record came from another machine.
+    pub fn is_remote(&self) -> bool {
+        self.origin.is_some()
+    }
 }
 
 impl Provenance {
@@ -302,6 +311,7 @@ impl Provenance {
             confidence: ev.confidence,
             vantage: ev.vantage.clone(),
             detail: ev.detail.clone(),
+            origin: ev.origin.clone(),
         }
     }
 }
@@ -651,12 +661,22 @@ impl TopologyGraph {
             Fact::DeviceVendor { device, vendor } => {
                 let key = self.canonical_key(&device, None);
                 let id = NodeId::Device(key);
+                let remote = ev.is_remote();
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                 if let Some(node) = self.nodes.get_mut(&id) {
                     // Vendor is descriptive metadata only. It is never consulted by role
                     // scoring, because who manufactured a device says nothing about
                     // whether it routes.
-                    node.vendor = Some(vendor);
+                    //
+                    // A peer may fill in a vendor this vantage never learned, but it must
+                    // not replace one established here: the local OUI lookup was made
+                    // against this machine's registry, and silently overwriting it would
+                    // let a remote peer restate local identity.
+                    let established_locally =
+                        node.vendor.is_some() && node.provenance.iter().any(|p| !p.is_remote());
+                    if !(remote && established_locally) {
+                        node.vendor = Some(vendor);
+                    }
                 }
             }
             Fact::DeviceDescription { device, text } => {
@@ -792,9 +812,18 @@ impl TopologyGraph {
             Fact::OpaqueBoundary { device, why } => {
                 let key = self.canonical_key(&device, None);
                 let id = NodeId::Device(key);
+                let remote = ev.is_remote();
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                 if let Some(node) = self.nodes.get_mut(&id) {
-                    node.opaque_reason = Some(why);
+                    // A boundary is a statement about what *this* vantage cannot see past.
+                    // A peer declaring one must not overwrite the local reason, which
+                    // describes a different limit; where none exists locally, the peer's
+                    // reason is recorded and stays attributed to it.
+                    let established_locally = node.opaque_reason.is_some()
+                        && node.provenance.iter().any(|p| !p.is_remote());
+                    if !(remote && established_locally) {
+                        node.opaque_reason = Some(why);
+                    }
                 }
             }
             Fact::Service {
