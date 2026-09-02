@@ -159,7 +159,10 @@ pub fn parse_x509_certificate(cert_der: &[u8]) -> TlsCertificateInfo {
                     if k + 2 + len <= search_window.len() {
                         let name =
                             String::from_utf8_lossy(&search_window[k + 2..k + 2 + len]).to_string();
-                        if !name.is_empty() && !info.alt_names.contains(&name) {
+                        // The scan looks for a context tag byte, which also occurs inside
+                        // signatures and key material, so anything that does not look like
+                        // a DNS name is signature bytes rather than a SAN entry.
+                        if is_plausible_dns_name(&name) && !info.alt_names.contains(&name) {
                             info.alt_names.push(name);
                         }
                     }
@@ -230,6 +233,26 @@ pub fn parse_tls_response(buf: &[u8]) -> Option<TlsCertificateInfo> {
 }
 
 /// Asynchronously probes a target IP and port for TLS certificate details
+/// True when a string could be a DNS name in a certificate SAN.
+///
+/// Guards a byte scan that cannot distinguish a real context tag from the same byte value
+/// appearing inside a signature; without it, raw key material was reported as a hostname.
+pub fn is_plausible_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    // A wildcard prefix is legitimate; everything else must be a hostname character.
+    let body = name.strip_prefix("*.").unwrap_or(name);
+    if body.is_empty() {
+        return false;
+    }
+    body.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && body.chars().any(|c| c.is_ascii_alphanumeric())
+        && !body.starts_with('.')
+        && !body.ends_with('.')
+}
+
 pub async fn probe_tls_certificate(
     target: Ipv4Addr,
     port: u16,
@@ -294,5 +317,31 @@ mod tests {
         let parsed = parse_x509_certificate(&cert_der);
         assert_eq!(parsed.common_name.as_deref(), Some("rt-be58.local"));
         assert!(parsed.alt_names.contains(&"asusrouter.com".to_string()));
+    }
+
+    #[test]
+    fn signature_bytes_are_not_mistaken_for_san_entries() {
+        // The exact failure this guards: a byte scan matched inside key material and
+        // reported raw bytes as a hostname.
+        assert!(!is_plausible_dns_name("J\u{19}\u{1c}g\u{7}m"));
+        assert!(!is_plausible_dns_name(""));
+        assert!(!is_plausible_dns_name("has space"));
+        assert!(!is_plausible_dns_name(".leading"));
+        assert!(!is_plausible_dns_name("trailing."));
+        assert!(!is_plausible_dns_name("\u{1}"));
+    }
+
+    #[test]
+    fn real_san_entries_are_accepted() {
+        for name in [
+            "linksyssmartwifi.com",
+            "www.linksyssmartwifi.com",
+            "myrouter.local",
+            "EA6350.home.linksys.com",
+            "*.example.org",
+            "router",
+        ] {
+            assert!(is_plausible_dns_name(name), "{name} should be accepted");
+        }
     }
 }

@@ -95,6 +95,9 @@ pub struct DeviceExport {
     pub id: String,
     /// `router`, `switch`, `host` or `opaque boundary`.
     pub kind: String,
+    /// The single section this device is presented under. Mutually exclusive, so summing
+    /// categories yields the device total with nothing double counted.
+    pub category: String,
     pub addresses: Vec<String>,
     pub hostnames: Vec<String>,
     pub vendor: Option<String>,
@@ -145,6 +148,19 @@ pub struct ProviderOutcomeExport {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SummaryExport {
+    /// Unique devices, counted once each. Equals routers + switches + boundaries +
+    /// ai_systems + other_hosts.
+    pub devices: usize,
+    pub routers: usize,
+    pub switches: usize,
+    pub opaque_boundaries: usize,
+    /// Devices with a protocol-confirmed AI capability that are not infrastructure.
+    pub ai_systems: usize,
+    pub other_hosts: usize,
+    pub networks: usize,
+    pub vlans: usize,
+    pub services: usize,
+    pub interfaces: usize,
     /// Node count per kind, so `total_nodes` is interpretable rather than an opaque
     /// figure that silently includes networks, interfaces and services.
     pub nodes_by_kind: std::collections::BTreeMap<String, usize>,
@@ -239,6 +255,9 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
         devices.push(DeviceExport {
             id: node.display_name(),
             kind: node.kind.label().to_string(),
+            category: crate::topology::graph::categorize(node)
+                .map(|c| c.label().to_string())
+                .unwrap_or_default(),
             addresses: node.addresses.iter().map(|a| a.to_string()).collect(),
             hostnames: node.hostnames.iter().cloned().collect(),
             vendor: node.vendor.clone(),
@@ -312,7 +331,18 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             .or_default() += 1;
     }
 
+    let counts = graph.counts();
     let mut summary = SummaryExport {
+        devices: counts.devices(),
+        routers: counts.routers,
+        switches: counts.switches,
+        opaque_boundaries: counts.opaque_boundaries,
+        ai_systems: counts.ai_systems,
+        other_hosts: counts.other_hosts,
+        networks: counts.networks,
+        vlans: counts.vlans,
+        services: counts.services,
+        interfaces: counts.interfaces,
         nodes_by_kind,
         observed: 0,
         advertised: 0,
@@ -633,6 +663,45 @@ mod tests {
         assert!(
             !data.relationships.is_empty(),
             "relationships must be serialised"
+        );
+    }
+
+    #[test]
+    fn device_categories_sum_to_the_device_total_without_double_counting() {
+        let data = build_export(&sample_report());
+        let s = &data.summary;
+
+        assert_eq!(
+            s.routers + s.switches + s.opaque_boundaries + s.ai_systems + s.other_hosts,
+            s.devices,
+            "every device must fall in exactly one category"
+        );
+
+        // Each exported device carries exactly one category, and they tally.
+        let mut counted = std::collections::BTreeMap::new();
+        for device in &data.devices {
+            *counted.entry(device.category.clone()).or_insert(0usize) += 1;
+        }
+        assert_eq!(
+            counted.values().sum::<usize>(),
+            s.devices,
+            "the device list and the summary must agree"
+        );
+    }
+
+    #[test]
+    fn the_graph_node_total_is_explained_by_its_composition() {
+        let data = build_export(&sample_report());
+        let s = &data.summary;
+
+        assert_eq!(
+            s.nodes_by_kind.values().sum::<usize>(),
+            s.total_nodes,
+            "the per-kind breakdown must account for every graph node"
+        );
+        assert!(
+            s.total_nodes >= s.devices,
+            "the graph holds devices plus networks, interfaces and services"
         );
     }
 

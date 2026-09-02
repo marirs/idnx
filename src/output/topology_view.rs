@@ -126,23 +126,38 @@ fn render_networks(report: &DiscoveryReport) {
 }
 
 fn render_infrastructure(graph: &TopologyGraph) {
-    let mut routers: Vec<_> = graph.nodes_of_kind(NodeKind::Router).collect();
-    let mut switches: Vec<_> = graph.nodes_of_kind(NodeKind::Switch).collect();
-    routers.sort_by_key(|n| n.display_name());
-    switches.sort_by_key(|n| n.display_name());
+    use crate::topology::graph::DeviceCategory;
 
-    if !routers.is_empty() {
-        println!("\n{}", "Routers & gateways".bold().green());
-        for node in routers {
+    // Sections are mutually exclusive, so their counts sum to the unique device total. A
+    // router that also hosts AI stays here and carries the capability as an annotation
+    // rather than appearing in two sections.
+    for (category, heading) in [
+        (DeviceCategory::Router, "Routers & gateways"),
+        (DeviceCategory::Switch, "Switches & bridges"),
+        (DeviceCategory::AiSystem, "AI agents & runtimes"),
+    ] {
+        let devices = graph.devices_in(category);
+        if devices.is_empty() {
+            continue;
+        }
+        println!(
+            "\n{} ({})",
+            heading.bold().green(),
+            devices.len().to_string().bold()
+        );
+        for node in devices {
             print_device(graph, node);
         }
     }
 
-    if !switches.is_empty() {
-        println!("\n{}", "Switches & bridges".bold().green());
-        for node in switches {
-            print_device(graph, node);
-        }
+    // Stated explicitly when absent, so "no AI found" is distinguishable from "AI was
+    // never looked for".
+    if graph.devices_in(DeviceCategory::AiSystem).is_empty() {
+        println!(
+            "\n{} {}",
+            "AI agents & runtimes (0)".bold(),
+            "no protocol-confirmed AI runtime, agent or MCP server".dimmed()
+        );
     }
 }
 
@@ -202,10 +217,16 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node) {
 }
 
 fn render_hosts(graph: &TopologyGraph) {
-    let all_hosts: Vec<_> = graph.nodes_of_kind(NodeKind::Host).collect();
+    use crate::topology::graph::DeviceCategory;
+
+    let all_hosts = graph.devices_in(DeviceCategory::Host);
+    if all_hosts.is_empty() {
+        return;
+    }
+
     // A device known only by a loopback or link-local address is this machine's own
-    // plumbing, not a discovered host.
-    let mut hosts: Vec<_> = all_hosts
+    // plumbing rather than a discovered host, but it is still counted as a device.
+    let shown: Vec<_> = all_hosts
         .iter()
         .copied()
         .filter(|n| {
@@ -214,26 +235,21 @@ fn render_hosts(graph: &TopologyGraph) {
                 .any(crate::topology::graph::is_interrogable)
         })
         .collect();
-    if hosts.is_empty() {
-        return;
-    }
-    hosts.sort_by_key(|n| n.addresses.iter().next().copied());
 
-    // State the omission rather than letting the heading disagree with the node total.
-    let omitted = all_hosts.len() - hosts.len();
+    let omitted = all_hosts.len() - shown.len();
     let note = if omitted > 0 {
-        format!(" ({omitted} more known only by a link-local or loopback address)")
+        format!(" ({omitted} known only by a link-local or loopback address)")
     } else {
         String::new()
     };
     println!(
         "\n{} ({}){}",
         "Hosts".bold().green(),
-        hosts.len(),
+        all_hosts.len().to_string().bold(),
         note.dimmed()
     );
-    for node in hosts {
-        // Lead with a routable address; link-local ones are shown as extras.
+
+    for node in shown {
         let mut addrs: Vec<String> = node
             .addresses
             .iter()
@@ -253,19 +269,17 @@ fn render_hosts(graph: &TopologyGraph) {
             .cloned()
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "  ├── {:<24} {:<22} {}",
+            "  |-- {:<24} {:<22} {}",
             addrs.first().cloned().unwrap_or_default().cyan(),
             name.green(),
             node.vendor.as_deref().unwrap_or("").dimmed()
         );
-        // Additional addresses on the same device, which is how a dual-stack host or a
-        // multi-homed router is shown as one entry rather than several.
         for extra in addrs.iter().skip(1) {
-            println!("  │     {}", extra.dimmed());
+            println!("  |     {}", extra.dimmed());
         }
         if !node.capabilities.is_empty() {
             println!(
-                "  │     {}",
+                "  |     {}",
                 node.capabilities
                     .iter()
                     .cloned()
@@ -468,25 +482,36 @@ fn render_coverage(report: &DiscoveryReport) {
     let facts = grade_counts_facts(&report.graph);
     let edges = grade_counts_edges(&report.graph);
 
-    // A bare node total is not interpretable: it counts networks, interfaces and services
-    // alongside devices, so "29 nodes" beside "11 hosts" read as a contradiction. The
-    // composition is spelled out so the two figures reconcile.
-    let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for node in report.graph.nodes() {
-        *by_kind.entry(node.kind.label()).or_default() += 1;
-    }
-    let composition = by_kind
-        .iter()
-        .map(|(kind, count)| format!("{count} {kind}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Device counts first, because that is what an operator actually asked. The graph node
+    // total is reported alongside so the difference is explained rather than looking wrong.
+    let counts = report.graph.counts();
 
+    println!("\n{}", "Topology summary".bold());
     println!(
-        "\n  {:<16}{} total — {}",
-        "Nodes:".bold(),
-        report.graph.node_count().to_string().bold(),
-        composition.dimmed()
+        "  {:<16}{}",
+        "Devices:".bold(),
+        counts.devices().to_string().bold()
     );
+    println!("    {:<14}{}", "Routers", counts.routers);
+    println!("    {:<14}{}", "Switches", counts.switches);
+    if counts.opaque_boundaries > 0 {
+        println!("    {:<14}{}", "Boundaries", counts.opaque_boundaries);
+    }
+    println!("    {:<14}{}", "AI systems", counts.ai_systems);
+    println!("    {:<14}{}", "Other hosts", counts.other_hosts);
+    println!("  {:<16}{}", "Networks:".bold(), counts.networks);
+    if counts.vlans > 0 {
+        println!("  {:<16}{}", "VLANs:".bold(), counts.vlans);
+    }
+    println!("  {:<16}{}", "Services:".bold(), counts.services);
+    println!("  {:<16}{}", "Interfaces:".bold(), counts.interfaces);
+    println!(
+        "  {:<16}{} {}",
+        "Graph nodes:".bold(),
+        counts.graph_nodes,
+        "(devices plus networks, interfaces and services)".dimmed()
+    );
+
     println!(
         "  {:<16}{} observed · {} advertised · {} inferred",
         "by grade:".dimmed(),

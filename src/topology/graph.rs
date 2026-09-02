@@ -12,6 +12,87 @@ use ipnet::IpNet;
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
 use super::role::{DeviceRole, score_role};
 
+/// How a device is presented to an operator.
+///
+/// Mutually exclusive by construction, so the section counts sum to the number of unique
+/// devices. A router that also hosts an AI runtime stays under `Router` and carries the
+/// capability as an annotation rather than being counted twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeviceCategory {
+    OpaqueBoundary,
+    Router,
+    Switch,
+    /// A non-infrastructure device with a *confirmed* AI capability.
+    AiSystem,
+    Host,
+}
+
+impl DeviceCategory {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeviceCategory::OpaqueBoundary => "opaque boundary",
+            DeviceCategory::Router => "router",
+            DeviceCategory::Switch => "switch",
+            DeviceCategory::AiSystem => "AI system",
+            DeviceCategory::Host => "host",
+        }
+    }
+}
+
+/// Capability labels that qualify a device as an AI system.
+///
+/// Membership requires a confirmed capability. An open port on 11434 or 3000 is not one:
+/// those ports host far more non-AI software than AI software.
+const AI_CAPABILITY_LABELS: &[&str] = &["AI runtime", "AI agent", "MCP server"];
+
+/// True when a device has a confirmed AI capability.
+pub fn has_confirmed_ai(node: &Node) -> bool {
+    node.capabilities.iter().any(|capability| {
+        AI_CAPABILITY_LABELS
+            .iter()
+            .any(|label| capability.starts_with(label))
+    })
+}
+
+/// Places a device in exactly one presentation category.
+pub fn categorize(node: &Node) -> Option<DeviceCategory> {
+    match node.kind {
+        NodeKind::OpaqueBoundary => Some(DeviceCategory::OpaqueBoundary),
+        // Infrastructure placement wins: a router hosting AI is still a router.
+        NodeKind::Router => Some(DeviceCategory::Router),
+        NodeKind::Switch => Some(DeviceCategory::Switch),
+        NodeKind::Host => Some(if has_confirmed_ai(node) {
+            DeviceCategory::AiSystem
+        } else {
+            DeviceCategory::Host
+        }),
+        NodeKind::Interface | NodeKind::Network | NodeKind::Vlan | NodeKind::Service => None,
+    }
+}
+
+/// Counts of everything an operator asked about, plus the internal graph total.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TopologyCounts {
+    pub routers: usize,
+    pub switches: usize,
+    pub opaque_boundaries: usize,
+    pub ai_systems: usize,
+    pub other_hosts: usize,
+    pub networks: usize,
+    pub vlans: usize,
+    pub services: usize,
+    pub interfaces: usize,
+    /// Every node in the graph, which is necessarily larger than the device count.
+    pub graph_nodes: usize,
+}
+
+impl TopologyCounts {
+    /// Unique physical or logical devices. Each is counted exactly once.
+    pub fn devices(&self) -> usize {
+        self.routers + self.switches + self.opaque_boundaries + self.ai_systems + self.other_hosts
+    }
+}
+
 /// Hostname tokens that suggest network equipment.
 ///
 /// Matched on token boundaries, never as substrings. A bare `contains("ap")` classified
@@ -346,6 +427,44 @@ impl TopologyGraph {
     /// VLANs observed with no prefix evidence, reported as such rather than invented.
     pub fn vlans_without_prefix(&self) -> impl Iterator<Item = u16> + '_ {
         self.vlans_without_prefix.iter().copied()
+    }
+
+    /// Counts for presentation, computed once so every renderer agrees.
+    pub fn counts(&self) -> TopologyCounts {
+        let mut counts = TopologyCounts {
+            graph_nodes: self.nodes.len(),
+            ..Default::default()
+        };
+
+        for node in self.nodes.values() {
+            match node.kind {
+                NodeKind::Network => counts.networks += 1,
+                NodeKind::Vlan => counts.vlans += 1,
+                NodeKind::Service => counts.services += 1,
+                NodeKind::Interface => counts.interfaces += 1,
+                _ => match categorize(node) {
+                    Some(DeviceCategory::Router) => counts.routers += 1,
+                    Some(DeviceCategory::Switch) => counts.switches += 1,
+                    Some(DeviceCategory::OpaqueBoundary) => counts.opaque_boundaries += 1,
+                    Some(DeviceCategory::AiSystem) => counts.ai_systems += 1,
+                    Some(DeviceCategory::Host) => counts.other_hosts += 1,
+                    None => {}
+                },
+            }
+        }
+
+        counts
+    }
+
+    /// Devices in one presentation category.
+    pub fn devices_in(&self, category: DeviceCategory) -> Vec<&Node> {
+        let mut out: Vec<&Node> = self
+            .nodes
+            .values()
+            .filter(|n| categorize(n) == Some(category))
+            .collect();
+        out.sort_by_key(|n| (n.addresses.iter().next().copied(), n.display_name()));
+        out
     }
 
     /// Interfaces through which a network is reached.
@@ -1282,6 +1401,126 @@ mod tests {
             g.candidate_addresses().is_empty(),
             "a consumer endpoint should not consume interrogation budget"
         );
+    }
+
+    #[test]
+    fn categories_are_mutually_exclusive_and_sum_to_the_device_total() {
+        let mut g = TopologyGraph::new();
+
+        // A router that also hosts an AI runtime.
+        let router = DeviceKey::mac("aa:00:00:00:00:01");
+        g.absorb(ev(
+            Fact::DeviceRoleSignal {
+                device: router.clone(),
+                signal: RoleSignal::DefaultGateway,
+            },
+            EvidenceSource::DefaultGateway,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceCapability {
+                device: router,
+                capability: crate::topology::evidence::Capability::AiRuntime,
+                detail: Some("Ollama".to_string()),
+            },
+            EvidenceSource::AiProtocol,
+            Confidence::Observed,
+        ));
+
+        // A plain host with a confirmed AI runtime.
+        let ai_host = DeviceKey::mac("bb:00:00:00:00:02");
+        g.absorb(ev(
+            Fact::DeviceCapability {
+                device: ai_host,
+                capability: crate::topology::evidence::Capability::AiRuntime,
+                detail: Some("Ollama".to_string()),
+            },
+            EvidenceSource::AiProtocol,
+            Confidence::Observed,
+        ));
+
+        // An ordinary host.
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: DeviceKey::mac("cc:00:00:00:00:03"),
+                address: "10.0.0.9".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        let counts = g.counts();
+        assert_eq!(counts.routers, 1);
+        assert_eq!(
+            counts.ai_systems, 1,
+            "only the non-infrastructure AI device"
+        );
+        assert_eq!(counts.other_hosts, 1);
+        assert_eq!(counts.devices(), 3, "each device counted exactly once");
+
+        // The router hosting AI stays under routers and is not double counted.
+        assert!(has_confirmed_ai(g.devices_in(DeviceCategory::Router)[0]));
+        assert_eq!(g.devices_in(DeviceCategory::AiSystem).len(), 1);
+    }
+
+    #[test]
+    fn an_open_conventional_port_does_not_make_an_ai_system() {
+        // 11434 open is not Ollama confirmed; only a protocol response qualifies.
+        let mut g = TopologyGraph::new();
+        let mac = DeviceKey::mac("dd:00:00:00:00:04");
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: mac,
+                address: "10.0.0.11".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::Service {
+                address: "10.0.0.11".parse().unwrap(),
+                port: 11434,
+                protocol: "tcp",
+                detail: None,
+            },
+            EvidenceSource::TcpProbe,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        let counts = g.counts();
+        assert_eq!(counts.ai_systems, 0);
+        assert_eq!(counts.other_hosts, 1);
+    }
+
+    #[test]
+    fn graph_node_total_exceeds_the_device_total() {
+        // The graph holds networks, interfaces and services too, which is exactly why the
+        // two figures differ and why both are reported.
+        let mut g = TopologyGraph::new();
+        g.absorb(ev(
+            Fact::Network {
+                prefix: IpNet::from_str("10.0.0.0/24").unwrap(),
+            },
+            EvidenceSource::KernelRoute,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: DeviceKey::mac("ee:00:00:00:00:05"),
+                address: "10.0.0.20".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        let counts = g.counts();
+        assert_eq!(counts.devices(), 1);
+        assert_eq!(counts.networks, 1);
+        assert_eq!(counts.graph_nodes, 2);
+        assert!(counts.graph_nodes > counts.devices());
     }
 
     #[test]

@@ -566,12 +566,18 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                     .any(|p| matches!(p.port, 80 | 443 | 8080 | 8443));
 
                 for port in &host.open_ports {
+                    // The conventional name for a port is a hint, not an identification.
+                    // Reporting 11434 as "ollama/llm" claimed a protocol nothing had
+                    // confirmed; a protocol probe is what upgrades this.
                     out.push(TopologyEvidence::new(
                         Fact::Service {
                             address: IpAddr::V4(host.ip),
                             port: port.port,
                             protocol: "tcp",
-                            detail: Some(port.service.to_string()),
+                            detail: Some(format!(
+                                "open; protocol unconfirmed (conventionally {})",
+                                port.service
+                            )),
                         },
                         EvidenceSource::TcpProbe,
                         Confidence::Observed,
