@@ -24,7 +24,7 @@ pub fn parse_lldp_frame(payload: &[u8]) -> Option<LldpNeighbor> {
 
     // Check if frame is Cisco Discovery Protocol (CDP: dest MAC 01:00:0c:cc:cc:cc)
     if payload.len() >= 22
-        && payload[0..6] == [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]
+        && payload[0..6] == CDP_MULTICAST_MAC
         && let Some(cdp) = crate::probes::cdp::parse_cdp_frame(payload)
     {
         let desc = match (cdp.platform, cdp.software_version) {
@@ -144,6 +144,22 @@ pub fn parse_lldp_frame(payload: &[u8]) -> Option<LldpNeighbor> {
     }
 }
 
+/// CDP frames are sent to this reserved Cisco multicast address. CDP is LLC/SNAP
+/// encapsulated, so it carries no distinguishing EtherType and must be matched on the
+/// destination MAC instead.
+const CDP_MULTICAST_MAC: [u8; 6] = [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC];
+
+/// Minimum size of Darwin's `struct bpf_hdr`.
+#[cfg(target_os = "macos")]
+const BPF_HDR_MIN_LEN: usize = 18;
+
+/// `BPF_WORDALIGN` from `net/bpf.h`; on Darwin `BPF_ALIGNMENT` is `sizeof(int32_t)`.
+#[cfg(target_os = "macos")]
+fn bpf_word_align(len: usize) -> usize {
+    const BPF_ALIGNMENT: usize = std::mem::size_of::<i32>();
+    (len + (BPF_ALIGNMENT - 1)) & !(BPF_ALIGNMENT - 1)
+}
+
 /// Result of attempting an LLDP capture
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -254,30 +270,56 @@ fn capture_macos_bpf(interface: &str, duration: Duration) -> LldpCaptureResult {
             Ok(n) if n > 14 => {
                 // Process BPF buffer (contains bpf_hdr + packet)
                 let mut read_offset = 0;
-                while read_offset + 18 <= n {
-                    // In 64-bit Darwin, bpf_hdr has bh_hdrlen at byte 16
-                    let bh_hdrlen = ((buffer[read_offset + 16] as usize)
-                        | ((buffer[read_offset + 17] as usize) << 8))
-                        .max(18);
-                    let pkt_start = read_offset + bh_hdrlen;
-                    if pkt_start + 14 > n {
+                while read_offset + BPF_HDR_MIN_LEN <= n {
+                    // Darwin `struct bpf_hdr` on 64-bit:
+                    //   0..8   bh_tstamp (two u32)
+                    //   8..12  bh_caplen
+                    //   12..16 bh_datalen
+                    //   16..18 bh_hdrlen
+                    let bh_caplen = u32::from_le_bytes([
+                        buffer[read_offset + 8],
+                        buffer[read_offset + 9],
+                        buffer[read_offset + 10],
+                        buffer[read_offset + 11],
+                    ]) as usize;
+                    let bh_hdrlen =
+                        u16::from_le_bytes([buffer[read_offset + 16], buffer[read_offset + 17]])
+                            as usize;
+
+                    if bh_hdrlen < BPF_HDR_MIN_LEN || bh_caplen == 0 {
                         break;
                     }
 
-                    // Check EtherType at offset 12 in the Ethernet header (LLDP 0x88CC or CDP destination MAC 01:00:0c:cc:cc:cc)
-                    let ethertype =
-                        ((buffer[pkt_start + 12] as u16) << 8) | (buffer[pkt_start + 13] as u16);
-                    let is_cdp = buffer[pkt_start..pkt_start + 6]
-                        == [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC];
+                    let pkt_start = read_offset + bh_hdrlen;
+                    let pkt_end = pkt_start + bh_caplen;
+                    if pkt_end > n || pkt_start + 14 > n {
+                        break;
+                    }
+
+                    // Bound the frame by its own captured length. Passing the remainder of
+                    // the buffer let the TLV walker run past the end of one packet and into
+                    // the next, producing garbage neighbours on a busy link.
+                    let frame = &buffer[pkt_start..pkt_end];
+
+                    // EtherType at offset 12 (LLDP 0x88CC), or the CDP multicast
+                    // destination MAC, since CDP is LLC/SNAP and carries a length there.
+                    let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
+                    let is_cdp = frame[0..6] == CDP_MULTICAST_MAC;
 
                     if (ethertype == 0x88CC || is_cdp)
-                        && let Some(neighbor) = parse_lldp_frame(&buffer[pkt_start..n])
+                        && let Some(neighbor) = parse_lldp_frame(frame)
                     {
                         neighbors.push(neighbor);
                     }
 
-                    // Move to next packet
-                    read_offset += 2048; // Advance frame
+                    // Each record is padded to a BPF_ALIGNMENT boundary. Advancing by a
+                    // fixed 2048 instead skipped every packet after the first in a buffer,
+                    // and mis-set the offset whenever a record was smaller than that.
+                    let advance = bpf_word_align(bh_hdrlen + bh_caplen);
+                    if advance == 0 {
+                        break;
+                    }
+                    read_offset += advance;
                 }
             }
             _ => {
@@ -294,15 +336,14 @@ fn capture_macos_bpf(interface: &str, duration: Duration) -> LldpCaptureResult {
 fn capture_linux_raw_socket(interface: &str, duration: Duration) -> LldpCaptureResult {
     use std::ffi::CString;
 
-    // ETH_P_LLDP = 0x88CC
-    const ETH_P_LLDP: u16 = 0x88CC;
-    let sock = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW,
-            ETH_P_LLDP.to_be() as i32,
-        )
-    };
+    // Bind to ETH_P_ALL rather than ETH_P_LLDP.
+    //
+    // CDP is LLC/SNAP encapsulated: the 802.3 length/type field holds a frame length, not
+    // 0x88CC, so a socket bound to ETH_P_LLDP never receives a single CDP frame. Binding
+    // to ETH_P_ALL and narrowing with a kernel packet filter is what actually makes the
+    // CDP parser reachable on Linux; matching macOS, which sees both.
+    const ETH_P_ALL: u16 = 0x0003;
+    let sock = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, ETH_P_ALL.to_be() as i32) };
 
     if sock < 0 {
         let err = std::io::Error::last_os_error();
@@ -329,7 +370,7 @@ fn capture_linux_raw_socket(interface: &str, duration: Duration) -> LldpCaptureR
     // Bind socket to interface
     let mut sa: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     sa.sll_family = libc::AF_PACKET as u16;
-    sa.sll_protocol = ETH_P_LLDP.to_be();
+    sa.sll_protocol = ETH_P_ALL.to_be();
     sa.sll_ifindex = if_index as i32;
 
     if unsafe {
@@ -346,6 +387,11 @@ fn capture_linux_raw_socket(interface: &str, duration: Duration) -> LldpCaptureR
         );
     }
 
+    // Narrow ETH_P_ALL down in the kernel so the userspace loop is not handed every frame
+    // on the link. Without this the discovery window is spent copying unrelated traffic and
+    // the few LLDP/CDP advertisements in it are missed.
+    attach_lldp_cdp_filter(sock);
+
     let mut buf = [0u8; 2048];
     let start = std::time::Instant::now();
     let mut neighbors = Vec::new();
@@ -358,16 +404,111 @@ fn capture_linux_raw_socket(interface: &str, duration: Duration) -> LldpCaptureR
 
     while start.elapsed() < duration {
         let n = unsafe { libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n > 14
-            && let Some(neighbor) = parse_lldp_frame(&buf[..n as usize])
-        {
-            neighbors.push(neighbor);
+        if n > 14 {
+            if let Some(neighbor) = parse_lldp_frame(&buf[..n as usize]) {
+                neighbors.push(neighbor);
+            }
+            // A frame was available, so drain the queue instead of sleeping. Sleeping after
+            // every successful read let bursts of advertisements expire unread.
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
 
     unsafe { libc::close(sock) };
     LldpCaptureResult::Success(neighbors)
+}
+
+/// Attaches a classic BPF filter accepting only LLDP (EtherType 0x88CC) and CDP
+/// (destination MAC 01:00:0c:cc:cc:cc) frames.
+///
+/// Failure is deliberately non-fatal: without the filter the socket still delivers the
+/// frames we want, just alongside everything else, so capture degrades rather than breaks.
+#[cfg(target_os = "linux")]
+fn attach_lldp_cdp_filter(sock: i32) {
+    // Offsets are into the Ethernet header.
+    //   0: ldh  [12]                 ; EtherType / 802.3 length
+    //   1: jeq  #0x88CC -> accept    ; LLDP
+    //   2: ld   [0]                  ; first 4 octets of the destination MAC
+    //   3: jeq  #0x01000CCC          ; CDP multicast, high half
+    //   4: ldh  [4]                  ; last 2 octets of the destination MAC
+    //   5: jeq  #0xCCCC -> accept    ; CDP multicast, low half
+    //   6: ret  #262144              ; accept (snap length)
+    //   7: ret  #0                   ; reject
+    const BPF_LD: u16 = 0x00;
+    const BPF_H: u16 = 0x08;
+    const BPF_W: u16 = 0x00;
+    const BPF_ABS: u16 = 0x20;
+    const BPF_JMP: u16 = 0x05;
+    const BPF_JEQ: u16 = 0x10;
+    const BPF_K: u16 = 0x00;
+    const BPF_RET: u16 = 0x06;
+
+    let prog: [libc::sock_filter; 8] = [
+        libc::sock_filter {
+            code: BPF_LD | BPF_H | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: 12,
+        },
+        libc::sock_filter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 4,
+            jf: 0,
+            k: 0x0000_88CC,
+        },
+        libc::sock_filter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 3,
+            k: 0x0100_0CCC,
+        },
+        libc::sock_filter {
+            code: BPF_LD | BPF_H | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: 4,
+        },
+        libc::sock_filter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: 0x0000_CCCC,
+        },
+        libc::sock_filter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: 262_144,
+        },
+        libc::sock_filter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ];
+
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut libc::sock_filter,
+    };
+
+    unsafe {
+        libc::setsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            &fprog as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+        );
+    }
 }
 
 #[cfg(test)]
