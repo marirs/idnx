@@ -8,37 +8,48 @@ This document provides a reference for the network protocols, OIDs, and frame sp
 
 idNX targets standard RFC MIBs for maximum cross-vendor compatibility (Cisco, Juniper, HP/Aruba, MikroTik, Ubiquiti, pfSense, Fortinet).
 
+Transport is **SNMP v1/v2c over UDP 161** via a hand-written ASN.1 BER codec. SNMPv3 is not yet implemented.
+
+The **Status** column below is authoritative: ✅ means the OID is walked and its value consumed by the discovery engine today; 📋 means it is a planned target and is *not* currently queried. Do not read a listed OID as an implemented capability.
+
 ### 1.1 Interface & Address MIBs
-| OID | Name | Description |
-|---|---|---|
-| `1.3.6.1.2.1.1.1.0` | `sysDescr` | System hardware and OS description string |
-| `1.3.6.1.2.1.1.5.0` | `sysName` | Hostname / FQDN of the device |
-| `1.3.6.1.2.1.4.20.1.1` | `ipAdEntAddr` | IP addresses configured on all interfaces |
-| `1.3.6.1.2.1.4.20.1.3` | `ipAdEntNetMask` | Subnet masks for each configured interface IP |
-| `1.3.6.1.2.1.4.20.1.2` | `ipAdEntIfIndex` | Interface index associated with each IP |
+| OID | Name | Status | Description |
+|---|---|---|---|
+| `1.3.6.1.2.1.1.1.0` | `sysDescr` | ✅ | System hardware and OS description string |
+| `1.3.6.1.2.1.1.5.0` | `sysName` | ✅ | Hostname / FQDN of the device |
+| `1.3.6.1.2.1.4.20.1.1` | `ipAdEntAddr` | ✅ | IP addresses configured on all interfaces |
+| `1.3.6.1.2.1.4.20.1.3` | `ipAdEntNetMask` | ✅ | Subnet masks for each configured interface IP |
+| `1.3.6.1.2.1.4.20.1.2` | `ipAdEntIfIndex` | 📋 | Interface index associated with each IP |
 
 ### 1.2 Routing Table MIBs
-| OID | Name | Description |
-|---|---|---|
-| `1.3.6.1.2.1.4.21.1.1` | `ipRouteDest` | Destination IP address / network |
-| `1.3.6.1.2.1.4.21.1.7` | `ipRouteNextHop` | Next-hop IP address for the route |
-| `1.3.6.1.2.1.4.21.1.11` | `ipRouteMask` | Subnet mask for the destination network |
-| `1.3.6.1.2.1.4.21.1.8` | `ipRouteType` | Route type (1=other, 2=invalid, 3=direct, 4=indirect) |
-| `1.3.6.1.2.1.4.24.4.1` | `inetCidrRouteTable` | Modern CIDR routing table (supports IPv4 & IPv6) |
+| OID | Name | Status | Description |
+|---|---|---|---|
+| `1.3.6.1.2.1.4.21.1.1` | `ipRouteDest` | ✅ | Destination IP address / network |
+| `1.3.6.1.2.1.4.21.1.7` | `ipRouteNextHop` | ✅ | Next-hop IP address for the route |
+| `1.3.6.1.2.1.4.21.1.11` | `ipRouteMask` | ✅ | Subnet mask for the destination network |
+| `1.3.6.1.2.1.4.21.1.8` | `ipRouteType` | 📋 | Route type (1=other, 2=invalid, 3=direct, 4=indirect) |
+| `1.3.6.1.2.1.4.24.4.1` | `inetCidrRouteTable` | 📋 | Modern CIDR routing table (supports IPv4 & IPv6) |
 
 ### 1.3 ARP / Neighbor Cache MIBs
-| OID | Name | Description |
-|---|---|---|
-| `1.3.6.1.2.1.4.22.1.2` | `ipNetToMediaPhysAddress` | MAC address of the connected neighbor host |
-| `1.3.6.1.2.1.4.22.1.3` | `ipNetToMediaNetAddress` | IP address of the connected neighbor host |
-| `1.3.6.1.2.1.4.22.1.4` | `ipNetToMediaType` | ARP entry type (3=dynamic, 4=static) |
+| OID | Name | Status | Description |
+|---|---|---|---|
+| `1.3.6.1.2.1.4.22.1.2` | `ipNetToMediaPhysAddress` | ✅ | MAC address of the connected neighbor host |
+| `1.3.6.1.2.1.4.22.1.3` | `ipNetToMediaNetAddress` | ✅ | IP address of the connected neighbor host |
+| `1.3.6.1.2.1.4.22.1.4` | `ipNetToMediaType` | 📋 | ARP entry type (3=dynamic, 4=static) |
 
 ### 1.4 Switch Port & VLAN MIBs
-| OID | Name | Description |
-|---|---|---|
-| `1.3.6.1.2.1.17.4.3.1.1` | `dot1dTpFdbAddress` | Learned MAC address in switch bridge table |
-| `1.3.6.1.2.1.17.4.3.1.2` | `dot1dTpFdbPort` | Switch port number for learned MAC |
-| `1.3.6.1.2.1.31.1.1.1.1` | `ifName` | Interface name (e.g., `Gi0/1`, `vlan10`, `ether1`) |
+
+**None of the following are implemented yet.** The SNMP harvester currently walks system
+information, the ARP cache, the routing table and the interface address table only. Switch
+port mapping — the evidence needed to say "this device is on switch port 7" — requires the
+BRIDGE-MIB below and is tracked on the roadmap.
+
+| OID | Name | Status | Description |
+|---|---|---|---|
+| `1.3.6.1.2.1.17.4.3.1.1` | `dot1dTpFdbAddress` | 📋 | Learned MAC address in switch bridge table |
+| `1.3.6.1.2.1.17.4.3.1.2` | `dot1dTpFdbPort` | 📋 | Switch port number for learned MAC |
+| `1.3.6.1.2.1.31.1.1.1.1` | `ifName` | 📋 | Interface name (e.g., `Gi0/1`, `vlan10`, `ether1`) |
+| `1.0.8802.1.1.2.1.4` | `lldpRemTable` (LLDP-MIB) | 📋 | Neighbour table read from a switch over SNMP |
 
 ---
 
@@ -55,11 +66,16 @@ idNX targets standard RFC MIBs for maximum cross-vendor compatibility (Cisco, Ju
   - TLV 5: System Name
   - TLV 6: System Description
   - TLV 7: System Capabilities (Bridge, Router)
-  - TLV 8: Management Address (Primary management IP)
+  - TLV 8: Management Address (Primary management IP) — fed into topology discovery as a pivot to interrogate
+
+> **Capture scope.** LLDP and CDP reveal the neighbours advertising on the link idNX is bound to. That is the device on the other end of the cable plus anything else advertising in that broadcast domain. It is not a reconstruction of every switch-to-switch relationship in the fabric; that requires reading LLDP-MIB or BRIDGE-MIB off each switch over SNMP.
 
 ### 2.2 CDP (Cisco Discovery Protocol)
 - **Destination MAC**: `01:00:0c:cc:cc:cc`
 - **LLC / SNAP**: `0xAAAA03`, OUI `0x00000C`, Protocol `0x2000`
+- CDP has no distinguishing EtherType, so capture matches the destination MAC. On Linux the
+  capture socket binds `ETH_P_ALL` with a kernel packet filter for exactly this reason:
+  a socket bound to `ETH_P_LLDP` (`0x88CC`) never receives a CDP frame.
 - **Key TLVs**:
   - Device-ID (Hostname)
   - Address (Management IPv4/IPv6)

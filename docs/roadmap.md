@@ -38,7 +38,8 @@ This document outlines the milestones and release goals for the **idNX** project
 - [x] Async SNMP v1/v2c client (compact UDP BER encoder/decoder).
 - [x] Community string sweep (`public`, `private`, user-defined lists).
 - [x] Interface IP Table (`ipAddrTable`) walking for multi-homed VLAN detection.
-- [x] Routing Table (`ipRouteTable` / `inetCidrRouteTable`) extraction to uncover remote subnets.
+- [x] Routing Table (`ipRouteTable`, OID `1.3.6.1.2.1.4.21.1`) extraction to uncover remote subnets.
+- [ ] `inetCidrRouteTable` (OID `1.3.6.1.2.1.4.24.4.1`) — the modern CIDR/IPv6 routing table. Not implemented; only the legacy `ipRouteTable` is walked today.
 - [x] Remote ARP Cache (`ipNetToMediaTable`) harvesting for silent / firewalled stealth devices.
 
 ---
@@ -70,7 +71,32 @@ This document outlines the milestones and release goals for the **idNX** project
 
 ---
 
-### Milestone 8: Container & Orchestrator Topology Mapping (v0.2.3) -> [PLANNED]
+### Milestone 8: Evidence-Graded Topology Model -> [COMPLETED]
+- [x] Split discovery into **routes** (networks whose prefix is known) and **pivots** (routers whose networks are not yet known), so a router address is never widened into a network by assumption.
+- [x] Confidence grading on every network — `verified`, `advertised`, `user-supplied`, `inferred` — surfaced in the topology tree, HTML graph and every export format.
+- [x] Default gateway seeded as the first topology pivot; SNMP checked over UDP 161 rather than by probing TCP 161.
+- [x] `ipAddrTable` consumed as directly-attached-network evidence, with the router's real interface address as the gateway.
+- [x] DHCP option 3 routers ingested from the OS lease (`ipconfig getoption` on macOS, dhclient leases on Linux, `ipconfig /all` on Windows).
+- [x] LLDP/CDP management addresses fed back into discovery as pivots instead of being printed and discarded.
+- [x] TTL hop discovery targets a public resolver derived from the system configuration, and is skipped when none exists, rather than tracing to a hardcoded address.
+- [x] Auto-discovered networks bounded by `--max-sweep-hosts` so a `/16` VM bridge in the kernel table cannot stall a run.
+- [x] Deterministic resolver selection and deterministic route/pivot ordering, so repeated runs on an unchanged network produce identical output.
+
+---
+
+### Milestone 9: Switch Port Mapping & Change Detection -> [PLANNED]
+- [ ] BRIDGE-MIB forwarding tables (`dot1dTpFdbAddress` / `dot1dTpFdbPort`) to place a device on a specific switch port.
+- [ ] LLDP-MIB (`lldpRemTable`) read over SNMP to reconstruct switch-to-switch relationships beyond the local link.
+- [ ] `ifName`, interface speed and operational state for named, typed uplinks.
+- [ ] VLAN and trunk relationships.
+- [ ] SNMPv3 (authentication and privacy).
+- [ ] IPv6 neighbour discovery and router advertisements as topology evidence.
+- [ ] Snapshot save/diff (`idnx snapshot save`, `idnx snapshot diff`) — new device, new subnet, changed switch port, disappeared host, newly exposed service.
+- [ ] PCAP fixtures for LLDP/CDP/MNDP and recorded SNMP responses, so protocol decoding is regression-tested without a lab.
+
+---
+
+### Milestone 10: Container & Orchestrator Topology Mapping -> [PLANNED]
 - [ ] Docker, Podman, and containerd runtime socket / port detection.
 - [ ] Kubernetes Node & Kubelet (`10250`, `10255`) infrastructure probing.
 - [ ] Virtualized container bridge subnet identification (`cni0`, `docker0`).

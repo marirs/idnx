@@ -49,7 +49,7 @@ idNX is architected as a high-performance, asynchronous Rust library (`idnx`) wi
 
 ### 2.1 `engine`
 * **`scanner`**: Drives data-plane discovery using bounded semaphore worker pools. Coordinates Layer 2 ARP population, parallel TCP SYN/connect sweeps, asynchronous ICMP echo sweeps for stealth hosts, and service banner grabbing.
-* **`deep`**: Interrogates candidate RFC 1918 gateway routers to detect upstream parent WANs, downstream cascaded routers, and adjacent managed switch subnets.
+* **`deep`**: Interrogates routers it has evidence for — the OS default gateway first, then DHCP option 3 routers, LLDP/CDP management addresses, UPnP responders and TTL hops — to learn the networks each one is attached to or forwards toward. Distinguishes *routes* (networks whose prefix is known) from *pivots* (routers whose networks are not yet known), and grades every result `verified`, `advertised`, `user-supplied` or `inferred`. See `docs/deep_exploration.md`.
 
 ### 2.2 `probes`
 * **`lldp`**: Berkeley Packet Filter (macOS `/dev/bpf*`) and raw packet socket (Linux `AF_PACKET`) frame listener that decodes IEEE 802.1AB LLDP TLVs (Chassis ID, Port ID, System Name, System Description, Capabilities).

@@ -47,7 +47,7 @@ Unlike target-list scanners that require manual subnet inputs, **idNX begins wit
 1. **Auto-Detects Local Network & Link Speed:** Immediately detects the active interface, subnet CIDR, and real-time physical link speed (e.g. `10 Gbps Full-Duplex` or `2.16 Gbps Wi-Fi 6E 160MHz`).
 2. **Passive & Active Layer 2 Hardware Discovery:** Decodes IEEE 802.1AB **LLDP**, Cisco **CDP**, and MikroTik **MNDP** frames off the wire to map physical switch chassis, port IDs, native VLANs, and RouterOS boards.
 3. **Dual-Mode Name Synthesis:** Queries local Multicast DNS (RFC 6762) for `.local` names **and** sends RFC 1035 Unicast DNS PTR queries directly to gateway DNS servers (e.g. dnsmasq) to extract hostnames across routed subnets.
-4. **Cascaded & Adjacent Subnet Traversal:** Derives candidate adjacent networks from OS routing tables and gateway probes, queuing them for bounded recursive exploration.
+4. **Evidence-Graded Adjacent Subnet Traversal:** Derives adjacent networks from OS routing tables, the DHCP lease, LLDP/CDP management addresses, UPnP responders and SNMP MIB-II tables, then queues them for bounded recursive exploration. Every network is reported with the source that produced it and a confidence grade (`verified`, `advertised`, `user-supplied`, `inferred`), so an assumed network can never be mistaken for an observed one.
 5. **Multi-Signal Host Discovery:** Combines ARP, ICMP echo, and TCP SYN probes to maximize coverage of endpoints across different operating systems and firewall profiles.
 6. **Hardware Fingerprinting:** Resolves IEEE registered OUIs, flags IEEE 802 randomized private MAC addresses, interrogates UPnP/SSDP XML descriptors, and grabs SSH/HTTP server banners.
 
@@ -99,7 +99,9 @@ Auto-detects your primary active network interface, discovers your local subnet,
 ```bash
 idnx
 ```
-> **What it does:** Runs an unprivileged multi-threaded scan on your active interface (e.g. `en0`), identifies all live hosts using TCP SYN and ICMP echo fallbacks, queries mDNS and gateway DNS PTR records for hostnames, and probes standard RFC 1918 gateway candidates.
+> **What it does:** Runs an unprivileged multi-threaded scan on your active interface, identifies live hosts using TCP SYN and ICMP echo fallbacks, queries mDNS and gateway DNS PTR records for hostnames, and interrogates the routers it has evidence for — starting with your OS default gateway — over SNMP to learn what else they are attached to.
+>
+> **What it does not do:** invent networks. Reaching devices behind a router requires that router (or an adjacent one) to disclose them via SNMP, LLDP/CDP, DHCP or UPnP. Most consumer routers ship with SNMP disabled, in which case idNX reports your local subnet and whatever your kernel routes already cover. Brute-force subnet guessing is available behind `--heuristic-sweep` and everything it produces is graded `inferred`.
 
 ### 2. Full Privileged Discovery (Recommended for Switches)
 Unlocks raw socket packet capture (BPF on macOS, `AF_PACKET` on Linux) to capture wire-level Layer 2 switch advertisements:
