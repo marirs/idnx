@@ -432,6 +432,51 @@ fn services_for(graph: &TopologyGraph, node: &crate::topology::Node) -> Vec<Stri
     out
 }
 
+/// Per-device interrogation coverage.
+///
+/// Reports what was attempted against each device, not merely whether it produced
+/// evidence. "no response" answered neither of the two questions an operator actually has:
+/// was this device asked, and did it refuse or stay silent.
+fn render_device_coverage(report: &DiscoveryReport) {
+    if report.coverage.is_empty() {
+        return;
+    }
+
+    println!("\n{}", "Device coverage".bold());
+    println!(
+        "  {} device(s) interrogated in {}ms wall clock ({}ms if run one at a time), {} probes",
+        report.coverage.len(),
+        report.enrichment_elapsed.as_millis(),
+        report.enrichment_sequential_equivalent.as_millis(),
+        report.probes_attempted,
+    );
+
+    for record in &report.coverage {
+        println!(
+            "  {} {}",
+            record.address.to_string().cyan().bold(),
+            format!("[{}]", record.tier).dimmed()
+        );
+        if !record.discovery_sources.is_empty() {
+            println!(
+                "    {:<18} {}",
+                "discovered by",
+                record.discovery_sources.join(", ").dimmed()
+            );
+        }
+        println!("    {:<18} {}", "interrogation", record.summary().dimmed());
+        if record.silent() {
+            // A device that was asked and stayed silent is a finding about the device;
+            // one that was never asked is a gap in coverage. They must not read alike.
+            println!(
+                "    {:<18} {}",
+                "outcome",
+                "asked, no response on any probed port".dimmed()
+            );
+        }
+    }
+}
+
 fn render_coverage(report: &DiscoveryReport) {
     println!("\n{}", "Discovery coverage".bold());
 
@@ -474,6 +519,8 @@ fn render_coverage(report: &DiscoveryReport) {
             println!("    networks learned: {}", list.join(", ").green());
         }
     }
+
+    render_device_coverage(report);
 
     // Three separate tallies. A node carries only its strongest supporting grade, so
     // counting nodes alone reported "0 advertised" on a run that was displaying advertised

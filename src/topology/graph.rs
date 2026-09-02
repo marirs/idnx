@@ -343,6 +343,21 @@ impl Node {
         }
     }
 
+    /// Distinct evidence sources that contributed to this node.
+    ///
+    /// Reported per device so that "discovered by ARP alone" is distinguishable from
+    /// "discovered by ARP, DHCP and a router advertisement".
+    pub fn evidence_sources(&self) -> Vec<String> {
+        let mut sources: Vec<String> = self
+            .provenance
+            .iter()
+            .map(|p| p.source.label().to_string())
+            .collect();
+        sources.sort();
+        sources.dedup();
+        sources
+    }
+
     /// Best display name available, preferring what the device called itself.
     pub fn display_name(&self) -> String {
         if let Some(name) = self.hostnames.iter().next() {

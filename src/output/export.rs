@@ -50,7 +50,31 @@ pub struct TopologyExport {
     pub devices: Vec<DeviceExport>,
     pub relationships: Vec<RelationshipExport>,
     pub coverage: Vec<CoverageExport>,
+    /// What was attempted against each device and what came back. Separate from `coverage`,
+    /// which is per scope: a consumer needs to tell a silent device from an unasked one.
+    pub device_coverage: Vec<DeviceCoverageExport>,
     pub summary: SummaryExport,
+}
+
+/// Per-device interrogation record.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceCoverageExport {
+    pub address: String,
+    /// Why the device was interrogated: pivot, candidate or host.
+    pub tier: String,
+    pub discovery_sources: Vec<String>,
+    pub stages_run: u8,
+    pub tcp_attempted: usize,
+    pub tcp_responsive: Vec<u16>,
+    pub udp_attempted: Vec<u16>,
+    pub protocols_confirmed: Vec<String>,
+    /// Ports that refused without credentials, which is a finding rather than an absence.
+    pub auth_required: Vec<u16>,
+    /// Set when the device was never interrogated, saying why.
+    pub skipped: Option<String>,
+    /// True when the device was asked and answered nothing at all.
+    pub silent: bool,
+    pub elapsed_ms: u128,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -324,6 +348,25 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
         }
     }));
 
+    let device_coverage: Vec<DeviceCoverageExport> = report
+        .coverage
+        .iter()
+        .map(|record| DeviceCoverageExport {
+            address: record.address.to_string(),
+            tier: record.tier.label().to_string(),
+            discovery_sources: record.discovery_sources.clone(),
+            stages_run: record.stages_run,
+            tcp_attempted: record.tcp_attempted,
+            tcp_responsive: record.tcp_responsive.clone(),
+            udp_attempted: record.udp_attempted.clone(),
+            protocols_confirmed: record.protocols_confirmed.clone(),
+            auth_required: record.auth_required.clone(),
+            skipped: record.skipped.clone(),
+            silent: record.silent(),
+            elapsed_ms: record.elapsed.as_millis(),
+        })
+        .collect();
+
     let mut nodes_by_kind: std::collections::BTreeMap<String, usize> = Default::default();
     for node in graph.nodes() {
         *nodes_by_kind
@@ -377,6 +420,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
         devices,
         relationships,
         coverage,
+        device_coverage,
         summary,
     }
 }
@@ -627,6 +671,10 @@ mod tests {
                 runs: Vec::new(),
             }],
             pivot_runs: Vec::new(),
+            coverage: Vec::new(),
+            enrichment_elapsed: std::time::Duration::ZERO,
+            enrichment_sequential_equivalent: std::time::Duration::ZERO,
+            probes_attempted: 0,
             visibility: VisibilityReport {
                 vantage: Vantage {
                     interface: "en0".to_string(),

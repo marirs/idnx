@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use ipnet::IpNet;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::providers::{
     ContinuousSource, DiscoveryContext, DiscoveryProvider, ProviderRun, Vantage,
@@ -73,6 +74,14 @@ pub struct DiscoveryReport {
     /// Per-device interrogation results, so a pivot that disclosed nothing is visible
     /// rather than silently dropped.
     pub pivot_runs: Vec<PivotRun>,
+    /// What was attempted against every device and what came back, so that a silent
+    /// device is distinguishable from one that was never asked.
+    pub coverage: Vec<crate::providers::target::DeviceCoverage>,
+    /// Wall-clock time spent interrogating devices, with the sequential equivalent, so the
+    /// effect of running them concurrently is measured rather than asserted.
+    pub enrichment_elapsed: Duration,
+    pub enrichment_sequential_equivalent: Duration,
+    pub probes_attempted: usize,
     pub visibility: VisibilityReport,
     /// Scopes discovered but not enumerated because they exceeded the safety budget.
     pub oversized_scopes: Vec<IpNet>,
@@ -82,7 +91,9 @@ pub struct DiscoveryReport {
 /// Runs providers to a fixed point over everything discovered.
 pub struct DiscoveryEngine {
     seed_providers: Vec<Box<dyn DiscoveryProvider>>,
-    scope_providers: Vec<Box<dyn DiscoveryProvider>>,
+    /// Shared rather than owned outright: the device queue hands these to concurrent
+    /// per-device tasks, which must each hold their own reference.
+    scope_providers: Arc<Vec<Box<dyn DiscoveryProvider>>>,
     /// Observed continuously and drained by the engine, which also owns its shutdown.
     continuous: Option<Arc<dyn ContinuousSource>>,
     budget: Budget,
@@ -104,7 +115,7 @@ impl DiscoveryEngine {
     ) -> Self {
         Self {
             seed_providers,
-            scope_providers,
+            scope_providers: Arc::new(scope_providers),
             continuous: None,
             budget: Budget::default(),
         }
@@ -136,6 +147,10 @@ impl DiscoveryEngine {
         let mut processed: HashSet<IpNet> = HashSet::new();
         let mut interrogated: HashSet<std::net::IpAddr> = HashSet::new();
         let mut oversized = Vec::new();
+        let mut coverage: Vec<crate::providers::target::DeviceCoverage> = Vec::new();
+        let mut enrichment_elapsed = Duration::ZERO;
+        let mut enrichment_sequential = Duration::ZERO;
+        let mut probes_attempted = 0usize;
 
         // Phase 1: seed from local OS state. This always runs and never depends on any
         // remote device answering.
@@ -206,18 +221,14 @@ impl DiscoveryEngine {
             //
             // A candidate hint changes who gets asked and nothing else. Confidence and role
             // still come only from what the answers contain.
-            let mut pivots: Vec<std::net::IpAddr> = graph
-                .pivot_addresses()
-                .into_iter()
-                .filter(|a| !interrogated.contains(a))
-                .collect();
-            for candidate in graph.candidate_addresses() {
-                if !interrogated.contains(&candidate) && !pivots.contains(&candidate) {
-                    pivots.push(candidate);
-                }
-            }
+            // Everything not yet interrogated, infrastructure first. Every device is
+            // enqueued, not only those already believed to be network equipment: asking
+            // only devices with routing evidence was circular, since interrogation is how
+            // that evidence is obtained. The tier decides how much work a device is worth
+            // and nothing else -- role and confidence still come only from the answers.
+            let outstanding = !interrogation_queue(&graph, &interrogated).is_empty();
 
-            if pending.is_empty() && pivots.is_empty() {
+            if pending.is_empty() && !outstanding {
                 if !continuous_finished {
                     // Candidate convergence. Stop observing, take everything still
                     // buffered, and only then decide: a frame captured moments ago may
@@ -242,7 +253,14 @@ impl DiscoveryEngine {
                             .into_iter()
                             .any(|a| !pivots_before.contains(&a) && !interrogated.contains(&a));
 
-                        if gained_network || gained_pivot {
+                        // A candidate arriving in the final drain must resume traversal
+                        // just as a pivot does. Checking only pivots meant a device the
+                        // capture revealed at the very end was recorded and never asked
+                        // anything, which is the exact failure the two queues exist to
+                        // avoid.
+                        let gained_device = !interrogation_queue(&graph, &interrogated).is_empty();
+
+                        if gained_network || gained_pivot || gained_device {
                             // The final drain extended the topology, so traversal resumes.
                             continue;
                         }
@@ -252,45 +270,52 @@ impl DiscoveryEngine {
                 break;
             }
 
-            for address in pivots {
-                interrogated.insert(address);
-                let before: HashSet<IpNet> = graph.networks().into_iter().collect();
-
-                let targeted = context.for_target(address);
-                let mut runs = Vec::new();
-                for provider in &self.scope_providers {
-                    if !provider.applies(&targeted) {
-                        continue;
-                    }
-                    let evidence = provider.discover(&targeted).await;
-                    runs.push(ProviderRun {
-                        provider: provider.name(),
-                        evidence_count: evidence.len(),
-                        note: if evidence.is_empty() {
-                            Some("no response".to_string())
-                        } else {
-                            None
-                        },
-                    });
-                    for ev in evidence {
-                        graph.absorb(ev);
-                    }
-                }
-
-                let learned: Vec<IpNet> = graph
-                    .networks()
-                    .into_iter()
-                    .filter(|n| !before.contains(n))
-                    .collect();
-
-                if !runs.is_empty() {
-                    pivot_runs.push(PivotRun {
-                        address,
-                        runs,
-                        networks_learned: learned,
-                    });
-                }
+            let queued = interrogation_queue(&graph, &interrogated);
+            for task in &queued {
+                interrogated.insert(task.address);
             }
+            let networks_before_queue: HashSet<IpNet> = graph.networks().into_iter().collect();
+
+            let run = crate::engine::enrich::enrich_devices(
+                queued,
+                &context,
+                Arc::clone(&self.scope_providers),
+            )
+            .await;
+
+            enrichment_elapsed += run.elapsed;
+            enrichment_sequential += run.sequential_equivalent();
+            probes_attempted += run.probes_attempted();
+            for ev in run.evidence {
+                graph.absorb(ev);
+            }
+
+            // Networks learned during a concurrent pass cannot be attributed to one device
+            // without serializing the pass again, so they are recorded against the pass.
+            let learned: Vec<IpNet> = graph
+                .networks()
+                .into_iter()
+                .filter(|n| !networks_before_queue.contains(n))
+                .collect();
+            // A PivotRun is kept only for devices with established routing or bridging
+            // evidence, because that is the traversal record. Every device -- pivot,
+            // candidate and ordinary host -- is accounted for in `coverage` instead.
+            for record in &run.coverage {
+                if record.tier != crate::providers::target::DeviceTier::EstablishedPivot {
+                    continue;
+                }
+                pivot_runs.push(PivotRun {
+                    address: record.address,
+                    runs: vec![ProviderRun {
+                        provider: "device-enrichment",
+                        evidence_count: record.tcp_responsive.len()
+                            + record.protocols_confirmed.len(),
+                        note: Some(record.summary()),
+                    }],
+                    networks_learned: learned.clone(),
+                });
+            }
+            coverage.extend(run.coverage);
 
             for scope in pending {
                 if processed.len() >= self.budget.max_scopes {
@@ -305,7 +330,7 @@ impl DiscoveryEngine {
 
                 let scoped = context.for_scope(scope);
                 let mut runs = Vec::new();
-                for provider in &self.scope_providers {
+                for provider in self.scope_providers.iter() {
                     if !provider.applies(&scoped) {
                         continue;
                     }
@@ -356,6 +381,10 @@ impl DiscoveryEngine {
             graph,
             scope_runs,
             pivot_runs,
+            coverage,
+            enrichment_elapsed,
+            enrichment_sequential_equivalent: enrichment_sequential,
+            probes_attempted,
             visibility: VisibilityReport {
                 vantage: context.vantage.clone(),
                 blind_to,
@@ -436,6 +465,14 @@ pub fn is_virtual_interface(name: &str) -> bool {
     VIRTUAL_INTERFACE_PREFIXES
         .iter()
         .any(|p| lowered.starts_with(&p.to_ascii_lowercase()))
+}
+
+/// Devices still awaiting interrogation, infrastructure first.
+fn interrogation_queue(
+    graph: &TopologyGraph,
+    interrogated: &HashSet<std::net::IpAddr>,
+) -> Vec<crate::engine::enrich::DeviceTask> {
+    crate::engine::enrich::queue_from_graph(graph, interrogated)
 }
 
 #[cfg(test)]

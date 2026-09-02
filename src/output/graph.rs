@@ -470,6 +470,10 @@ mod tests {
                 runs: Vec::new(),
             }],
             pivot_runs: Vec::new(),
+            coverage: Vec::new(),
+            enrichment_elapsed: std::time::Duration::ZERO,
+            enrichment_sequential_equivalent: std::time::Duration::ZERO,
+            probes_attempted: 0,
             visibility: VisibilityReport {
                 vantage: Vantage {
                     interface: "eth0".to_string(),

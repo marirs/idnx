@@ -395,10 +395,12 @@ pub struct HostEnrichmentProvider {
 impl Default for HostEnrichmentProvider {
     fn default() -> Self {
         Self {
-            ports: vec![
-                21, 22, 23, 25, 53, 80, 139, 161, 443, 445, 554, 1234, 8000, 8080, 8443, 9100,
-                11434,
-            ],
+            // Liveness only. Every other port belongs to the per-device queue, which
+            // probes a far wider set once and attributes the result to one device;
+            // sweeping the same seventeen ports here as well probed each host twice.
+            // These three are kept because a host that ignores ICMP and has no ARP entry
+            // is otherwise invisible, and they are the ports most likely to answer.
+            ports: vec![22, 80, 443],
             max_enumerable_hosts: crate::engine::orchestrator::Budget::default()
                 .max_enumerable_hosts,
         }
@@ -596,9 +598,6 @@ pub fn network_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         Box::new(VendorDiscoveryProvider),
         Box::new(SnmpProvider),
         Box::new(HostEnrichmentProvider::default()),
-        // Runs against every interrogated device, so "interrogated" means a full protocol
-        // pass rather than a single anonymous SNMP query.
-        Box::new(crate::providers::target::TargetEnrichmentProvider::default()),
     ]
 }
 

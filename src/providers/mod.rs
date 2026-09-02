@@ -15,7 +15,10 @@ pub mod vendor;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use ipnet::IpNet;
 
@@ -100,6 +103,13 @@ pub struct DiscoveryContext {
     pub target: Option<IpAddr>,
     pub timeout: Duration,
     pub concurrency: usize,
+    /// One shared budget for every network probe in the run.
+    ///
+    /// Device-level and port-level parallelism draw on the same permits, so interrogating
+    /// many devices at once cannot multiply into `devices x ports` simultaneous sockets.
+    /// Without this the two concurrency limits compose, and the total is whatever the two
+    /// happen to multiply to.
+    pub probe_permits: Arc<Semaphore>,
     /// SNMP communities the operator supplied. Empty means the anonymous default only.
     pub snmp_communities: Vec<String>,
     pub privileged: bool,
@@ -113,6 +123,7 @@ impl DiscoveryContext {
             target: None,
             timeout,
             concurrency,
+            probe_permits: Arc::new(Semaphore::new(concurrency.max(1))),
             snmp_communities: Vec::new(),
             privileged: false,
         }
