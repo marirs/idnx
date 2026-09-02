@@ -1,0 +1,389 @@
+//! The common evidence record every discovery provider emits.
+//!
+//! Providers never mutate the topology graph directly. They return
+//! [`TopologyEvidence`], and the graph decides what that evidence supports. This is what
+//! makes a print-only provider structurally impossible: emitting evidence is the only way
+//! for a provider to report anything at all.
+
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::SystemTime;
+
+use ipnet::IpNet;
+
+/// How much weight a single fact carries.
+///
+/// This grades one fact, not a whole device. A captured advertisement is `Observed`
+/// evidence that a device transmitted a frame, while the contents of that frame are
+/// `Advertised`: the device asserted them and we have not confirmed them independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Confidence {
+    /// Derived by assumption rather than observation. Always labelled as such.
+    Inferred,
+    /// A device asserted it (an RA prefix, an LLDP system name, an SNMP route entry).
+    /// We believe the device; we have not verified the claim ourselves.
+    Advertised,
+    /// The operator supplied it on the command line.
+    UserSupplied,
+    /// We saw it directly: a frame on the wire, a kernel table entry, a live response.
+    Observed,
+}
+
+impl Confidence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Confidence::Inferred => "inferred",
+            Confidence::Advertised => "advertised",
+            Confidence::UserSupplied => "user-supplied",
+            Confidence::Observed => "observed",
+        }
+    }
+
+    /// Compact marker so the grade is visible in dense output without a legend.
+    pub fn marker(&self) -> &'static str {
+        match self {
+            Confidence::Inferred => "~",
+            Confidence::Advertised => "+",
+            Confidence::UserSupplied => "=",
+            Confidence::Observed => "*",
+        }
+    }
+}
+
+impl fmt::Display for Confidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Where a fact came from.
+///
+/// Deliberately protocol-level rather than vendor-level: no vendor is privileged, and a
+/// proprietary discovery protocol is just another source alongside DHCP or LLDP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EvidenceSource {
+    InterfaceAddress,
+    KernelRoute,
+    DefaultGateway,
+    ResolverConfig,
+    DhcpLease,
+    ArpCache,
+    NdpCache,
+    IcmpProbe,
+    TcpProbe,
+    Mdns,
+    UnicastDns,
+    Ssdp,
+    Nbns,
+    Llmnr,
+    Mndp,
+    Lldp,
+    Cdp,
+    Stp,
+    RouterAdvertisement,
+    Snmp,
+    VendorDiscovery,
+    UserSupplied,
+}
+
+impl EvidenceSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            EvidenceSource::InterfaceAddress => "interface address",
+            EvidenceSource::KernelRoute => "kernel route",
+            EvidenceSource::DefaultGateway => "default gateway",
+            EvidenceSource::ResolverConfig => "resolver config",
+            EvidenceSource::DhcpLease => "DHCP lease",
+            EvidenceSource::ArpCache => "ARP cache",
+            EvidenceSource::NdpCache => "NDP cache",
+            EvidenceSource::IcmpProbe => "ICMP probe",
+            EvidenceSource::TcpProbe => "TCP probe",
+            EvidenceSource::Mdns => "mDNS",
+            EvidenceSource::UnicastDns => "unicast DNS",
+            EvidenceSource::Ssdp => "SSDP/UPnP",
+            EvidenceSource::Nbns => "NBNS",
+            EvidenceSource::Llmnr => "LLMNR",
+            EvidenceSource::Mndp => "MNDP",
+            EvidenceSource::Lldp => "LLDP",
+            EvidenceSource::Cdp => "CDP",
+            EvidenceSource::Stp => "STP/BPDU",
+            EvidenceSource::RouterAdvertisement => "IPv6 router advertisement",
+            EvidenceSource::Snmp => "SNMP",
+            EvidenceSource::VendorDiscovery => "vendor discovery",
+            EvidenceSource::UserSupplied => "user supplied",
+        }
+    }
+
+    /// True when the source requires elevated privileges to obtain.
+    pub fn needs_privilege(&self) -> bool {
+        matches!(
+            self,
+            EvidenceSource::Lldp | EvidenceSource::Cdp | EvidenceSource::Stp
+        )
+    }
+}
+
+impl fmt::Display for EvidenceSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Stable identity for a physical or logical device.
+///
+/// A MAC identifies a device across every address it holds, which is what lets the graph
+/// recognise a router's LAN and WAN addresses as one device. An address-only key is the
+/// fallback for devices seen across a routing boundary, where no MAC is available.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DeviceKey {
+    Mac(String),
+    Address(IpAddr),
+}
+
+impl DeviceKey {
+    pub fn mac(raw: &str) -> Self {
+        DeviceKey::Mac(raw.to_ascii_lowercase())
+    }
+}
+
+impl fmt::Display for DeviceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DeviceKey::Mac(m) => write!(f, "{}", m),
+            DeviceKey::Address(a) => write!(f, "{}", a),
+        }
+    }
+}
+
+/// Behaviour that argues a device performs a network-infrastructure role.
+///
+/// Roles are scored from corroborated behaviour. A manufacturer OUI is explicitly not on
+/// this list: it identifies who built the hardware and nothing about what the device does.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RoleSignal {
+    /// This machine's default gateway.
+    DefaultGateway,
+    /// Handed out a DHCP lease, or was named as the router in one.
+    DhcpRouter,
+    /// Sent IPv6 router advertisements, or is flagged isRouter in the neighbour table.
+    RouterAdvertisement,
+    /// LLDP/CDP capability bits claiming router or bridge function.
+    LinkLayerCapability(&'static str),
+    /// Advertised a UPnP InternetGatewayDevice.
+    InternetGatewayDevice,
+    /// Answered SNMP with IP forwarding enabled, or returned a routing table.
+    SnmpForwarding,
+    /// Appeared as an intermediate hop on a path, so it forwarded our traffic.
+    ObservedForwarding,
+    /// Emitted spanning-tree BPDUs, which only a bridge does.
+    SpanningTreeBridge,
+    /// Serves DNS and a web management interface: the common SOHO router shape.
+    ManagementSurface,
+}
+
+impl RoleSignal {
+    /// Weight toward a router/switch classification.
+    ///
+    /// Scoring is explicit so that a single weak signal can never promote a device on its
+    /// own; the threshold in `role.rs` requires corroboration.
+    pub fn weight(&self) -> u32 {
+        match self {
+            RoleSignal::DefaultGateway => 100,
+            RoleSignal::SnmpForwarding => 90,
+            RoleSignal::SpanningTreeBridge => 90,
+            RoleSignal::InternetGatewayDevice => 80,
+            RoleSignal::DhcpRouter => 80,
+            RoleSignal::RouterAdvertisement => 70,
+            RoleSignal::LinkLayerCapability(_) => 70,
+            RoleSignal::ObservedForwarding => 60,
+            RoleSignal::ManagementSurface => 30,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            RoleSignal::DefaultGateway => "is this machine's default gateway".to_string(),
+            RoleSignal::DhcpRouter => "acts as a DHCP router or server".to_string(),
+            RoleSignal::RouterAdvertisement => {
+                "advertises itself as an IPv6 router (RFC 4861)".to_string()
+            }
+            RoleSignal::LinkLayerCapability(c) => {
+                format!("LLDP/CDP capability: {}", c)
+            }
+            RoleSignal::InternetGatewayDevice => {
+                "advertises a UPnP InternetGatewayDevice".to_string()
+            }
+            RoleSignal::SnmpForwarding => "SNMP reports IP forwarding".to_string(),
+            RoleSignal::ObservedForwarding => "observed forwarding traffic on a path".to_string(),
+            RoleSignal::SpanningTreeBridge => "emits spanning-tree BPDUs".to_string(),
+            RoleSignal::ManagementSurface => {
+                "serves DNS and a web management interface".to_string()
+            }
+        }
+    }
+}
+
+/// A single normalized fact produced by a provider.
+#[derive(Debug, Clone)]
+pub enum Fact {
+    /// A network exists, backed by prefix-bearing evidence.
+    ///
+    /// Only emitted when a real prefix was observed or advertised. A VLAN tag alone never
+    /// produces one of these.
+    Network { prefix: IpNet },
+
+    /// A VLAN ID was observed. The prefix is deliberately absent unless separate
+    /// prefix-bearing evidence arrives for it.
+    Vlan { id: u16 },
+
+    /// A local interface carries a network. Establishes which networks are reached through
+    /// which link, which is how virtual and VPN plumbing is told apart from physical
+    /// topology at render time.
+    InterfaceNetwork { interface: String, prefix: IpNet },
+
+    /// A device holds an address.
+    DeviceAddress { device: DeviceKey, address: IpAddr },
+
+    /// A device has a hostname.
+    DeviceHostname { device: DeviceKey, hostname: String },
+
+    /// A device's hardware vendor, from its OUI. Descriptive only; never a role.
+    DeviceVendor { device: DeviceKey, vendor: String },
+
+    /// Free-form model/description text a device published about itself.
+    DeviceDescription { device: DeviceKey, text: String },
+
+    /// Behaviour arguing the device performs an infrastructure role.
+    DeviceRoleSignal {
+        device: DeviceKey,
+        signal: RoleSignal,
+    },
+
+    /// A device is the gateway for a network.
+    GatewayFor { device: DeviceKey, network: IpNet },
+
+    /// A device routes toward a network, optionally through a next hop.
+    RoutesTo {
+        device: DeviceKey,
+        network: IpNet,
+        next_hop: Option<IpAddr>,
+    },
+
+    /// A device is attached to a network.
+    AttachedTo { device: DeviceKey, network: IpNet },
+
+    /// Two bridges are related by spanning tree.
+    BridgeLink {
+        bridge_id: String,
+        root_id: String,
+        port: Option<String>,
+    },
+
+    /// A device is reachable only through another, which forwards for it.
+    ObservedBehind { device: DeviceKey, via: DeviceKey },
+
+    /// A device terminates visibility: it forwards, but nothing behind it is observable.
+    OpaqueBoundary { device: DeviceKey, why: String },
+
+    /// A service is exposed on an address.
+    Service {
+        address: IpAddr,
+        port: u16,
+        protocol: &'static str,
+        detail: Option<String>,
+    },
+
+    /// A name resolves to an address.
+    ResolvedAs { name: String, address: IpAddr },
+}
+
+/// One fact plus the provenance required to justify it.
+#[derive(Debug, Clone)]
+pub struct TopologyEvidence {
+    pub fact: Fact,
+    pub source: EvidenceSource,
+    pub confidence: Confidence,
+    /// Which vantage observed it.
+    pub vantage: String,
+    pub observed_at: SystemTime,
+    /// Human-readable justification, rendered by the explain view.
+    pub detail: Option<String>,
+}
+
+impl TopologyEvidence {
+    pub fn new(
+        fact: Fact,
+        source: EvidenceSource,
+        confidence: Confidence,
+        vantage: impl Into<String>,
+    ) -> Self {
+        Self {
+            fact,
+            source,
+            confidence,
+            vantage: vantage.into(),
+            observed_at: SystemTime::now(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// Convenience for the common case of an IPv4 host address.
+pub fn v4(addr: Ipv4Addr) -> IpAddr {
+    IpAddr::V4(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn confidence_orders_observed_above_inferred() {
+        assert!(Confidence::Inferred < Confidence::Advertised);
+        assert!(Confidence::Advertised < Confidence::UserSupplied);
+        assert!(Confidence::UserSupplied < Confidence::Observed);
+    }
+
+    #[test]
+    fn device_key_mac_is_case_insensitive() {
+        // The same NIC must not become two devices because two sources disagreed on case.
+        assert_eq!(
+            DeviceKey::mac("AA:BB:CC:00:11:22"),
+            DeviceKey::mac("aa:bb:cc:00:11:22")
+        );
+    }
+
+    #[test]
+    fn a_single_weak_signal_scores_below_a_strong_one() {
+        // Corroboration matters: a management surface alone must not outweigh being the
+        // observed default gateway.
+        assert!(RoleSignal::ManagementSurface.weight() < RoleSignal::DefaultGateway.weight());
+    }
+
+    #[test]
+    fn vlan_fact_carries_no_prefix() {
+        // Guards the rule that a VLAN tag proves only the VLAN ID.
+        let fact = Fact::Vlan { id: 20 };
+        match fact {
+            Fact::Vlan { id } => assert_eq!(id, 20),
+            _ => panic!("expected a VLAN fact"),
+        }
+    }
+
+    #[test]
+    fn network_fact_requires_an_explicit_prefix() {
+        let fact = Fact::Network {
+            prefix: IpNet::from_str("10.20.0.0/16").unwrap(),
+        };
+        match fact {
+            Fact::Network { prefix } => assert_eq!(prefix.prefix_len(), 16),
+            _ => panic!("expected a network fact"),
+        }
+    }
+}
