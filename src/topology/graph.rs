@@ -846,8 +846,14 @@ impl TopologyGraph {
     /// route or DHCP lease, once by MAC from the neighbour cache -- and until they are
     /// merged the queue sees two devices and interrogates the same machine twice.
     /// Idempotent: a second call over an already-merged graph does nothing.
-    pub fn merge_address_identities(&mut self) {
+    ///
+    /// Returns the aliases it created, absorbed identity first. The engine keys its
+    /// interrogation ledger by device, so a device interrogated under an address key and
+    /// later merged into a MAC key would otherwise look un-interrogated and be probed and
+    /// reported a second time.
+    pub fn merge_address_identities(&mut self) -> Vec<(DeviceKey, DeviceKey)> {
         let mut merges: Vec<(NodeId, NodeId)> = Vec::new();
+        let mut aliases: Vec<(DeviceKey, DeviceKey)> = Vec::new();
         for id in self.nodes.keys() {
             let NodeId::Device(key) = id else {
                 continue;
@@ -879,6 +885,9 @@ impl TopologyGraph {
             let Some(source) = self.nodes.remove(&from) else {
                 continue;
             };
+            if let (NodeId::Device(absorbed), NodeId::Device(surviving)) = (&from, &to) {
+                aliases.push((absorbed.clone(), surviving.clone()));
+            }
 
             if let Some(target) = self.nodes.get_mut(&to) {
                 target.addresses.extend(source.addresses);
@@ -931,6 +940,8 @@ impl TopologyGraph {
                     .or_insert(edge);
             }
         }
+
+        aliases
     }
 
     /// Applies role scoring to every device node.
@@ -938,7 +949,7 @@ impl TopologyGraph {
     /// Run after all evidence is absorbed so that corroborating signals gathered by
     /// different providers are weighed together rather than in arrival order.
     pub fn finalize_roles(&mut self) {
-        self.merge_address_identities();
+        let _ = self.merge_address_identities();
 
         let assignments: Vec<(NodeId, DeviceRole)> = self
             .role_weights

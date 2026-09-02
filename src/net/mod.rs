@@ -7,4 +7,5 @@ pub mod ipv6;
 pub mod link_speed;
 pub mod mdns;
 pub mod routes;
+pub mod socket;
 pub mod vantage;

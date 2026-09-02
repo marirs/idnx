@@ -478,6 +478,7 @@ mod tests {
                 vantage: Vantage {
                     interface: "eth0".to_string(),
                     kind: VantageKind::Wired,
+                    index: 0,
                     capture_available: true,
                 },
                 blind_to: vec!["switched unicast".to_string()],

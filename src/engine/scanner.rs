@@ -561,7 +561,11 @@ pub async fn scan_subnet_ext(
     }
 
     // 5. Query UPnP / SSDP device descriptions for rich hardware metadata
-    let upnp_devices = crate::probes::upnp::discover_upnp_devices(Duration::from_millis(500)).await;
+    let upnp_devices = crate::probes::upnp::discover_upnp_devices(
+        &crate::net::socket::SocketBinding::unbound(),
+        Duration::from_millis(500),
+    )
+    .await;
     for dev in upnp_devices {
         if let Some(host) = host_results.get_mut(&dev.ip) {
             let model_opt = dev.model_description.or(dev.model_name);
@@ -597,6 +601,7 @@ pub async fn scan_subnet_ext(
             && let Some(smb_info) = crate::probes::smb::probe_smb(
                 &crate::net::endpoint::Endpoint::global(std::net::IpAddr::V4(host.ip)),
                 445,
+                &crate::net::socket::SocketBinding::unbound(),
                 Duration::from_millis(400),
             )
             .await
@@ -625,6 +630,7 @@ pub async fn scan_subnet_ext(
             && let Some(tls_info) = crate::probes::tls::probe_tls_certificate(
                 &crate::net::endpoint::Endpoint::global(std::net::IpAddr::V4(host.ip)),
                 p,
+                &crate::net::socket::SocketBinding::unbound(),
                 Duration::from_millis(400),
             )
             .await

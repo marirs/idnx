@@ -50,6 +50,7 @@ pub fn vantage_for(name: &str, privileged: bool) -> Vantage {
     Vantage {
         interface: name.to_string(),
         kind,
+        index: crate::net::endpoint::interface_index(name),
         capture_available,
     }
 }

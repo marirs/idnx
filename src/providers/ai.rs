@@ -12,10 +12,10 @@
 //! identity, after which its tools, resources and prompts are enumerated.
 
 use crate::net::endpoint::Endpoint;
+use crate::net::socket::SocketBinding;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::topology::TopologyEvidence;
@@ -255,18 +255,20 @@ pub fn parse_listing(result: &serde_json::Value, collection: &str) -> Vec<String
 }
 
 /// One HTTP request/response exchange.
+#[allow(clippy::too_many_arguments)]
 async fn http_exchange(
     ip: &Endpoint,
     port: u16,
+    binding: &SocketBinding,
     path: &str,
     method: &str,
     payload: Option<&str>,
     extra_headers: &[(String, String)],
     timeout_duration: Duration,
 ) -> Option<HttpResponse> {
-    let mut stream = timeout(timeout_duration, TcpStream::connect(ip.socket_addr(port)))
+    let mut stream = binding
+        .tcp_connect(ip.socket_addr(port), timeout_duration)
         .await
-        .ok()?
         .ok()?;
 
     let mut request = format!(
@@ -324,12 +326,14 @@ async fn http_exchange(
 pub async fn confirm_mcp(
     ip: &Endpoint,
     port: u16,
+    binding: &SocketBinding,
     path: &str,
     timeout_duration: Duration,
 ) -> Option<McpServer> {
     let response = http_exchange(
         ip,
         port,
+        binding,
         path,
         "POST",
         Some(&mcp_initialize_request()),
@@ -362,6 +366,7 @@ pub async fn confirm_mcp(
     let _ = http_exchange(
         ip,
         port,
+        binding,
         path,
         "POST",
         Some(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
@@ -386,6 +391,7 @@ pub async fn confirm_mcp(
         let Some(listing) = http_exchange(
             ip,
             port,
+            binding,
             path,
             "POST",
             Some(&mcp_list_request(id as u32, method)),
@@ -417,6 +423,7 @@ pub async fn probe_ai_services(
     target: &Endpoint,
     device: &DeviceKey,
     open_ports: &[u16],
+    binding: &SocketBinding,
     timeout_duration: Duration,
     vantage: &str,
 ) -> Vec<TopologyEvidence> {
@@ -436,7 +443,7 @@ pub async fn probe_ai_services(
 
     // Runtime detection, which already confirms via protocol endpoints rather than ports.
     if let Some(ai) =
-        crate::probes::ai::probe_ai_runtime(target, &reachable, timeout_duration).await
+        crate::probes::ai::probe_ai_runtime(target, &reachable, binding, timeout_duration).await
     {
         out.push(
             TopologyEvidence::new(
@@ -483,7 +490,8 @@ pub async fn probe_ai_services(
     // MCP, confirmed only by negotiation.
     for &port in &reachable {
         for path in ["/mcp", "/sse", "/"] {
-            let Some(server) = confirm_mcp(target, port, path, timeout_duration).await else {
+            let Some(server) = confirm_mcp(target, port, binding, path, timeout_duration).await
+            else {
                 continue;
             };
 

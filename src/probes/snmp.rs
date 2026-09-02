@@ -7,11 +7,11 @@
 //! - `ipRouteTable` (`1.3.6.1.2.1.4.21.1`) - Routing table (adjacent subnet discovery)
 //! - `ipAddrTable` (`1.3.6.1.2.1.4.20.1`) - Multi-homed interface addresses
 
+use crate::net::socket::SocketBinding;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 
 // ASN.1 BER Universal and Context Tags
 const TAG_INTEGER: u8 = 0x02;
@@ -491,13 +491,14 @@ async fn snmp_request(
     community: &str,
     pdu_type: u8,
     oid: &Oid,
+    binding: &SocketBinding,
     timeout: Duration,
 ) -> Result<SnmpMessage, String> {
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let dest = SocketAddrV4::new(target, port);
+    let socket = binding
+        .udp_socket(&std::net::SocketAddr::V4(dest))
         .await
         .map_err(|e| format!("UDP bind error: {}", e))?;
-
-    let dest = SocketAddrV4::new(target, port);
     let request_id = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -525,6 +526,7 @@ pub async fn snmp_walk(
     port: u16,
     community: &str,
     root_oid: &Oid,
+    binding: &SocketBinding,
     timeout: Duration,
     max_steps: usize,
 ) -> Vec<(Oid, BerValue)> {
@@ -538,6 +540,7 @@ pub async fn snmp_walk(
             community,
             PDU_GET_NEXT_REQUEST,
             &current_oid,
+            binding,
             timeout,
         )
         .await
@@ -603,6 +606,7 @@ pub async fn harvest_snmp_device(
     target: Ipv4Addr,
     port: u16,
     community: &str,
+    binding: &SocketBinding,
     timeout: Duration,
 ) -> Option<SnmpDeviceInfo> {
     // 1. Probe sysDescr to verify SNMP responsiveness and community validity
@@ -613,6 +617,7 @@ pub async fn harvest_snmp_device(
         community,
         PDU_GET_REQUEST,
         &sys_descr_oid,
+        binding,
         timeout,
     )
     .await
@@ -632,6 +637,7 @@ pub async fn harvest_snmp_device(
         community,
         PDU_GET_REQUEST,
         &sys_name_oid,
+        binding,
         timeout,
     )
     .await
@@ -654,7 +660,8 @@ pub async fn harvest_snmp_device(
     // .2 = ipNetToMediaPhysAddress (MAC)
     // .3 = ipNetToMediaNetAddress (IP)
     if let Ok(arp_root) = Oid::from_str(OID_IP_NET_TO_MEDIA_TABLE) {
-        let arp_results = snmp_walk(target, port, community, &arp_root, timeout, 512).await;
+        let arp_results =
+            snmp_walk(target, port, community, &arp_root, binding, timeout, 512).await;
         let mut ip_map: std::collections::HashMap<
             Vec<u32>,
             (Option<Ipv4Addr>, Option<String>, u32),
@@ -696,7 +703,8 @@ pub async fn harvest_snmp_device(
     // .7 = ipRouteNextHop
     // .11 = ipRouteMask
     if let Ok(route_root) = Oid::from_str(OID_IP_ROUTE_TABLE) {
-        let route_results = snmp_walk(target, port, community, &route_root, timeout, 256).await;
+        let route_results =
+            snmp_walk(target, port, community, &route_root, binding, timeout, 256).await;
         type RouteTuple = (Option<Ipv4Addr>, Option<Ipv4Addr>, Option<Ipv4Addr>);
         let mut route_map: std::collections::HashMap<Vec<u32>, RouteTuple> =
             std::collections::HashMap::new();
@@ -733,7 +741,8 @@ pub async fn harvest_snmp_device(
     // .1 = ipAdEntAddr
     // .3 = ipAdEntNetMask
     if let Ok(addr_root) = Oid::from_str(OID_IP_ADDR_TABLE) {
-        let addr_results = snmp_walk(target, port, community, &addr_root, timeout, 64).await;
+        let addr_results =
+            snmp_walk(target, port, community, &addr_root, binding, timeout, 64).await;
         let mut addr_map: std::collections::HashMap<
             Vec<u32>,
             (Option<Ipv4Addr>, Option<Ipv4Addr>),

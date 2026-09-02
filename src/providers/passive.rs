@@ -567,6 +567,7 @@ fn convert_unscoped(facts: &[FrameFact], interface: &str) -> Vec<TopologyEvidenc
         crate::providers::Vantage {
             interface: interface.to_string(),
             kind: crate::providers::VantageKind::Unknown,
+            index: crate::net::endpoint::interface_index(interface),
             capture_available: true,
         },
         std::time::Duration::from_millis(0),
@@ -595,6 +596,7 @@ mod tests {
             Vantage {
                 interface: "test0".to_string(),
                 kind: VantageKind::Wired,
+                index: 0,
                 capture_available: true,
             },
             Duration::from_millis(100),

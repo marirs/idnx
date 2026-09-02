@@ -48,7 +48,7 @@ This document outlines the milestones and release goals for the **idNX** project
 - [x] Ergonomic `ScannerBuilder` API (fluent builder pattern for embedding `idnx` in Rust applications).
 - [x] Clean-Room Protocol Probes (targeted handshake triggers: TLS ClientHello for X.509 cert extraction, SMB Negotiate for Windows domain/hostname).
 - [x] Interactive Network Topology Graph Export (`--export-graph topology.html` standalone force-directed visualization).
-- [x] Recursive exploration scheduler (`--recursive` & `--max-depth` flags to queue discovered subnets).
+- [x] Recursive exploration scheduler queueing discovered subnets. (The `--recursive` and `--max-depth` flags this shipped with were removed in Milestone 10: recursion is automatic and has no depth to choose.)
 - [x] Updatable 2-Tier OUI Engine (`idnx --update-oui` fetching master OUI database to `~/.cache/idnx/oui.txt`).
 
 ---
@@ -66,7 +66,7 @@ This document outlines the milestones and release goals for the **idNX** project
 - [x] Local LLM runtime detector (Ollama `11434`, LM Studio `1234`, vLLM `8000`, LocalAI `8080`, Text-generation-webui `5000`).
 - [x] Active model inventory extractor (`/v1/models` and `/api/tags` to identify loaded models like `llama3.2`, `deepseek-r1`, `qwen2.5-coder`).
 - [x] Model Context Protocol (MCP) server detector (JSON-RPC 2.0 / SSE endpoint discovery on `/sse`).
-- [x] AgentPin standard prober (`.well-known/agent-identity.json`).
+- [ ] AgentPin standard prober (`.well-known/agent-identity.json`) — **partial**. The endpoint is fetched, but the parser accepts essentially any JSON object containing a `name` field. Until the manifest schema and its identity signature are validated, a response cannot be treated as a confirmed AgentPin identity; an unsigned or malformed manifest must make the device a candidate, not a confirmation.
 - [x] Dedicated topology category: `🤖 AI Agents & LLM Runtimes` in ASCII tree, tables, HTML graph, and JSON/YAML/XML/CSV exports.
 
 ---
@@ -79,7 +79,7 @@ This document outlines the milestones and release goals for the **idNX** project
 - [x] DHCP option 3 routers ingested from the OS lease (`ipconfig getoption` on macOS, dhclient leases on Linux, `ipconfig /all` on Windows).
 - [x] LLDP/CDP management addresses fed back into discovery as pivots instead of being printed and discarded.
 - [x] Removed the hardcoded traceroute target. (TTL hop inference was retired entirely in Milestone 9: a hop proves a router interface on one path and nothing about any prefix.)
-- [x] Auto-discovered networks bounded by `--max-sweep-hosts` so a `/16` VM bridge in the kernel table cannot stall a run.
+- [x] Auto-discovered networks bounded by an internal safety budget so a `/16` VM bridge in the kernel table cannot stall a run. (Originally the `--max-sweep-hosts` flag; removed in Milestone 10, when discovery depth stopped being an operator decision.)
 - [x] Deterministic resolver selection and deterministic route/pivot ordering, so repeated runs on an unchanged network produce identical output.
 
 ---

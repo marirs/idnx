@@ -10,6 +10,8 @@ use ipnet::IpNet;
 
 use crate::engine::orchestrator::{DiscoveryReport, is_virtual_network};
 use crate::net::vantage::StartingScope;
+use crate::topology::evidence::DeviceKey;
+use crate::topology::graph::DeviceCategory;
 use crate::topology::graph::{NodeKind, Relationship};
 use crate::topology::{NodeId, TopologyGraph};
 
@@ -17,10 +19,11 @@ use crate::topology::{NodeId, TopologyGraph};
 pub fn render(report: &DiscoveryReport, start: &StartingScope) {
     render_vantage(report, start);
     render_networks(report);
-    render_infrastructure(&report.graph);
-    render_hosts(&report.graph);
-    render_boundaries(&report.graph);
-    render_device_table(&report.graph);
+    let vantage = report.visibility.vantage.interface.as_str();
+    render_infrastructure(&report.graph, vantage);
+    render_hosts(&report.graph, vantage);
+    render_boundaries(&report.graph, vantage);
+    render_device_table(&report.graph, vantage);
     render_coverage(report);
 }
 
@@ -125,7 +128,7 @@ fn render_networks(report: &DiscoveryReport) {
     }
 }
 
-fn render_infrastructure(graph: &TopologyGraph) {
+fn render_infrastructure(graph: &TopologyGraph, vantage: &str) {
     use crate::topology::graph::DeviceCategory;
 
     // Sections are mutually exclusive, so their counts sum to the unique device total. A
@@ -146,7 +149,7 @@ fn render_infrastructure(graph: &TopologyGraph) {
             devices.len().to_string().bold()
         );
         for node in devices {
-            print_device(graph, node);
+            print_device(graph, node, vantage);
         }
     }
 
@@ -161,8 +164,8 @@ fn render_infrastructure(graph: &TopologyGraph) {
     }
 }
 
-fn print_device(graph: &TopologyGraph, node: &crate::topology::Node) {
-    let addrs: Vec<String> = node.addresses.iter().map(|a| a.to_string()).collect();
+fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &str) {
+    let addrs = display_addresses(node, vantage);
     println!(
         "  ├── {} {} {}",
         node.display_name().cyan().bold(),
@@ -216,7 +219,39 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node) {
     }
 }
 
-fn render_hosts(graph: &TopologyGraph) {
+/// A device's addresses for display, routable first, link-local addresses scoped.
+///
+/// `fe80::1` on its own names no device: the same address on another link is a different
+/// device. Rendering it bare made two distinct neighbours indistinguishable.
+fn display_addresses(node: &crate::topology::graph::Node, vantage: &str) -> Vec<String> {
+    let mut routable: Vec<String> = Vec::new();
+    let mut scoped: Vec<String> = Vec::new();
+
+    for address in &node.addresses {
+        if crate::topology::graph::is_interrogable(address) {
+            routable.push(address.to_string());
+            continue;
+        }
+        // The zone comes from the identity where the identity carries one, and otherwise
+        // from the vantage: a link-local neighbour was, by definition, seen on this link.
+        let zone = match &node.id {
+            NodeId::Device(DeviceKey::ScopedAddress(_, zone)) => zone.as_str(),
+            _ => vantage,
+        };
+        scoped.push(if crate::net::endpoint::requires_zone(address) {
+            format!("{address}%{zone}")
+        } else {
+            address.to_string()
+        });
+    }
+
+    routable.sort();
+    scoped.sort();
+    routable.extend(scoped);
+    routable
+}
+
+fn render_hosts(graph: &TopologyGraph, vantage: &str) {
     use crate::topology::graph::DeviceCategory;
 
     let all_hosts = graph.devices_in(DeviceCategory::Host);
@@ -224,44 +259,18 @@ fn render_hosts(graph: &TopologyGraph) {
         return;
     }
 
-    // A device known only by a loopback or link-local address is this machine's own
-    // plumbing rather than a discovered host, but it is still counted as a device.
-    let shown: Vec<_> = all_hosts
-        .iter()
-        .copied()
-        .filter(|n| {
-            n.addresses
-                .iter()
-                .any(crate::topology::graph::is_interrogable)
-        })
-        .collect();
-
-    let omitted = all_hosts.len() - shown.len();
-    let note = if omitted > 0 {
-        format!(" ({omitted} known only by a link-local or loopback address)")
-    } else {
-        String::new()
-    };
+    // Every host is shown. Hiding those known only by a link-local address dismissed them
+    // as "this machine's plumbing", which they are not: they are discovered devices on the
+    // link, several of which answer TCP probes. The count and the list disagreeing was the
+    // visible symptom.
     println!(
-        "\n{} ({}){}",
+        "\n{} ({})",
         "Hosts".bold().green(),
-        all_hosts.len().to_string().bold(),
-        note.dimmed()
+        all_hosts.len().to_string().bold()
     );
 
-    for node in shown {
-        let mut addrs: Vec<String> = node
-            .addresses
-            .iter()
-            .filter(|a| crate::topology::graph::is_interrogable(a))
-            .map(|a| a.to_string())
-            .collect();
-        addrs.extend(
-            node.addresses
-                .iter()
-                .filter(|a| !crate::topology::graph::is_interrogable(a))
-                .map(|a| a.to_string()),
-        );
+    for node in all_hosts {
+        let addrs = display_addresses(node, vantage);
         let name = node
             .hostnames
             .iter()
@@ -291,7 +300,7 @@ fn render_hosts(graph: &TopologyGraph) {
     }
 }
 
-fn render_boundaries(graph: &TopologyGraph) {
+fn render_boundaries(graph: &TopologyGraph, vantage: &str) {
     let boundaries: Vec<_> = graph.nodes_of_kind(NodeKind::OpaqueBoundary).collect();
     if boundaries.is_empty() {
         return;
@@ -299,7 +308,7 @@ fn render_boundaries(graph: &TopologyGraph) {
 
     println!("\n{}", "Opaque boundaries".bold().yellow());
     for node in boundaries {
-        let addrs: Vec<String> = node.addresses.iter().map(|a| a.to_string()).collect();
+        let addrs = display_addresses(node, vantage);
         println!(
             "  ├── {} {}",
             node.display_name().cyan().bold(),
@@ -319,20 +328,13 @@ fn render_boundaries(graph: &TopologyGraph) {
 /// The tree shows relationships; this shows the inventory. Services live on their own nodes
 /// in the graph, so they are gathered back onto their owning device here rather than being
 /// stored twice.
-fn render_device_table(graph: &TopologyGraph) {
+fn render_device_table(graph: &TopologyGraph, vantage: &str) {
     let mut devices: Vec<&crate::topology::Node> = graph
         .nodes()
-        .filter(|n| {
-            matches!(
-                n.kind,
-                NodeKind::Router | NodeKind::Switch | NodeKind::Host | NodeKind::OpaqueBoundary
-            )
-        })
-        .filter(|n| {
-            n.addresses
-                .iter()
-                .any(crate::topology::graph::is_interrogable)
-        })
+        // No reachability filter. A device known only by a link-local address -- the IPv6
+        // router on this link among them -- is a discovered device and belongs in the
+        // inventory; omitting it made the table disagree with the sections above it.
+        .filter(|n| crate::topology::graph::categorize(n).is_some())
         .collect();
     if devices.is_empty() {
         return;
@@ -354,11 +356,11 @@ fn render_device_table(graph: &TopologyGraph) {
         ]);
 
     for node in devices {
-        let address = node
-            .addresses
-            .iter()
-            .find(|a| crate::topology::graph::is_interrogable(a))
-            .map(|a| a.to_string())
+        // Scoped addresses are shown as such: fe80::1 alone does not identify a device,
+        // because the same address on another link is another device entirely.
+        let address = display_addresses(node, vantage)
+            .first()
+            .cloned()
             .unwrap_or_default();
 
         let services = services_for(graph, node);
@@ -369,11 +371,20 @@ fn render_device_table(graph: &TopologyGraph) {
             _ => String::new(),
         };
 
+        // The presentation category, not the raw node kind. An AI system is rendered in its
+        // own section above, so labelling it "host" here contradicted the same page.
+        let category = crate::topology::graph::categorize(node);
         table.add_row(vec![
-            Cell::new(node.kind.label()).fg(match node.kind {
-                NodeKind::Router => TableColor::Blue,
-                NodeKind::Switch => TableColor::Magenta,
-                NodeKind::OpaqueBoundary => TableColor::Yellow,
+            Cell::new(
+                category
+                    .map(|c| c.label())
+                    .unwrap_or_else(|| node.kind.label()),
+            )
+            .fg(match category {
+                Some(DeviceCategory::Router) => TableColor::Blue,
+                Some(DeviceCategory::Switch) => TableColor::Magenta,
+                Some(DeviceCategory::OpaqueBoundary) => TableColor::Yellow,
+                Some(DeviceCategory::AiSystem) => TableColor::Green,
                 _ => TableColor::White,
             }),
             Cell::new(address),
@@ -416,20 +427,79 @@ fn render_device_table(graph: &TopologyGraph) {
 }
 
 /// Service descriptions belonging to a device, gathered from its addresses.
+/// One line per service port, carrying its strongest description.
+///
+/// Collapsed by port across every address the device answers on. A dual-stack device is
+/// probed at both of its addresses, producing a service node per address, and a port that
+/// answered on both was printed twice -- once bare and once with whatever the protocol
+/// handshake established, as though two services had been found. Every record is retained
+/// in the graph and in exports; only the display is collapsed.
 fn services_for(graph: &TopologyGraph, node: &crate::topology::Node) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    let mut best: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+
     for service in graph.nodes_of_kind(NodeKind::Service) {
-        let NodeId::Service(addr, _) = &service.id else {
+        let NodeId::Service(addr, port) = &service.id else {
             continue;
         };
         if !node.addresses.contains(addr) {
             continue;
         }
-        out.extend(service.descriptions.iter().cloned());
+        let Some(description) = strongest_description(service, *port) else {
+            continue;
+        };
+        best.entry(*port)
+            .and_modify(|current| {
+                if description.len() > current.len() {
+                    *current = description.clone();
+                }
+            })
+            .or_insert(description);
     }
-    out.sort();
-    out.dedup();
-    out
+
+    best.into_values().collect()
+}
+
+/// The most informative description a service node holds.
+///
+/// A confirmed protocol beats a bare open port. Where several are confirmed, the longest is
+/// the one carrying the most identity -- a certificate subject or a server banner rather
+/// than a protocol name alone.
+fn strongest_description(service: &crate::topology::Node, port: u16) -> Option<String> {
+    service
+        .descriptions
+        .iter()
+        .filter(|d| {
+            !d.contains("protocol not yet confirmed") && !d.contains("protocol unconfirmed")
+        })
+        .max_by_key(|d| d.len())
+        .cloned()
+        .or_else(|| service.descriptions.iter().next().cloned())
+        .or_else(|| Some(format!("{port}/tcp")))
+}
+
+/// Sorts an endpoint string by address rather than lexically, so .9 precedes .10.
+fn parse_sort_key(endpoint: Option<&str>) -> (u8, Option<std::net::IpAddr>, String) {
+    let Some(endpoint) = endpoint else {
+        return (2, None, String::new());
+    };
+    let bare = endpoint.split('%').next().unwrap_or(endpoint);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(address) => (0, Some(address), endpoint.to_string()),
+        Err(_) => (1, None, endpoint.to_string()),
+    }
+}
+
+/// How a device was prioritised in the work queue.
+///
+/// Deliberately not a role name. The tier decides scheduling order only; the role comes
+/// from what the device's answers contain and is rendered in the topology sections.
+fn scheduling_priority(tier: crate::providers::target::DeviceTier) -> &'static str {
+    use crate::providers::target::DeviceTier;
+    match tier {
+        DeviceTier::EstablishedPivot => "infrastructure first",
+        DeviceTier::Candidate => "elevated",
+        DeviceTier::Host => "normal",
+    }
 }
 
 /// Per-device interrogation coverage.
@@ -451,7 +521,15 @@ fn render_device_coverage(report: &DiscoveryReport) {
         report.probes_attempted,
     );
 
-    for record in &report.coverage {
+    // Ordered by address for reading. The ledger itself is keyed by device, so its own
+    // order follows identity rather than anything an operator would scan down.
+    let mut records: Vec<&crate::providers::target::DeviceCoverage> =
+        report.coverage.iter().collect();
+    records.sort_by(|a, b| {
+        parse_sort_key(a.primary_endpoint()).cmp(&parse_sort_key(b.primary_endpoint()))
+    });
+
+    for record in records {
         println!(
             "  {} {}",
             record
@@ -459,7 +537,9 @@ fn render_device_coverage(report: &DiscoveryReport) {
                 .unwrap_or(&record.device.to_string())
                 .cyan()
                 .bold(),
-            format!("[{}]", record.tier).dimmed()
+            // The scheduling tier, not the device's role: a device the graph later scores
+            // as a router was rendered here as "[host]", contradicting the sections above.
+            format!("priority: {}", scheduling_priority(record.tier)).dimmed()
         );
         if record.addresses.len() > 1 {
             println!(

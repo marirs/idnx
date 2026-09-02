@@ -17,13 +17,30 @@ pub struct Endpoint {
     pub address: IpAddr,
     /// Interface name for a link-local address. `None` for anything globally routed.
     pub zone: Option<String>,
+    /// Kernel scope index for that interface.
+    ///
+    /// Carried alongside the name rather than resolved from it at the socket. On Windows a
+    /// zone *is* the numeric index and no name exists to look up, so resolving by name
+    /// there produced scope 0 and an unroutable destination.
+    pub zone_index: u32,
 }
 
 impl Endpoint {
+    /// Builds an endpoint, resolving the zone name to a scope index.
     pub fn new(address: IpAddr, zone: Option<String>) -> Self {
+        let index = zone.as_deref().map(interface_index).unwrap_or(0);
+        Self::scoped(address, zone, index)
+    }
+
+    /// Builds an endpoint with a scope index already known.
+    pub fn scoped(address: IpAddr, zone: Option<String>, zone_index: u32) -> Self {
         // A zone on a routable address is meaningless and would only be noise in output.
-        let zone = zone.filter(|_| requires_zone(&address));
-        Self { address, zone }
+        let needs_zone = requires_zone(&address);
+        Self {
+            address,
+            zone: zone.filter(|_| needs_zone),
+            zone_index: if needs_zone { zone_index } else { 0 },
+        }
     }
 
     /// Address with no link qualification.
@@ -31,6 +48,7 @@ impl Endpoint {
         Self {
             address,
             zone: None,
+            zone_index: 0,
         }
     }
 
@@ -45,10 +63,7 @@ impl Endpoint {
     pub fn socket_addr(&self, port: u16) -> SocketAddr {
         match self.address {
             IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), port),
-            IpAddr::V6(v6) => {
-                let scope = self.zone.as_deref().map(scope_index).unwrap_or(0);
-                SocketAddr::V6(SocketAddrV6::new(v6, port, 0, scope))
-            }
+            IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, self.zone_index)),
         }
     }
 
@@ -87,8 +102,11 @@ pub fn is_link_local(address: &Ipv6Addr) -> bool {
 }
 
 /// Resolves an interface name to the kernel's scope index.
+///
+/// Unix only. On Windows a zone is written as the numeric index directly and there is no
+/// name to resolve; the index is carried from the vantage instead.
 #[cfg(unix)]
-fn scope_index(name: &str) -> u32 {
+pub fn interface_index(name: &str) -> u32 {
     let Ok(cstr) = std::ffi::CString::new(name) else {
         return 0;
     };
@@ -96,11 +114,11 @@ fn scope_index(name: &str) -> u32 {
     unsafe { libc::if_nametoindex(cstr.as_ptr()) }
 }
 
-/// On Windows a zone is written as the numeric index directly, so there is nothing to look
-/// up; an unparseable zone yields 0, which fails the connection rather than reaching the
-/// wrong link.
+/// Windows has no name-to-index lookup in libc, and a friendly name such as `Ethernet 2` is
+/// not a number. Callers supply the index from the vantage, which obtained it from the
+/// platform; anything reaching here is already a numeric zone or is unusable.
 #[cfg(not(unix))]
-fn scope_index(name: &str) -> u32 {
+pub fn interface_index(name: &str) -> u32 {
     name.parse().unwrap_or(0)
 }
 

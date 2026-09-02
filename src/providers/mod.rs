@@ -79,6 +79,12 @@ impl VantageKind {
 pub struct Vantage {
     pub interface: String,
     pub kind: VantageKind,
+    /// Kernel scope index for this interface.
+    ///
+    /// Carried rather than derived from the name at the point of use. On Windows an IPv6
+    /// zone is a numeric index and there is no name to resolve, so parsing the friendly
+    /// name as an integer yielded scope 0 and an address the kernel could not route.
+    pub index: u32,
     /// Whether raw link-layer capture is possible here (privileges plus platform support).
     pub capture_available: bool,
 }
@@ -103,6 +109,13 @@ pub struct DiscoveryContext {
     pub target: Option<IpAddr>,
     pub timeout: Duration,
     pub concurrency: usize,
+    /// Local addresses every active probe originates from.
+    ///
+    /// Naming an interface must constrain the traffic, not only the target list: an
+    /// unbound socket follows ordinary OS routing and can leave through a different
+    /// interface entirely, producing evidence attributed to a vantage that never carried
+    /// it.
+    pub binding: Arc<crate::net::socket::SocketBinding>,
     /// One shared budget for every network probe in the run.
     ///
     /// Device-level and port-level parallelism draw on the same permits, so interrogating
@@ -117,12 +130,19 @@ pub struct DiscoveryContext {
 
 impl DiscoveryContext {
     pub fn seed(vantage: Vantage, timeout: Duration, concurrency: usize) -> Self {
+        let interface = vantage.interface.clone();
+        let index = vantage.index;
         Self {
             vantage,
             scope: None,
             target: None,
             timeout,
             concurrency,
+            binding: Arc::new(crate::net::socket::SocketBinding::for_interface(
+                &interface,
+                &crate::net::interface::list_interface_addresses(),
+                index,
+            )),
             probe_permits: Arc::new(Semaphore::new(concurrency.max(1))),
             snmp_communities: Vec::new(),
             privileged: false,

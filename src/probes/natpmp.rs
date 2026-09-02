@@ -8,7 +8,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
+use crate::net::socket::SocketBinding;
 use tokio::time::timeout;
 
 /// The port NAT-PMP and PCP both listen on.
@@ -67,10 +67,14 @@ pub fn parse_external_address_response(data: &[u8]) -> Option<NatPmpResponse> {
 /// whether it routes.
 pub async fn probe_nat_gateway(
     target: Ipv4Addr,
+    binding: &SocketBinding,
     timeout_duration: Duration,
 ) -> Option<Option<Ipv4Addr>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
     let destination = SocketAddrV4::new(target, NAT_PMP_PORT);
+    let socket = binding
+        .udp_socket(&std::net::SocketAddr::V4(destination))
+        .await
+        .ok()?;
 
     socket
         .send_to(&external_address_request(), destination)

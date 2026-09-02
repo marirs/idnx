@@ -12,9 +12,9 @@
 use std::time::Duration;
 
 use crate::net::endpoint::Endpoint;
+use crate::net::socket::SocketBinding;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 /// Ports worth asking for an HTTP response.
@@ -112,15 +112,13 @@ fn extract_title(response: &str) -> Option<String> {
 pub async fn probe_http(
     target: &Endpoint,
     port: u16,
+    binding: &SocketBinding,
     timeout_duration: Duration,
 ) -> Option<HttpIdentity> {
-    let mut stream = timeout(
-        timeout_duration,
-        TcpStream::connect(target.socket_addr(port)),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut stream = binding
+        .tcp_connect(target.socket_addr(port), timeout_duration)
+        .await
+        .ok()?;
 
     // HEAD would skip the body, and with it the page title that most often carries the
     // model name. `Connection: close` keeps the read from waiting on keep-alive.

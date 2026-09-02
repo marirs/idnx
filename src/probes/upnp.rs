@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
+
+use crate::net::socket::SocketBinding;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -67,7 +68,10 @@ struct UpnpDescription {
     device_type: Option<String>,
 }
 
-async fn fetch_upnp_description(location_url: &str) -> Option<UpnpDescription> {
+async fn fetch_upnp_description(
+    location_url: &str,
+    binding: &SocketBinding,
+) -> Option<UpnpDescription> {
     // Parse URL: http://host:port/path
     let stripped = location_url.strip_prefix("http://")?;
     let slash_pos = stripped.find('/')?;
@@ -82,10 +86,12 @@ async fn fetch_upnp_description(location_url: &str) -> Option<UpnpDescription> {
         (host_port, 80)
     };
 
-    let addr = format!("{}:{}", host, port);
-    let mut stream = timeout(Duration::from_millis(600), TcpStream::connect(&addr))
+    // Resolved rather than passed as a string, so the connection can be bound to the
+    // interface the advertisement arrived on.
+    let destination: std::net::SocketAddr = format!("{host}:{port}").parse().ok()?;
+    let mut stream = binding
+        .tcp_connect(destination, Duration::from_millis(600))
         .await
-        .ok()?
         .ok()?;
 
     let req = format!(
@@ -120,13 +126,16 @@ async fn fetch_upnp_description(location_url: &str) -> Option<UpnpDescription> {
 }
 
 /// Broadcasts SSDP M-SEARCH query and fetches device descriptions for routers/gateways
-pub async fn discover_upnp_devices(timeout_duration: Duration) -> Vec<UpnpDevice> {
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+pub async fn discover_upnp_devices(
+    binding: &SocketBinding,
+    timeout_duration: Duration,
+) -> Vec<UpnpDevice> {
+    // SSDP is link-local multicast. Sent from the wrong interface it reaches a different
+    // link entirely, and every answer would be attributed to a vantage that never sent it.
+    let socket = match binding.udp_broadcast().await {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-
-    let _ = socket.set_broadcast(true);
 
     let msg = b"M-SEARCH * HTTP/1.1\r\n\
 HOST: 239.255.255.250:1900\r\n\
@@ -205,7 +214,7 @@ ST: ssdp:all\r\n\r\n";
         // publish several and refuse some of them.
         let mut described = None;
         for loc in &device_locations {
-            if let Some(d) = fetch_upnp_description(loc).await {
+            if let Some(d) = fetch_upnp_description(loc, binding).await {
                 described = Some(d);
                 break;
             }

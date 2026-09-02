@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use super::DiscoveryContext;
 use crate::net::endpoint::Endpoint;
+use crate::net::socket::SocketBinding;
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{
     Capability, Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal,
@@ -49,7 +50,7 @@ pub const STAGE_TWO_PORTS: &[u16] = &[
 ];
 
 /// UDP control-plane probes, which need no open TCP port to reach a device.
-const CONTROL_PLANE_UDP_PORTS: &[u16] = &[crate::probes::natpmp::NAT_PMP_PORT];
+const CONTROL_PLANE_UDP_PORTS: &[u16] = &[crate::probes::natpmp::NAT_PMP_PORT, 53];
 
 /// Why a device is being interrogated.
 ///
@@ -304,7 +305,17 @@ pub async fn interrogate_device(
     // The UDP control plane needs no open TCP port, and NAT-PMP is IPv4 by definition.
     if primary.is_ipv4() {
         coverage.udp_attempted.extend(CONTROL_PLANE_UDP_PORTS);
-        out.extend(probe_control_plane(&primary, &device, timeout, vantage, &mut coverage).await);
+        out.extend(
+            probe_control_plane(
+                &primary,
+                &device,
+                &context.binding,
+                timeout,
+                vantage,
+                &mut coverage,
+            )
+            .await,
+        );
     }
 
     // Stage 2 broadens. It runs for any device already known to be alive -- an ARP or NDP
@@ -353,6 +364,7 @@ pub async fn interrogate_device(
                 &primary,
                 &device,
                 &open_ports,
+                &context.binding,
                 timeout,
                 vantage,
                 &mut coverage,
@@ -364,6 +376,7 @@ pub async fn interrogate_device(
                 &primary,
                 &device,
                 &open_ports,
+                &context.binding,
                 timeout.max(Duration::from_millis(600)),
                 vantage,
             )
@@ -459,10 +472,12 @@ async fn sweep_ports(
 }
 
 /// Confirms protocols on ports that answered.
+#[allow(clippy::too_many_arguments)]
 async fn confirm_protocols(
     target: &Endpoint,
     device: &DeviceKey,
     open_ports: &[u16],
+    binding: &SocketBinding,
     timeout: Duration,
     vantage: &str,
     coverage: &mut DeviceCoverage,
@@ -475,7 +490,9 @@ async fn confirm_protocols(
         if !matches!(port, 443 | 8443 | 4443 | 993 | 995 | 8006 | 32400) {
             continue;
         }
-        if let Some(cert) = crate::probes::tls::probe_tls_certificate(target, port, timeout).await {
+        if let Some(cert) =
+            crate::probes::tls::probe_tls_certificate(target, port, binding, timeout).await
+        {
             coverage.protocols_confirmed.push(format!("tls/{port}"));
             let common_name = cert.common_name.clone().unwrap_or_default();
             let mut description = if common_name.is_empty() {
@@ -535,7 +552,7 @@ async fn confirm_protocols(
     // SMB identity: hostname and domain, which no port number could tell us.
     if open_ports.contains(&445) || open_ports.contains(&139) {
         let port = if open_ports.contains(&445) { 445 } else { 139 };
-        if let Some(smb) = crate::probes::smb::probe_smb(target, port, timeout).await {
+        if let Some(smb) = crate::probes::smb::probe_smb(target, port, binding, timeout).await {
             coverage.protocols_confirmed.push(format!("smb/{port}"));
             if let Some(name) = smb.dns_computer_name.clone().or(smb.computer_name.clone()) {
                 out.push(TopologyEvidence::new(
@@ -573,38 +590,16 @@ async fn confirm_protocols(
         }
     }
 
-    // DNS: an open port 53 is reachability, not a resolver. This asks an actual DNS
-    // question and requires a well-formed answer to the transaction it sent, which is what
-    // separates a resolver from a service that happens to sit on that port.
+    // DNS over TCP, for a resolver that answers only there. UDP was already attempted in
+    // the control plane, so this runs only when that found nothing.
     if open_ports.contains(&53)
-        && let Some(identity) = crate::probes::dns::confirm_dns(target, timeout).await
+        && !coverage
+            .protocols_confirmed
+            .iter()
+            .any(|p| p.starts_with("dns/"))
+        && let Some(identity) = crate::probes::dns::confirm_dns_tcp(target, binding, timeout).await
     {
-        coverage.protocols_confirmed.push("dns/53".to_string());
-        let detail = match &identity.version {
-            Some(version) => format!("answered a DNS query ({version})"),
-            None => format!("answered a DNS query (rcode {})", identity.response_code),
-        };
-        out.push(TopologyEvidence::new(
-            Fact::DeviceCapability {
-                device: device.clone(),
-                capability: Capability::DnsServer,
-                detail: Some(detail.clone()),
-            },
-            EvidenceSource::UnicastDns,
-            Confidence::Observed,
-            vantage,
-        ));
-        out.push(TopologyEvidence::new(
-            Fact::Service {
-                address,
-                port: 53,
-                protocol: "tcp",
-                detail: Some(detail),
-            },
-            EvidenceSource::UnicastDns,
-            Confidence::Observed,
-            vantage,
-        ));
+        out.extend(dns_evidence(target, device, &identity, vantage, coverage));
     }
 
     // HTTP: the status line, Server header and page title are the device describing
@@ -614,7 +609,8 @@ async fn confirm_protocols(
         if !crate::probes::http::HTTP_PORTS.contains(&port) {
             continue;
         }
-        let Some(identity) = crate::probes::http::probe_http(target, port, timeout).await else {
+        let Some(identity) = crate::probes::http::probe_http(target, port, binding, timeout).await
+        else {
             continue;
         };
         coverage.protocols_confirmed.push(format!("http/{port}"));
@@ -669,6 +665,7 @@ async fn confirm_protocols(
 async fn probe_control_plane(
     target: &Endpoint,
     device: &DeviceKey,
+    binding: &SocketBinding,
     timeout: Duration,
     vantage: &str,
     coverage: &mut DeviceCoverage,
@@ -686,7 +683,7 @@ async fn probe_control_plane(
 
     // NAT-PMP: only a NAT gateway answers, so a reply is direct role evidence and needs no
     // credentials. This reaches routers that expose no TCP service at all.
-    if let Some(external) = crate::probes::natpmp::probe_nat_gateway(v4, timeout).await {
+    if let Some(external) = crate::probes::natpmp::probe_nat_gateway(v4, binding, timeout).await {
         coverage.protocols_confirmed.push("nat-pmp".to_string());
         out.push(
             TopologyEvidence::new(
@@ -715,7 +712,65 @@ async fn probe_control_plane(
         ));
     }
 
+    // DNS over UDP, attempted regardless of whether TCP 53 answered. Gating confirmation
+    // on an open TCP port missed every UDP-only resolver and every device with TCP 53
+    // filtered -- between them, most resolvers on a home or office network. An open port
+    // is reachability, not a protocol; this asks an actual question and requires a
+    // well-formed answer carrying the transaction id it sent.
+    if let Some(identity) = crate::probes::dns::confirm_dns_udp(target, binding, timeout).await {
+        out.extend(dns_evidence(target, device, &identity, vantage, coverage));
+    }
+
     out
+}
+
+/// Builds the evidence for a confirmed resolver.
+///
+/// The transport is recorded rather than assumed: labelling a UDP-only resolver's service
+/// "tcp" would be false, and it is exactly the common case.
+fn dns_evidence(
+    target: &Endpoint,
+    device: &DeviceKey,
+    identity: &crate::probes::dns::DnsIdentity,
+    vantage: &str,
+    coverage: &mut DeviceCoverage,
+) -> Vec<TopologyEvidence> {
+    let transport = identity.transport.label();
+    coverage
+        .protocols_confirmed
+        .push(format!("dns/53/{transport}"));
+
+    let detail = match &identity.version {
+        Some(version) => format!("answered a DNS query over {transport} ({version})"),
+        None => format!(
+            "answered a DNS query over {transport} (rcode {})",
+            identity.response_code
+        ),
+    };
+
+    vec![
+        TopologyEvidence::new(
+            Fact::DeviceCapability {
+                device: device.clone(),
+                capability: Capability::DnsServer,
+                detail: Some(detail.clone()),
+            },
+            EvidenceSource::UnicastDns,
+            Confidence::Observed,
+            vantage,
+        ),
+        TopologyEvidence::new(
+            Fact::Service {
+                address: target.address,
+                port: 53,
+                protocol: transport,
+                detail: Some(detail),
+            },
+            EvidenceSource::UnicastDns,
+            Confidence::Observed,
+            vantage,
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -728,6 +783,7 @@ mod tests {
             Vantage {
                 interface: "test0".to_string(),
                 kind: VantageKind::Wired,
+                index: 0,
                 capture_available: false,
             },
             Duration::from_millis(50),

@@ -12,10 +12,29 @@
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
 use crate::net::endpoint::Endpoint;
+use crate::net::socket::SocketBinding;
+
+/// Which transport carried the answer.
+///
+/// Recorded because it is not interchangeable: a resolver that answers UDP but has TCP 53
+/// filtered is common, and labelling its service "tcp" would be simply false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsTransport {
+    Udp,
+    Tcp,
+}
+
+impl DnsTransport {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DnsTransport::Udp => "udp",
+            DnsTransport::Tcp => "tcp",
+        }
+    }
+}
 
 /// What a resolver disclosed about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +43,8 @@ pub struct DnsIdentity {
     pub response_code: u8,
     /// Contents of a `version.bind` TXT answer, where the server published one.
     pub version: Option<String>,
+    /// The transport the answer arrived over.
+    pub transport: DnsTransport,
 }
 
 /// Builds a `version.bind` CHAOS TXT query.
@@ -69,6 +90,8 @@ pub fn parse_dns_response(data: &[u8], transaction_id: u16) -> Option<DnsIdentit
     Some(DnsIdentity {
         response_code,
         version: extract_txt_answer(data, question_count, answer_count),
+        // Overwritten by the caller that owns the socket; parsing alone cannot know.
+        transport: DnsTransport::Udp,
     })
 }
 
@@ -122,21 +145,61 @@ fn skip_name(data: &[u8], mut cursor: usize) -> Option<usize> {
     }
 }
 
-/// Asks a device to answer a DNS query.
+/// Asks a device to answer a DNS query over UDP.
 ///
-/// Tries UDP first, as every resolver serves it, then TCP for a device that answers only
-/// there. `None` means it did not answer DNS, which says nothing else about it.
-pub async fn confirm_dns(target: &Endpoint, timeout_duration: Duration) -> Option<DnsIdentity> {
+/// Independent of whether TCP 53 is open. Gating DNS confirmation on an open TCP port
+/// missed every UDP-only resolver and every device with TCP 53 filtered, which between
+/// them are most resolvers on a home or office network.
+pub async fn confirm_dns_udp(
+    target: &Endpoint,
+    binding: &SocketBinding,
+    timeout_duration: Duration,
+) -> Option<DnsIdentity> {
+    let transaction_id = transaction_id_for(target);
+    let query = version_bind_query(transaction_id);
+    let mut identity =
+        confirm_over_udp(target, binding, &query, transaction_id, timeout_duration).await?;
+    identity.transport = DnsTransport::Udp;
+    Some(identity)
+}
+
+/// Asks a device to answer a DNS query over TCP.
+pub async fn confirm_dns_tcp(
+    target: &Endpoint,
+    binding: &SocketBinding,
+    timeout_duration: Duration,
+) -> Option<DnsIdentity> {
+    let transaction_id = transaction_id_for(target);
+    let query = version_bind_query(transaction_id);
+    let mut identity =
+        confirm_over_tcp(target, binding, &query, transaction_id, timeout_duration).await?;
+    identity.transport = DnsTransport::Tcp;
+    Some(identity)
+}
+
+/// Asks a device to answer a DNS query, over UDP first and then TCP.
+///
+/// `None` means it did not answer DNS, which says nothing else about it.
+pub async fn confirm_dns(
+    target: &Endpoint,
+    binding: &SocketBinding,
+    timeout_duration: Duration,
+) -> Option<DnsIdentity> {
     // Derived from the address so a run is reproducible, while still differing between
     // devices so that a stray response cannot match every probe.
     let transaction_id = transaction_id_for(target);
     let query = version_bind_query(transaction_id);
 
-    if let Some(identity) = confirm_over_udp(target, &query, transaction_id, timeout_duration).await
+    if let Some(mut identity) =
+        confirm_over_udp(target, binding, &query, transaction_id, timeout_duration).await
     {
+        identity.transport = DnsTransport::Udp;
         return Some(identity);
     }
-    confirm_over_tcp(target, &query, transaction_id, timeout_duration).await
+    let mut identity =
+        confirm_over_tcp(target, binding, &query, transaction_id, timeout_duration).await?;
+    identity.transport = DnsTransport::Tcp;
+    Some(identity)
 }
 
 fn transaction_id_for(target: &Endpoint) -> u16 {
@@ -153,17 +216,13 @@ fn transaction_id_for(target: &Endpoint) -> u16 {
 
 async fn confirm_over_udp(
     target: &Endpoint,
+    binding: &SocketBinding,
     query: &[u8],
     transaction_id: u16,
     timeout_duration: Duration,
 ) -> Option<DnsIdentity> {
-    let bind = if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind).await.ok()?;
     let destination = target.socket_addr(53);
+    let socket = binding.udp_socket(&destination).await.ok()?;
     socket.send_to(query, destination).await.ok()?;
 
     let mut buf = [0u8; 1500];
@@ -180,13 +239,14 @@ async fn confirm_over_udp(
 
 async fn confirm_over_tcp(
     target: &Endpoint,
+    binding: &SocketBinding,
     query: &[u8],
     transaction_id: u16,
     timeout_duration: Duration,
 ) -> Option<DnsIdentity> {
-    let mut stream = timeout(timeout_duration, TcpStream::connect(target.socket_addr(53)))
+    let mut stream = binding
+        .tcp_connect(target.socket_addr(53), timeout_duration)
         .await
-        .ok()?
         .ok()?;
 
     // DNS over TCP prefixes each message with its length.
@@ -301,6 +361,16 @@ mod tests {
         response.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x10]);
         let identity = parse_dns_response(&response, 0x0009).expect("a response");
         assert!(identity.version.is_none());
+    }
+
+    #[test]
+    fn the_transport_is_recorded_rather_than_assumed() {
+        // A resolver answering UDP with TCP 53 filtered is common; labelling its service
+        // "tcp" would be false.
+        let response = header(0x1234, [0x81, 0x80], [1, 0, 0, 0]);
+        let parsed = parse_dns_response(&response, 0x1234).expect("a response");
+        assert_eq!(parsed.transport, DnsTransport::Udp);
+        assert_eq!(DnsTransport::Tcp.label(), "tcp");
     }
 
     #[test]

@@ -15,6 +15,8 @@ use idnx::topology::evidence::{
 use idnx::topology::graph::{DeviceCategory, TopologyGraph};
 
 const VANTAGE: &str = "test0";
+/// Any non-zero index: the value only has to be carried through unchanged.
+const VANTAGE_INDEX: u32 = 3;
 
 /// Structural summary of a graph: what it found, with no identity text in it.
 ///
@@ -241,7 +243,7 @@ fn an_oui_from_the_arp_table_still_selects_its_adapter() {
     ));
     graph.finalize_roles();
 
-    let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+    let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
     assert_eq!(queue.len(), 1);
 
     let selected: Vec<&'static str> = adapters()
@@ -273,7 +275,7 @@ fn an_ipv6_only_neighbour_is_queued_with_a_reachable_endpoint() {
     ));
     graph.finalize_roles();
 
-    let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+    let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].endpoints.len(), 1);
     assert_eq!(queue[0].endpoints[0].to_string(), "fd00:1234::aa");
@@ -319,5 +321,77 @@ fn open_ports_alone_confer_no_capability_and_no_role() {
         node.capabilities.is_empty(),
         "an open port is reachability, not a confirmed protocol: {:?}",
         node.capabilities
+    );
+}
+
+/// A device interrogated under one identity must not be interrogated again after it merges.
+///
+/// The interrogation ledger is keyed by device. An address-keyed identity that later folds
+/// into a MAC-keyed one leaves the ledger holding a key nothing refers to any more, so the
+/// device looks un-interrogated and is probed and reported a second time.
+#[test]
+fn a_late_arriving_mac_identity_does_not_reinterrogate_the_device() {
+    use idnx::engine::enrich::queue_from_graph;
+    use std::collections::HashSet;
+
+    let mut graph = TopologyGraph::new();
+    let address: std::net::IpAddr = "10.4.0.1".parse().unwrap();
+    let by_address = DeviceKey::Address(address);
+    let by_mac = DeviceKey::Mac("02:00:5e:00:00:cc".to_string());
+
+    // First the device is known only by address, as a kernel route or DHCP lease names it.
+    graph.absorb(evidence(
+        Fact::DeviceAddress {
+            device: by_address.clone(),
+            address,
+        },
+        EvidenceSource::KernelRoute,
+        Confidence::Observed,
+    ));
+
+    let first_pass = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
+    assert_eq!(first_pass.len(), 1);
+    let mut interrogated: HashSet<DeviceKey> =
+        first_pass.into_iter().map(|task| task.device).collect();
+
+    // Then the neighbour cache names the same address by MAC, and the identities merge.
+    graph.absorb(evidence(
+        Fact::DeviceAddress {
+            device: by_mac.clone(),
+            address,
+        },
+        EvidenceSource::ArpCache,
+        Confidence::Observed,
+    ));
+    let aliases = graph.merge_address_identities();
+    assert!(
+        aliases
+            .iter()
+            .any(|(from, to)| *from == by_address && *to == by_mac),
+        "the merge must report the alias it created: {aliases:?}"
+    );
+
+    // Remapping the ledger onto the surviving identity is what prevents the second pass.
+    for (absorbed, surviving) in &aliases {
+        if interrogated.remove(absorbed) {
+            interrogated.insert(surviving.clone());
+        }
+    }
+
+    let second_pass = queue_from_graph(&graph, &interrogated, VANTAGE, VANTAGE_INDEX);
+    assert!(
+        second_pass.is_empty(),
+        "the device was already interrogated under its earlier identity: {:?}",
+        second_pass
+            .iter()
+            .map(|t| t.device.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // Without the remapping it would be queued again, which is the defect being pinned.
+    let stale: HashSet<DeviceKey> = [by_address].into_iter().collect();
+    assert_eq!(
+        queue_from_graph(&graph, &stale, VANTAGE, VANTAGE_INDEX).len(),
+        1
     );
 }

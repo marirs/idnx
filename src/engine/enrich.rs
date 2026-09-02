@@ -142,13 +142,16 @@ fn proves_liveness(source: EvidenceSource) -> bool {
     )
 }
 
-/// Orders a device's addresses by how useful they are as a probe destination.
+/// Orders every probeable address a device has, most preferred first.
 ///
-/// A routable address is preferred over a link-local one, which needs a zone and only works
-/// from the link it was seen on. Within a family the choice is stable so that repeated runs
-/// probe the same address and their coverage records line up.
-fn preferred_endpoints(node: &Node, vantage: &str) -> Vec<Endpoint> {
-    let mut endpoints: Vec<Endpoint> = Vec::new();
+/// All of them are kept. Keeping one per family discarded real addresses -- a device with
+/// two IPv4 addresses on different networks had one silently dropped -- and the choice was
+/// nondeterministic besides, because it took the first element of a set whose iteration
+/// order is not stable across runs.
+///
+/// Preference order: IPv4, then routable IPv6, then link-local IPv6, each sorted, so
+/// repeated runs probe in the same order and their coverage records line up.
+fn preferred_endpoints(node: &Node, vantage: &str, index: u32) -> Vec<Endpoint> {
     let mut v4: Vec<IpAddr> = Vec::new();
     let mut v6_routable: Vec<IpAddr> = Vec::new();
     let mut v6_link_local: Vec<IpAddr> = Vec::new();
@@ -166,19 +169,21 @@ fn preferred_endpoints(node: &Node, vantage: &str) -> Vec<Endpoint> {
         }
     }
 
-    // One endpoint per family. Several addresses in the same family are the same stack on
-    // the same device; probing each of them repeats identical work.
-    if let Some(address) = v4.first() {
-        endpoints.push(Endpoint::global(*address));
-    }
-    if let Some(address) = v6_routable.first() {
-        endpoints.push(Endpoint::global(*address));
-    } else if let Some(address) = v6_link_local.first() {
-        // The zone is what makes a link-local address reachable at all. It is the link the
-        // neighbour was observed on, which is this vantage.
-        endpoints.push(Endpoint::new(*address, Some(vantage.to_string())));
-    }
+    v4.sort();
+    v6_routable.sort();
+    v6_link_local.sort();
 
+    let mut endpoints: Vec<Endpoint> = Vec::new();
+    endpoints.extend(v4.into_iter().map(Endpoint::global));
+    endpoints.extend(v6_routable.into_iter().map(Endpoint::global));
+    // The zone is what makes a link-local address reachable at all: it is the link the
+    // neighbour was observed on, which is this vantage. The index comes from the vantage
+    // too, because on Windows there is no name to resolve.
+    endpoints.extend(
+        v6_link_local
+            .into_iter()
+            .map(|address| Endpoint::scoped(address, Some(vantage.to_string()), index)),
+    );
     endpoints
 }
 
@@ -208,6 +213,7 @@ pub fn queue_from_graph(
     graph: &TopologyGraph,
     interrogated: &HashSet<DeviceKey>,
     vantage: &str,
+    index: u32,
 ) -> Vec<InterrogationTarget> {
     let pivots: HashSet<IpAddr> = graph.pivot_addresses().into_iter().collect();
     let candidates: HashSet<IpAddr> = graph.candidate_addresses().into_iter().collect();
@@ -220,7 +226,7 @@ pub fn queue_from_graph(
         if interrogated.contains(key) {
             continue;
         }
-        let endpoints = preferred_endpoints(node, vantage);
+        let endpoints = preferred_endpoints(node, vantage, index);
         if endpoints.is_empty() {
             continue;
         }
@@ -261,6 +267,8 @@ mod tests {
     use crate::topology::evidence::{Confidence, Fact, RoleSignal, TopologyEvidence};
 
     const VANTAGE: &str = "test0";
+    /// Any non-zero index: the value only has to be carried through unchanged.
+    const VANTAGE_INDEX: u32 = 3;
 
     fn absorb(graph: &mut TopologyGraph, fact: Fact, source: EvidenceSource) {
         graph.absorb(TopologyEvidence::new(
@@ -305,7 +313,7 @@ mod tests {
             EvidenceSource::KernelRoute,
         );
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert_eq!(queue.len(), 3);
 
         // Infrastructure is worked first, so what it discloses can extend the same pass.
@@ -319,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dual_stack_device_is_one_entry_with_one_endpoint_per_family() {
+    fn a_dual_stack_device_is_one_entry_carrying_every_address() {
         // Interrogating each address separately probed the same machine repeatedly and
         // produced several coverage records for one device.
         let mut graph = TopologyGraph::new();
@@ -335,12 +343,15 @@ mod tests {
             );
         }
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert_eq!(queue.len(), 1, "one device, one entry");
-        let endpoints = addresses_of(&queue[0]);
-        assert_eq!(endpoints.len(), 2, "one per family: {endpoints:?}");
-        assert!(endpoints[0].parse::<IpAddr>().unwrap().is_ipv4());
-        assert_eq!(endpoints[1], "fd00::4");
+
+        // Every address is kept. Keeping one per family silently discarded a real address,
+        // and the ordering is fixed so repeated runs probe them in the same order.
+        assert_eq!(
+            addresses_of(&queue[0]),
+            vec!["10.9.0.4", "10.9.0.44", "fd00::4"]
+        );
     }
 
     #[test]
@@ -350,12 +361,12 @@ mod tests {
         let mut graph = TopologyGraph::new();
         device(&mut graph, "02:00:5e:00:00:05", "fe80::5");
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert_eq!(addresses_of(&queue[0]), vec![format!("fe80::5%{VANTAGE}")]);
     }
 
     #[test]
-    fn a_routable_ipv6_address_is_preferred_over_a_link_local_one() {
+    fn a_routable_ipv6_address_is_probed_before_a_link_local_one() {
         let mut graph = TopologyGraph::new();
         let key = device(&mut graph, "02:00:5e:00:00:06", "fe80::6");
         absorb(
@@ -367,8 +378,43 @@ mod tests {
             EvidenceSource::NdpCache,
         );
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
-        assert_eq!(addresses_of(&queue[0]), vec!["fd00::6"]);
+        // Both are kept; the routable one is probed first because it needs no zone and
+        // works from anywhere, which makes it the address the full stage set runs against.
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
+        assert_eq!(
+            addresses_of(&queue[0]),
+            vec!["fd00::6".to_string(), format!("fe80::6%{VANTAGE}")]
+        );
+    }
+
+    #[test]
+    fn address_ordering_does_not_depend_on_set_iteration_order() {
+        // The addresses come from a set whose order is not stable across runs. Taking the
+        // first element made the probed address differ between runs of the same network.
+        let mut graph = TopologyGraph::new();
+        let key = device(&mut graph, "02:00:5e:00:00:10", "10.9.0.60");
+        for address in ["10.9.0.20", "10.9.0.40", "fd00::20", "fe80::20"] {
+            absorb(
+                &mut graph,
+                Fact::DeviceAddress {
+                    device: key.clone(),
+                    address: address.parse().unwrap(),
+                },
+                EvidenceSource::NdpCache,
+            );
+        }
+
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
+        assert_eq!(
+            addresses_of(&queue[0]),
+            vec![
+                "10.9.0.20".to_string(),
+                "10.9.0.40".to_string(),
+                "10.9.0.60".to_string(),
+                "fd00::20".to_string(),
+                format!("fe80::20%{VANTAGE}"),
+            ]
+        );
     }
 
     #[test]
@@ -378,7 +424,7 @@ mod tests {
         let mut graph = TopologyGraph::new();
         device(&mut graph, "02:00:5e:00:00:07", "fd00::7");
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert_eq!(queue.len(), 1);
         assert_eq!(addresses_of(&queue[0]), vec!["fd00::7"]);
     }
@@ -390,7 +436,7 @@ mod tests {
         device(&mut graph, "02:00:5e:00:00:09", "10.9.0.9");
 
         let done: HashSet<DeviceKey> = [done_key].into_iter().collect();
-        let queue = queue_from_graph(&graph, &done, VANTAGE);
+        let queue = queue_from_graph(&graph, &done, VANTAGE, VANTAGE_INDEX);
         assert_eq!(queue.len(), 1);
         assert_eq!(addresses_of(&queue[0]), vec!["10.9.0.9"]);
     }
@@ -404,7 +450,7 @@ mod tests {
         device(&mut graph, "02:00:5e:00:00:0b", "169.254.1.9");
         device(&mut graph, "02:00:5e:00:00:0c", "10.9.0.12");
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert_eq!(queue.len(), 1);
         assert_eq!(addresses_of(&queue[0]), vec!["10.9.0.12"]);
     }
@@ -416,7 +462,7 @@ mod tests {
         let mut graph = TopologyGraph::new();
         device(&mut graph, "02:00:5e:00:00:0d", "10.9.0.13");
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert!(queue[0].confirmed_live);
         assert!(proves_liveness(EvidenceSource::NdpCache));
         assert!(proves_liveness(EvidenceSource::IcmpProbe));
@@ -441,7 +487,7 @@ mod tests {
             EvidenceSource::ArpCache,
         );
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert_eq!(
             queue[0].known.vendor.as_deref(),
             Some("ASUSTek COMPUTER INC.")
@@ -466,7 +512,7 @@ mod tests {
             EvidenceSource::Mdns,
         );
 
-        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE);
+        let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
         assert_eq!(queue.len(), 1);
         assert!(queue[0].discovery_sources.len() >= 2, "{:?}", queue[0]);
     }

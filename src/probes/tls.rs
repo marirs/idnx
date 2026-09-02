@@ -6,9 +6,9 @@
 //! without any OpenSSL or C library dependencies.
 
 use crate::net::endpoint::Endpoint;
+use crate::net::socket::SocketBinding;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 /// Extracted TLS Certificate metadata
@@ -256,9 +256,10 @@ pub fn is_plausible_dns_name(name: &str) -> bool {
 pub async fn probe_tls_certificate(
     target: &Endpoint,
     port: u16,
+    binding: &SocketBinding,
     timeout_duration: Duration,
 ) -> Option<TlsCertificateInfo> {
-    let connect_fut = TcpStream::connect(target.socket_addr(port));
+    let connect_fut = binding.tcp_connect(target.socket_addr(port), timeout_duration);
     let mut stream = timeout(timeout_duration, connect_fut).await.ok()?.ok()?;
 
     let client_hello = build_client_hello();

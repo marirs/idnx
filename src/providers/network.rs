@@ -41,6 +41,7 @@ impl DiscoveryProvider for SsdpProvider {
             // the MX value, and each descriptor then needs an HTTP fetch. A sub-second
             // window silently misses gateways that are present and answering.
             let devices = crate::probes::upnp::discover_upnp_devices(
+                &context.binding,
                 context.timeout.max(Duration::from_millis(2500)),
             )
             .await;
@@ -149,7 +150,12 @@ impl DiscoveryProvider for MndpProvider {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
 
-            for n in crate::probes::mndp::listen_mndp_neighbors(Duration::from_millis(600)).await {
+            for n in crate::probes::mndp::listen_mndp_neighbors(
+                &context.binding,
+                Duration::from_millis(600),
+            )
+            .await
+            {
                 let device = DeviceKey::mac(&n.mac_address);
 
                 out.push(TopologyEvidence::new(
@@ -215,6 +221,7 @@ impl DiscoveryProvider for VendorDiscoveryProvider {
         Box::pin(async move {
             crate::providers::vendor::run_broadcasts(
                 &context.vantage.interface,
+                &context.binding,
                 context.timeout.max(Duration::from_millis(600)),
             )
             .await
@@ -262,6 +269,7 @@ impl DiscoveryProvider for SnmpProvider {
                     target,
                     161,
                     &community,
+                    &context.binding,
                     context.timeout.max(Duration::from_millis(350)),
                 )
                 .await
@@ -556,6 +564,7 @@ mod tests {
             Vantage {
                 interface: "test0".to_string(),
                 kind,
+                index: 0,
                 capture_available: capture,
             },
             Duration::from_millis(200),

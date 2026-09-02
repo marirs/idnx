@@ -24,6 +24,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::net::endpoint::Endpoint;
+use crate::net::socket::SocketBinding;
 
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{
@@ -205,7 +206,14 @@ impl VendorAdapter for UbiquitiAdapter {
 pub trait VendorBroadcast: Send + Sync {
     fn name(&self) -> &'static str;
 
-    fn probe<'a>(&'a self, vantage: &'a str, timeout: Duration) -> AdapterFuture<'a>;
+    /// `binding` constrains the broadcast to the selected interface. A vendor broadcast
+    /// leaving through another link discovers devices this vantage cannot see.
+    fn probe<'a>(
+        &'a self,
+        vantage: &'a str,
+        binding: &'a SocketBinding,
+        timeout: Duration,
+    ) -> AdapterFuture<'a>;
 }
 
 /// ASUS Device Discovery, UDP 9999.
@@ -216,10 +224,15 @@ impl VendorBroadcast for AsusBroadcast {
         "broadcast:asus"
     }
 
-    fn probe<'a>(&'a self, vantage: &'a str, timeout: Duration) -> AdapterFuture<'a> {
+    fn probe<'a>(
+        &'a self,
+        vantage: &'a str,
+        binding: &'a SocketBinding,
+        timeout: Duration,
+    ) -> AdapterFuture<'a> {
         Box::pin(async move {
             let mut out = Vec::new();
-            for router in crate::probes::asus::discover_asus_routers(timeout).await {
+            for router in crate::probes::asus::discover_asus_routers(binding, timeout).await {
                 let address = std::net::IpAddr::V4(router.ip);
                 let device = DeviceKey::Address(address);
 
@@ -273,10 +286,20 @@ pub fn broadcasts() -> Vec<Box<dyn VendorBroadcast>> {
 }
 
 /// Runs every vendor broadcast on a link. None gates another and none gates recursion.
-pub async fn run_broadcasts(vantage: &str, timeout: Duration) -> Vec<TopologyEvidence> {
+pub async fn run_broadcasts(
+    vantage: &str,
+    binding: &SocketBinding,
+    timeout: Duration,
+) -> Vec<TopologyEvidence> {
     let mut out = Vec::new();
     for broadcast in broadcasts() {
-        out.extend(broadcast.probe(vantage, timeout).await);
+        out.extend(
+            broadcast
+                .probe(vantage, binding, timeout)
+                .await
+                .into_iter()
+                .filter(|ev| adapter_may_assert(&ev.fact)),
+        );
     }
     out
 }

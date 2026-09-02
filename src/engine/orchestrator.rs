@@ -228,9 +228,10 @@ impl DiscoveryEngine {
             // only devices with routing evidence was circular, since interrogation is how
             // that evidence is obtained. The tier decides how much work a device is worth
             // and nothing else -- role and confidence still come only from the answers.
-            graph.merge_address_identities();
+            let aliases = graph.merge_address_identities();
+            apply_aliases(&aliases, &mut interrogated, &mut coverage);
             let outstanding =
-                !interrogation_queue(&graph, &interrogated, &context.vantage.interface).is_empty();
+                !interrogation_queue(&graph, &interrogated, &context.vantage).is_empty();
 
             if pending.is_empty() && !outstanding {
                 if !continuous_finished {
@@ -263,7 +264,7 @@ impl DiscoveryEngine {
                         // anything, which is the exact failure the two queues exist to
                         // avoid.
                         let gained_device =
-                            !interrogation_queue(&graph, &interrogated, &context.vantage.interface)
+                            !interrogation_queue(&graph, &interrogated, &context.vantage)
                                 .is_empty();
 
                         if gained_network || gained_pivot || gained_device {
@@ -280,8 +281,9 @@ impl DiscoveryEngine {
             // interrogate. A device arrives twice -- by address from a route or lease, by
             // MAC from the neighbour cache -- and an unmerged graph presents those as two
             // devices, so the same machine was probed twice and reported twice.
-            graph.merge_address_identities();
-            let queued = interrogation_queue(&graph, &interrogated, &context.vantage.interface);
+            let aliases = graph.merge_address_identities();
+            apply_aliases(&aliases, &mut interrogated, &mut coverage);
+            let queued = interrogation_queue(&graph, &interrogated, &context.vantage);
             for task in &queued {
                 interrogated.insert(task.device.clone());
             }
@@ -481,13 +483,46 @@ pub fn is_virtual_interface(name: &str) -> bool {
         .any(|p| lowered.starts_with(&p.to_ascii_lowercase()))
 }
 
+/// Rewrites interrogation state onto surviving identities after a merge.
+///
+/// Without this, a device first interrogated under an address key and later merged into a
+/// MAC key is absent from the ledger under its new key: it is interrogated a second time
+/// and appears twice in coverage. Applied repeatedly because a merge can chain -- an
+/// address folds into a scoped address which folds into a MAC.
+fn apply_aliases(
+    aliases: &[(DeviceKey, DeviceKey)],
+    interrogated: &mut HashSet<DeviceKey>,
+    coverage: &mut Vec<crate::providers::target::DeviceCoverage>,
+) {
+    for (absorbed, surviving) in aliases {
+        if interrogated.remove(absorbed) {
+            interrogated.insert(surviving.clone());
+        }
+        for record in coverage.iter_mut() {
+            if record.device == *absorbed {
+                record.device = surviving.clone();
+            }
+        }
+    }
+
+    // A device may have been interrogated under two identities before they merged. Keep
+    // the record that learned more rather than an arbitrary one.
+    coverage.sort_by(|a, b| {
+        a.device
+            .to_string()
+            .cmp(&b.device.to_string())
+            .then(b.tcp_attempted().cmp(&a.tcp_attempted()))
+    });
+    coverage.dedup_by(|a, b| a.device == b.device);
+}
+
 /// Devices still awaiting interrogation, infrastructure first.
 fn interrogation_queue(
     graph: &TopologyGraph,
     interrogated: &HashSet<DeviceKey>,
-    vantage: &str,
+    vantage: &crate::providers::Vantage,
 ) -> Vec<crate::providers::target::InterrogationTarget> {
-    crate::engine::enrich::queue_from_graph(graph, interrogated, vantage)
+    crate::engine::enrich::queue_from_graph(graph, interrogated, &vantage.interface, vantage.index)
 }
 
 #[cfg(test)]
@@ -536,6 +571,7 @@ mod tests {
             Vantage {
                 interface: "test0".to_string(),
                 kind: VantageKind::Wired,
+                index: 0,
                 capture_available: true,
             },
             std::time::Duration::from_millis(1),

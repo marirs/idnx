@@ -1,6 +1,6 @@
+use crate::net::socket::SocketBinding;
 use std::net::Ipv4Addr;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,9 +93,14 @@ pub fn parse_mndp_packet(payload: &[u8]) -> Option<MndpNeighbor> {
 }
 
 /// Listens for MikroTik MNDP broadcast packets on UDP port 5678
-pub async fn listen_mndp_neighbors(listen_duration: Duration) -> Vec<MndpNeighbor> {
+pub async fn listen_mndp_neighbors(
+    binding: &SocketBinding,
+    listen_duration: Duration,
+) -> Vec<MndpNeighbor> {
     let mut neighbors = Vec::new();
-    let socket = match UdpSocket::bind("0.0.0.0:5678").await {
+    // Bound to the selected interface: MNDP is a link-local broadcast, so listening on the
+    // wrong link reports neighbours that this vantage cannot see.
+    let socket = match binding.udp_bound_v4(5678).await {
         Ok(s) => s,
         Err(_) => return neighbors,
     };

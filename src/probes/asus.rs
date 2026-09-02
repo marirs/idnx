@@ -1,7 +1,7 @@
+use crate::net::socket::SocketBinding;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
@@ -15,15 +15,18 @@ pub struct AsusRouterDiscovery {
 
 /// Probes the ASUS proprietary Device Discovery service on UDP port 9999 / 18017
 /// Used by ASUSWRT routers (RT-BE, RT-AX, GT, etc.)
-pub async fn discover_asus_routers(timeout_duration: Duration) -> Vec<AsusRouterDiscovery> {
+pub async fn discover_asus_routers(
+    binding: &SocketBinding,
+    timeout_duration: Duration,
+) -> Vec<AsusRouterDiscovery> {
     let mut discovered = Vec::new();
 
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Broadcast from the selected interface only: a vendor broadcast leaving through
+    // another link discovers devices this vantage cannot actually see.
+    let socket = match binding.udp_broadcast().await {
         Ok(s) => Arc::new(s),
         Err(_) => return discovered,
     };
-
-    let _ = socket.set_broadcast(true);
 
     let payloads: &[&[u8]] = &[b"\x0c\x15\x00\x00", b"IBOX\x00\x00\x00\x00", b"INFO"];
     let bcast_addr = SocketAddrV4::new(Ipv4Addr::new(255, 255, 255, 255), 9999);

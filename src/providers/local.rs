@@ -458,6 +458,7 @@ mod tests {
             Vantage {
                 interface: "test0".to_string(),
                 kind: VantageKind::Wired,
+                index: 0,
                 capture_available: false,
             },
             Duration::from_millis(200),

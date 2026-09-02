@@ -4,10 +4,10 @@
 //! (Ollama, LM Studio, vLLM, LocalAI), Model Context Protocol (MCP) servers, and AgentPin identities.
 
 use crate::net::endpoint::Endpoint;
+use crate::net::socket::SocketBinding;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 /// Identifies the category of detected AI runtime or agent interface
@@ -65,12 +65,13 @@ impl AiRuntimeInfo {
 async fn http_get(
     ip: &Endpoint,
     port: u16,
+    binding: &SocketBinding,
     path: &str,
     timeout_duration: Duration,
 ) -> Option<(u16, String)> {
-    let mut stream = timeout(timeout_duration, TcpStream::connect(ip.socket_addr(port)))
+    let mut stream = binding
+        .tcp_connect(ip.socket_addr(port), timeout_duration)
         .await
-        .ok()?
         .ok()?;
 
     let request = format!(
@@ -205,24 +206,26 @@ pub fn parse_agentpin_manifest(json_str: &str) -> Option<(String, Option<String>
 pub async fn probe_ai_runtime(
     ip: &Endpoint,
     open_ports: &[u16],
+    binding: &SocketBinding,
     timeout_duration: Duration,
 ) -> Option<AiRuntimeInfo> {
     let probe_timeout = Duration::from_millis(timeout_duration.as_millis().min(500) as u64);
 
     // 1. Probe Ollama on port 11434
     if open_ports.contains(&11434)
-        && let Some((status, body)) = http_get(ip, 11434, "/api/tags", probe_timeout).await
+        && let Some((status, body)) = http_get(ip, 11434, binding, "/api/tags", probe_timeout).await
         && status == 200
     {
         let models = parse_ollama_tags(&body);
-        let version =
-            if let Some((_, ver_body)) = http_get(ip, 11434, "/api/version", probe_timeout).await {
-                serde_json::from_str::<OllamaVersion>(&ver_body)
-                    .ok()
-                    .and_then(|v| v.version)
-            } else {
-                None
-            };
+        let version = if let Some((_, ver_body)) =
+            http_get(ip, 11434, binding, "/api/version", probe_timeout).await
+        {
+            serde_json::from_str::<OllamaVersion>(&ver_body)
+                .ok()
+                .and_then(|v| v.version)
+        } else {
+            None
+        };
 
         return Some(AiRuntimeInfo {
             runtime_type: AiRuntimeType::Ollama,
@@ -237,7 +240,8 @@ pub async fn probe_ai_runtime(
     // 2. Probe OpenAI-Compatible Runtimes (LM Studio on 1234, vLLM on 8000, LocalAI on 8080)
     for &port in &[1234, 8000, 8080, 5000] {
         if open_ports.contains(&port)
-            && let Some((status, body)) = http_get(ip, port, "/v1/models", probe_timeout).await
+            && let Some((status, body)) =
+                http_get(ip, port, binding, "/v1/models", probe_timeout).await
             && status == 200
         {
             let models = parse_openai_models(&body);
@@ -265,8 +269,14 @@ pub async fn probe_ai_runtime(
     // 4. Probe AgentPin Standard Identity on standard HTTP ports
     for &port in &[80, 443, 3000, 8080] {
         if open_ports.contains(&port)
-            && let Some((status, body)) =
-                http_get(ip, port, "/.well-known/agent-identity.json", probe_timeout).await
+            && let Some((status, body)) = http_get(
+                ip,
+                port,
+                binding,
+                "/.well-known/agent-identity.json",
+                probe_timeout,
+            )
+            .await
             && status == 200
             && let Some((name, desc, ver)) = parse_agentpin_manifest(&body)
         {
