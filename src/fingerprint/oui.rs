@@ -222,6 +222,10 @@ static OUI_DATABASE: &[([u8; 3], &str)] = &[
     ([0x58, 0x02, 0x05], "AzureWave (NVIDIA DGX / Compute Node)"),
     ([0x60, 0x32, 0xB1], "TP-Link"),
     ([0x60, 0xA4, 0x4C], "ASUSTek Computer Inc."),
+    // 60:CF:84 confirmed against an RT-BE92U whose own UPnP device description reported
+    // manufacturer "ASUSTeK Computer Inc."; it was absent here, so its WAN-side interface
+    // appeared as an unidentified device with no vendor.
+    ([0x60, 0xCF, 0x84], "ASUSTek Computer Inc."),
     ([0x64, 0x90, 0xC1], "Xiaomi"),
     ([0x64, 0xD1, 0x54], "MikroTik"),
     ([0x68, 0x5E, 0xDD], "Apple"),

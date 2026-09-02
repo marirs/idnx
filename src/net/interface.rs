@@ -176,6 +176,64 @@ pub fn resolve_target(
     Ok((cidr, None))
 }
 
+/// Reports whether an interface is wireless.
+///
+/// This matters for Layer 2 discovery, not for scanning. LLDP and CDP are link-local
+/// multicast frames, and access points do not bridge them to wireless clients — so a
+/// capture on a Wi-Fi interface finds no switches no matter how correct the decoder is.
+/// Without this check that outcome is indistinguishable from "there are no switches".
+pub fn is_wireless_interface(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // The kernel exposes a `wireless` directory (or a phy80211 link) only for 802.11 devices.
+        std::path::Path::new(&format!("/sys/class/net/{}/wireless", name)).exists()
+            || std::path::Path::new(&format!("/sys/class/net/{}/phy80211", name)).exists()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // `networksetup` maps each device to its hardware port; the Wi-Fi radio is the only
+        // port reported as "Wi-Fi" (or "AirPort" on older releases).
+        let Ok(output) = std::process::Command::new("networksetup")
+            .arg("-listallhardwareports")
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        parse_macos_wireless_ports(&text)
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(name))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// Extracts the device names of wireless hardware ports from `networksetup` output.
+#[cfg(any(target_os = "macos", test))]
+pub fn parse_macos_wireless_ports(text: &str) -> Vec<String> {
+    let mut wireless = Vec::new();
+    let mut current_is_wireless = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(port) = trimmed.strip_prefix("Hardware Port:") {
+            let port = port.trim().to_ascii_lowercase();
+            current_is_wireless = port == "wi-fi" || port == "airport";
+        } else if let Some(device) = trimmed.strip_prefix("Device:")
+            && current_is_wireless
+        {
+            wireless.push(device.trim().to_string());
+        }
+    }
+
+    wireless
+}
+
 /// Queries the OS kernel for the default route without external network packets or internet access
 fn get_kernel_default_route() -> Option<(String, Option<Ipv4Addr>)> {
     #[cfg(target_os = "macos")]
@@ -261,6 +319,24 @@ mod tests {
 
         assert_eq!(info.prefix_len, 24);
         assert_eq!(info.cidr.network(), Ipv4Addr::new(192, 168, 1, 0));
+    }
+
+    #[test]
+    fn test_parse_macos_wireless_ports() {
+        let sample = "\
+Hardware Port: Wi-Fi
+Device: en0
+Ethernet Address: 68:5e:dd:8f:75:56
+
+Hardware Port: Ethernet Adapter (en3)
+Device: en3
+Ethernet Address: 1e:dc:68:29:ce:2b
+
+Hardware Port: Thunderbolt Bridge
+Device: bridge0
+Ethernet Address: 36:14:e0:ee:4c:00
+";
+        assert_eq!(parse_macos_wireless_ports(sample), vec!["en0".to_string()]);
     }
 
     #[test]

@@ -283,6 +283,22 @@ async fn main() {
             match probes::lldp::capture_lldp_neighbors(iface_name, Duration::from_millis(600)).await
             {
                 probes::lldp::LldpCaptureResult::Success(neighbors) => {
+                    // Distinguish "no switches advertise here" from "this link cannot carry
+                    // switch advertisements at all". Over Wi-Fi the second is always true:
+                    // access points do not bridge link-local LLDP/CDP frames to clients, so
+                    // an empty capture says nothing about whether switches exist.
+                    if neighbors.is_empty() && net::interface::is_wireless_interface(iface_name) {
+                        println!(
+                            "{} No Layer 2 neighbours on {} (wireless link).",
+                            "[!]".yellow().bold(),
+                            iface_name.cyan()
+                        );
+                        println!(
+                            "    └── {}",
+                            "LLDP/CDP are link-local frames; access points do not bridge them to wireless clients. Managed switches cannot be discovered over Wi-Fi - connect via Ethernet to map them."
+                                .dimmed()
+                        );
+                    }
                     if !neighbors.is_empty() {
                         println!(
                             "{} Captured {} Layer 2 LLDP/CDP hardware advertisement(s):",
@@ -410,6 +426,19 @@ async fn main() {
     )
     .await;
 
+    // Devices the kernel already knows advertise themselves as IPv6 routers. Harvested once
+    // here rather than re-derived, and skipped entirely when IPv6 is disabled.
+    let ipv6_router_macs: Vec<String> = if cli.no_ipv6 {
+        Vec::new()
+    } else {
+        net::ipv6::harvest_ndp_cache(iface_filter)
+            .await
+            .into_iter()
+            .filter(|entry| entry.is_router)
+            .map(|entry| entry.mac)
+            .collect()
+    };
+
     let snmp_comms: Vec<String> = cli
         .snmp_communities
         .split(',')
@@ -418,7 +447,7 @@ async fn main() {
         .collect();
 
     // Explore downstream child networks by default (unless --no-deep specified)
-    let child_networks = if !cli.no_deep || cli.subnets.is_some() {
+    let deep_report = if !cli.no_deep || cli.subnets.is_some() {
         println!(
             "{} Probing downstream networks and cascaded subnets (SNMP OID MIB-II active)...",
             "[*]".blue().bold()
@@ -440,6 +469,8 @@ async fn main() {
             recursive: cli.recursive,
             max_depth: cli.max_depth,
             max_sweep_hosts: cli.max_sweep_hosts,
+            local_hosts: &summary.active_hosts,
+            ipv6_router_macs: &ipv6_router_macs,
             route_options: idnx::net::routes::RouteDiscoveryOptions {
                 enable_heuristic_sweep: cli.heuristic_sweep,
                 infer_hop_subnets: cli.infer_hop_subnets,
@@ -449,8 +480,9 @@ async fn main() {
 
         engine::deep::explore_downstream_networks(&target_cidr, &deep_cfg).await
     } else {
-        Vec::new()
+        engine::deep::DeepScanReport::default()
     };
+    let child_networks = deep_report.networks;
 
     let physical_switches: Vec<&str> = cli
         .switches
@@ -472,6 +504,59 @@ async fn main() {
         &child_networks,
     );
 
+    // 1b. Report routers we could see but not see past.
+    //
+    // Silence is the worst possible output here: a downstream NAT router looks identical to
+    // an ordinary client in the host table, so without this the operator has no way to tell
+    // "there is nothing behind this network" from "there is a router I could not query".
+    if !deep_report.boundaries.is_empty() {
+        println!(
+            "\n{} {}",
+            "[!]".yellow().bold(),
+            "Unexplored Network Boundaries (routers detected, contents not enumerable)"
+                .bold()
+                .yellow()
+        );
+        for b in &deep_report.boundaries {
+            let name = b
+                .hostname
+                .as_deref()
+                .or(b.vendor.as_deref())
+                .unwrap_or("unidentified device");
+            // An IPv6-only device carries the 0.0.0.0 placeholder; show what it actually has.
+            let address = if b.ip.is_unspecified() {
+                b.ipv6_addrs
+                    .first()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "unknown address".to_string())
+            } else {
+                b.ip.to_string()
+            };
+            println!(
+                "    ├── 🚧 {} [{}]{}",
+                address.cyan().bold(),
+                name.green(),
+                b.mac_address
+                    .as_deref()
+                    .map(|m| format!(" - {}", m))
+                    .unwrap_or_default()
+                    .dimmed()
+            );
+            for ev in &b.evidence {
+                println!("    │     • evidence: {}", ev.dimmed());
+            }
+            println!(
+                "    │     └── not traversed: {}",
+                b.reason.explain().yellow()
+            );
+        }
+        println!(
+            "    └── {}",
+            "To map behind these: enable SNMP on the device, or run idnx from a host on its LAN side."
+                .dimmed()
+        );
+    }
+
     // 2. Render Detailed Results Table
     output::terminal::print_scan_results(&target_cidr, &summary, &child_networks);
 
@@ -484,6 +569,7 @@ async fn main() {
             &summary,
             &child_networks,
             resolved_local_gateway,
+            &deep_report.boundaries,
         ) {
             Ok(path) => {
                 println!(

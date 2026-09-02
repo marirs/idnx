@@ -39,7 +39,25 @@ pub struct NetworkExport {
     /// only want an asset list can ignore this; consumers reasoning about topology need
     /// to know which networks were observed and which were merely advertised.
     pub networks: Vec<ExportNetwork>,
+    /// Routers that were detected but could not be traversed, each with the evidence that
+    /// identified it and the reason it could not be explored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unexplored_boundaries: Vec<ExportBoundary>,
     pub hosts: Vec<ExportHost>,
+}
+
+/// A router idNX could see but not see past.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportBoundary {
+    pub address: String,
+    pub mac_address: Option<String>,
+    pub vendor: Option<String>,
+    pub hostname: Option<String>,
+    pub discovery_source: String,
+    /// Observations that identified this device as a router.
+    pub evidence: Vec<String>,
+    /// Why the networks behind it could not be enumerated.
+    pub reason: String,
 }
 
 /// A network in the result set, with its discovery provenance.
@@ -94,6 +112,7 @@ pub fn build_export_data(
     summary: &ScanSummary,
     child_networks: &[ChildNetworkResult],
     local_gateway: Option<std::net::Ipv4Addr>,
+    boundaries: &[crate::engine::deep::UnexploredBoundary],
 ) -> NetworkExport {
     let mut hosts = Vec::new();
     let mut networks = Vec::new();
@@ -191,6 +210,25 @@ pub fn build_export_data(
         primary_subnet: primary_cidr.to_string(),
         total_active_hosts: hosts.len(),
         networks,
+        unexplored_boundaries: boundaries
+            .iter()
+            .map(|b| ExportBoundary {
+                address: if b.ip.is_unspecified() {
+                    b.ipv6_addrs
+                        .first()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| b.ip.to_string())
+                } else {
+                    b.ip.to_string()
+                },
+                mac_address: b.mac_address.clone(),
+                vendor: b.vendor.clone(),
+                hostname: b.hostname.clone(),
+                discovery_source: b.source.display_name().to_string(),
+                evidence: b.evidence.clone(),
+                reason: b.reason.explain().to_string(),
+            })
+            .collect(),
         hosts,
     }
 }
@@ -212,8 +250,15 @@ pub fn export_results(
     summary: &ScanSummary,
     child_networks: &[ChildNetworkResult],
     local_gateway: Option<std::net::Ipv4Addr>,
+    boundaries: &[crate::engine::deep::UnexploredBoundary],
 ) -> Result<PathBuf, String> {
-    let export_data = build_export_data(primary_cidr, summary, child_networks, local_gateway);
+    let export_data = build_export_data(
+        primary_cidr,
+        summary,
+        child_networks,
+        local_gateway,
+        boundaries,
+    );
     let filename = custom_path
         .map(|p| p.to_string())
         .unwrap_or_else(|| get_default_filename(format));
@@ -296,6 +341,28 @@ pub fn export_results(
                 ));
             }
             text.push('\n');
+
+            if !export_data.unexplored_boundaries.is_empty() {
+                text.push_str(
+                    "UNEXPLORED BOUNDARIES (routers detected, contents not enumerable)\n",
+                );
+                for b in &export_data.unexplored_boundaries {
+                    text.push_str(&format!(
+                        "{}  {}  [{}]\n",
+                        b.address,
+                        b.mac_address.as_deref().unwrap_or("-"),
+                        b.hostname
+                            .as_deref()
+                            .or(b.vendor.as_deref())
+                            .unwrap_or("unidentified")
+                    ));
+                    for ev in &b.evidence {
+                        text.push_str(&format!("    evidence: {}\n", ev));
+                    }
+                    text.push_str(&format!("    not traversed: {}\n", b.reason));
+                }
+                text.push('\n');
+            }
 
             text.push_str(&format!(
                 "{:<26} {:<16} {:<28} {:<18} {:<24} {:<8} {:<10}\n",
@@ -389,6 +456,7 @@ mod tests {
                 &summary,
                 &children,
                 Some(Ipv4Addr::new(192, 168, 1, 1)),
+                &[],
             )
             .expect("Export should succeed");
             assert!(exported_path.exists());

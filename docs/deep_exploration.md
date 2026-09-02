@@ -39,7 +39,38 @@ Every reported network carries a confidence grade:
 | `user-supplied` | `=` | You passed it via `--subnets`. |
 | `inferred` | `~` | Derived by assumption, never by observation. Opt-in only. |
 
-### 2.2 Gateway Interrogation Order
+### 2.2 Unexplored Boundaries
+
+The most important thing idNX can report when it *cannot* enumerate what lies behind a
+router is that the router is there. A downstream NAT router presents itself on the parent
+network as one ordinary client address among many; without an explicit report it is
+indistinguishable from a printer.
+
+Every device identified as a router but not traversed is listed with the evidence that
+identified it and the reason it could not be explored:
+
+```
+[!] Unexplored Network Boundaries (routers detected, contents not enumerable)
+    ├── 🚧 192.168.1.125 [ASUSTek Computer Inc.] - 60:cf:84:37:1b:70
+    │     • evidence: hardware vendor is ASUSTek Computer Inc.
+    │     └── not traversed: no SNMP response (UDP 161)
+```
+
+Router evidence, all observed rather than assumed:
+
+| Signal | Strength |
+| --- | --- |
+| Sets the RFC 4861 `isRouter` bit in the kernel IPv6 neighbour table | Strong - the device advertised itself as a router |
+| Is this machine's default gateway | Strong |
+| Serves DNS (53) *and* a web admin interface | Moderate - the classic SOHO router signature |
+| Hardware vendor is a router/AP vendor | Weak - only ever supporting evidence |
+| Advertises a name containing "router" | Weak |
+
+The `isRouter` bit is read strictly from the `Flgs` column of the neighbour table. The
+`St` (state) column also uses `R`, there meaning REACHABLE; conflating the two reports
+every recently-contacted phone and laptop as network infrastructure.
+
+### 2.3 Gateway Interrogation Order
 
 Deep exploration seeds from the OS default gateway first — it is the one router guaranteed to know what lies upstream — then interrogates every other pivot:
 
@@ -56,19 +87,25 @@ TTL hop discovery needs an off-link destination. idNX takes the first public nam
 
 A brute-force `192.168.x.1/.254` sweep is available behind `--heuristic-sweep`. It is guessing, is confined to `192.168.0.0/16`, and everything it produces is graded `inferred`.
 
-### 2.3 Dual-Mode Name Synthesis (Overcoming Multicast Barriers)
+### 2.4 Dual-Mode Name Synthesis (Overcoming Multicast Barriers)
 * **Local Subnet**: `idNX` uses Multicast DNS (RFC 6762 on `224.0.0.251:5353`) to resolve Apple, Linux, and IoT `.local` names.
 * **Cascaded / Routed Subnets**: Because mDNS packets cannot cross routers, `idNX` uses a custom zero-copy **RFC 1035 Unicast DNS PTR resolver**. It directs UDP reverse DNS queries to the subnet's own gateway (typically dnsmasq on port 53), recovering device names across routing boundaries without root privileges. The resolver is chosen deterministically — the subnet gateway first, then the lowest-numbered host offering DNS — so repeated runs on an unchanged network produce identical output.
 
-### 2.4 Layer 2 Link-Layer Frame Capture (LLDP, CDP, MNDP)
+### 2.5 Layer 2 Link-Layer Frame Capture (LLDP, CDP, MNDP)
 In privileged mode (`sudo idnx`), `idNX` taps into the raw network interface using BPF (macOS) and `AF_PACKET` (Linux):
 * **IEEE 802.1AB LLDP**: Intercepts advertisements on `01:80:c2:00:00:0e` to read switch chassis IDs, port numbers, and system descriptions.
 * **Cisco CDP**: Decodes frames on `01:00:0c:cc:cc:cc` to discover Cisco, Ubiquiti UniFi, and TP-Link Omada switches, their model names, and native VLANs.
 * **MikroTik MNDP**: Listens on UDP port 5678 for RouterOS broadcast beacons.
 
+**LLDP and CDP do not work over Wi-Fi.** They are link-local multicast frames, and access
+points do not bridge them to wireless clients. A capture on a wireless interface finds no
+switches regardless of how correct the decoder is, so idNX detects a wireless link and says
+so rather than reporting an empty result that looks like "there are no switches". To map
+managed switches, run idNX from a host with a wired connection.
+
 Capture reveals the neighbours that advertise on the link idNX is bound to. That is the device on the other end of your cable plus anything else advertising in that broadcast domain — it is not a full switch-to-switch fabric reconstruction. Management addresses learned here are fed back into discovery as pivots.
 
-### 2.5 Stealth ICMP Echo Fallbacks
+### 2.6 Stealth ICMP Echo Fallbacks
 For devices on routed subnets that have no open TCP ports or drop SYN packets, `idNX` runs parallel ICMP echo sweeps with dynamic timeout clamping (`.clamp(300, 1500)`), capturing stealth endpoints that standard port scanners skip.
 
 ---
@@ -91,4 +128,10 @@ Both tables are graded `advertised`, not `verified`: the device asserted them, a
 
 ### Requirements and limits
 
-SNMP is the mechanism that makes cascading real, and most consumer routers ship with it **disabled**. Where SNMP is off and no other control-plane source discloses anything, idNX will report the local subnet and whatever its kernel routes cover — which is the honest answer, not a failure. SNMPv3, BRIDGE-MIB forwarding tables and LLDP-MIB are not yet implemented; see the roadmap.
+SNMP is the mechanism that makes cascading real, and most consumer routers ship with it **disabled**. When that is the case idNX reports the router as an unexplored boundary rather than silently omitting it.
+
+A downstream NAT router is also, by design, opaque from its WAN side: it will typically
+drop inbound connections, expose its UPnP IGD only to its own LAN clients, and answer no
+management port. Where no control-plane source discloses the networks behind it, they
+cannot be enumerated from the parent network at all - the boundary report is the correct
+and complete answer. To map behind it, enable SNMP on the device or run idNX from a host on its LAN. Where SNMP is off and no other control-plane source discloses anything, idNX will report the local subnet and whatever its kernel routes cover — which is the honest answer, not a failure. SNMPv3, BRIDGE-MIB forwarding tables and LLDP-MIB are not yet implemented; see the roadmap.

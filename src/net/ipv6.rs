@@ -57,8 +57,17 @@ pub fn parse_macos_ndp(output: &str) -> Vec<NdpEntry> {
         // 3. Interface (parts[2])
         let iface = parts.get(2).map(|s| s.to_string());
 
-        // 4. Flags: 'R' indicates a router
-        let is_router = parts.iter().skip(3).any(|p| *p == "R" || p.contains('R'));
+        // 4. Router flag, read strictly from the Flgs column.
+        //
+        // `ndp -an` columns are:
+        //   0 Neighbor | 1 Linklayer Address | 2 Netif | 3 Expire | 4 St | 5 Flgs | 6 Prbs
+        //
+        // Both the State and the Flags column can contain 'R', and they mean entirely
+        // different things: in State it is REACHABLE, in Flags it is the RFC 4861 isRouter
+        // bit. Scanning every column for an 'R' therefore reports every recently-contacted
+        // neighbour - phones, laptops, this machine itself - as network infrastructure.
+        // Only column 5 carries the router bit, and it is absent on rows that have no flags.
+        let is_router = parts.get(5).is_some_and(|flags| flags.contains('R'));
 
         entries.push(NdpEntry {
             ip,
@@ -261,6 +270,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_macos_ndp_router_flag_ignores_non_flag_columns() {
+        // The State column must never be mistaken for the Flags column.
+        let sample = "\
+Neighbor                             Linklayer Address  Netif Expire    St Flgs Prbs
+fe80::1%en0                          c0:f6:ec:84:b9:b   en0   23h59m59s S  R
+fe80::fa:b41a:a32b:1798%en0          98:10:e8:f4:19:dd  en0   23h48m42s S
+fe80::16af:8444:caa7:6437%en0        4c:bb:47:0:48:f8   en0   8s        R
+";
+        let parsed = parse_macos_ndp(sample);
+        assert_eq!(parsed.len(), 3);
+        // Flgs column carries R: a genuine router advertisement.
+        assert!(parsed[0].is_router, "fe80::1 sets the isRouter flag");
+
+        // No flags at all.
+        assert!(!parsed[1].is_router);
+
+        // St column is R (REACHABLE) with no Flgs. An ordinary neighbour contacted
+        // recently; reading this as the router flag reported phones and this very
+        // machine as routers.
+        assert!(
+            !parsed[2].is_router,
+            "REACHABLE state must not be read as the router flag"
+        );
+    }
+
+    #[test]
     fn test_parse_macos_ndp_synthetic() {
         let sample = "\
 Neighbor                                Linklayer Address  Netif Expire    St Flgs Prbs
@@ -281,10 +316,7 @@ fe80::56ef:44ff:fe59:48dc%en0           54:ef:44:59:48:dc    en0 22h31m9s  S
         assert_eq!(parsed[0].interface.as_deref(), Some("en0"));
 
         assert_eq!(parsed[1].mac, "54:ef:44:59:48:dc");
-        assert_eq!(
-            parsed[2].ip,
-            "2001:db8::42".parse::<Ipv6Addr>().unwrap()
-        );
+        assert_eq!(parsed[2].ip, "2001:db8::42".parse::<Ipv6Addr>().unwrap());
         assert!(parsed[2].is_router);
     }
 

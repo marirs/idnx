@@ -935,10 +935,31 @@ impl Scanner {
         .await
     }
 
-    /// Executes a deep multi-tier infrastructure scan including downstream routers and SNMP tables
+    /// Executes a deep multi-tier infrastructure scan including downstream routers and SNMP tables.
+    ///
+    /// Returns the child networks only. Callers that also want the routers idNX could see
+    /// but not traverse should use `scan_deep_report`.
     pub async fn scan_deep(&self) -> (ScanSummary, Vec<crate::engine::deep::ChildNetworkResult>) {
+        let (summary, report) = self.scan_deep_report().await;
+        (summary, report.networks)
+    }
+
+    /// Executes a deep scan and returns the full report, including unexplored boundaries.
+    pub async fn scan_deep_report(&self) -> (ScanSummary, crate::engine::deep::DeepScanReport) {
         let summary = self.scan().await;
-        let children = if self.enable_deep || self.subnets.is_some() {
+
+        let ipv6_router_macs: Vec<String> = if self.enable_ipv6 {
+            crate::net::ipv6::harvest_ndp_cache(self.interface.as_deref())
+                .await
+                .into_iter()
+                .filter(|entry| entry.is_router)
+                .map(|entry| entry.mac)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let report = if self.enable_deep || self.subnets.is_some() {
             let config = crate::engine::deep::DeepScanConfig {
                 ports: &self.ports,
                 extra_subnets: self.subnets.as_deref(),
@@ -953,6 +974,8 @@ impl Scanner {
                 recursive: self.recursive,
                 max_depth: self.max_depth,
                 max_sweep_hosts: crate::engine::deep::DEFAULT_MAX_SWEEP_HOSTS,
+                local_hosts: &summary.active_hosts,
+                ipv6_router_macs: &ipv6_router_macs,
                 route_options: crate::net::routes::RouteDiscoveryOptions {
                     enable_heuristic_sweep: self.enable_heuristic_sweep,
                     infer_hop_subnets: false,
@@ -961,9 +984,9 @@ impl Scanner {
             };
             crate::engine::deep::explore_downstream_networks(&self.target, &config).await
         } else {
-            Vec::new()
+            crate::engine::deep::DeepScanReport::default()
         };
-        (summary, children)
+        (summary, report)
     }
 }
 

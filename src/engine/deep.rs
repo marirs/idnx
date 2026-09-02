@@ -75,6 +75,16 @@ pub struct DeepScanConfig<'a> {
     /// skipped. Operator-supplied `--subnets` are exempt: an explicit request is honoured.
     pub max_sweep_hosts: usize,
     pub route_options: RouteDiscoveryOptions,
+    /// Hosts found on the primary subnet. Used to recognise routers sitting on the local
+    /// segment — a downstream NAT router appears here as an ordinary client of the parent
+    /// network, which is exactly the case the tool exists to surface.
+    pub local_hosts: &'a [HostResult],
+    /// MAC addresses the kernel's IPv6 neighbour table marks with the RFC 4861 isRouter
+    /// bit. A device only earns this by advertising itself as a router, so it is the
+    /// strongest router signal available without credentials — and it works against
+    /// devices that answer no TCP port at all, which is exactly how a downstream NAT
+    /// router presents itself on its WAN side.
+    pub ipv6_router_macs: &'a [String],
 }
 
 impl<'a> DeepScanConfig<'a> {
@@ -91,12 +101,155 @@ impl<'a> DeepScanConfig<'a> {
             max_depth: 2,
             max_sweep_hosts: DEFAULT_MAX_SWEEP_HOSTS,
             route_options: RouteDiscoveryOptions::default(),
+            local_hosts: &[],
+            ipv6_router_macs: &[],
         }
     }
 }
 
+/// Vendors whose presence in an OUI lookup materially raises the chance a device routes.
+///
+/// This is a hint, never a conclusion: it only ever adds a line of evidence next to an
+/// observation that already stands on its own (open router ports, a UPnP IGD, and so on).
+const ROUTER_VENDOR_HINTS: &[&str] = &[
+    "asus",
+    "linksys",
+    "netgear",
+    "tp-link",
+    "d-link",
+    "mikrotik",
+    "ubiquiti",
+    "cisco",
+    "meraki",
+    "zyxel",
+    "draytek",
+    "fortinet",
+    "juniper",
+    "aruba",
+    "belkin",
+    "tenda",
+    "huawei",
+    "xiaomi router",
+    "openwrt",
+    "pfsense",
+    "synology",
+];
+
+/// Judges whether a host on the local subnet looks like a router, and says why.
+///
+/// Returns the supporting observations, empty when the host does not look like one. The
+/// caller decides what to do with them; this function never concludes on its own.
+fn router_evidence(
+    host: &HostResult,
+    is_default_gateway: bool,
+    ipv6_router_macs: &[String],
+) -> Vec<String> {
+    let mut evidence = Vec::new();
+
+    if is_default_gateway {
+        evidence.push("is this machine's default gateway".to_string());
+    }
+
+    // The kernel's own neighbour table, populated from the device's Router Advertisements.
+    if let Some(mac) = &host.mac_address
+        && ipv6_router_macs.iter().any(|m| m.eq_ignore_ascii_case(mac))
+    {
+        evidence.push("sets the IPv6 isRouter flag (RFC 4861 neighbour table)".to_string());
+    }
+
+    let open: Vec<u16> = host.open_ports.iter().map(|p| p.port).collect();
+    let serves_dns = open.contains(&53);
+    let serves_admin = open.iter().any(|p| matches!(p, 80 | 443 | 8080 | 8443));
+
+    // A device answering DNS *and* offering a web admin surface is the classic signature of
+    // a home or small-office router; either alone is far too common to mean anything.
+    if serves_dns && serves_admin {
+        evidence.push("serves DNS (53) and a web admin interface".to_string());
+    }
+
+    if let Some(vendor) = &host.vendor {
+        let lowered = vendor.to_ascii_lowercase();
+        if ROUTER_VENDOR_HINTS.iter().any(|v| lowered.contains(v)) {
+            evidence.push(format!("hardware vendor is {}", vendor));
+        }
+    }
+
+    // A UPnP InternetGatewayDevice is a self-declaration of routing, and the strongest
+    // signal available without credentials.
+    if let Some(name) = &host.hostname
+        && name.to_ascii_lowercase().contains("router")
+    {
+        evidence.push(format!("advertises itself as \"{}\"", name));
+    }
+
+    evidence
+}
+
 /// Default ceiling for an exhaustive host sweep of an auto-discovered network (a `/20`).
 pub const DEFAULT_MAX_SWEEP_HOSTS: usize = 4096;
+
+/// Why a router that idNX can see could not be explored past.
+///
+/// The distinction matters: "no downstream networks were found" and "a router is sitting
+/// right there refusing to disclose anything" look identical in the output otherwise, and
+/// only the second one tells the operator to go and change something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundaryReason {
+    /// The router did not answer SNMP on the configured port and communities. This is the
+    /// default state of most consumer routers.
+    SnmpNoResponse,
+    /// SNMP probing was disabled by the operator, so it was never attempted.
+    SnmpDisabled,
+    /// The router answered SNMP but advertised no private networks we did not already have.
+    NoAdditionalNetworks,
+    /// The device advertises itself as a router but has no IPv4 address to interrogate.
+    NoIpv4Address,
+}
+
+impl BoundaryReason {
+    pub fn explain(&self) -> &'static str {
+        match self {
+            BoundaryReason::SnmpNoResponse => {
+                "no SNMP response (UDP 161) - most consumer routers ship with SNMP disabled"
+            }
+            BoundaryReason::SnmpDisabled => "SNMP probing disabled via --no-snmp",
+            BoundaryReason::NoAdditionalNetworks => {
+                "answered SNMP but advertised no networks beyond those already known"
+            }
+            BoundaryReason::NoIpv4Address => {
+                "advertises as an IPv6 router but exposes no IPv4 address to query"
+            }
+        }
+    }
+}
+
+/// A device that is almost certainly a router, which idNX could see but could not see past.
+///
+/// A downstream NAT router is the single most important thing this tool can report when it
+/// cannot enumerate what lies behind it: the operator needs to know the boundary exists.
+#[derive(Debug, Clone)]
+pub struct UnexploredBoundary {
+    /// IPv4 address, or `0.0.0.0` for a device only reachable over IPv6.
+    pub ip: Ipv4Addr,
+    /// IPv6 addresses observed for this device. The only identifier available when the
+    /// device has no IPv4 presence at all.
+    pub ipv6_addrs: Vec<std::net::Ipv6Addr>,
+    pub source: DiscoverySource,
+    /// Observations that make this look like a router, in the operator's words.
+    pub evidence: Vec<String>,
+    pub reason: BoundaryReason,
+    pub mac_address: Option<String>,
+    pub vendor: Option<String>,
+    pub hostname: Option<String>,
+}
+
+/// Result of a deep exploration pass.
+#[derive(Debug, Clone, Default)]
+pub struct DeepScanReport {
+    pub networks: Vec<ChildNetworkResult>,
+    /// Routers seen but not traversed, each with the reason.
+    pub boundaries: Vec<UnexploredBoundary>,
+}
 
 /// Upper bound on routers interrogated in the seeding pass.
 ///
@@ -285,7 +438,7 @@ pub async fn confirm_routes(
 pub async fn explore_downstream_networks(
     parent_cidr: &Ipv4Net,
     config: &DeepScanConfig<'_>,
-) -> Vec<ChildNetworkResult> {
+) -> DeepScanReport {
     let mut queue = std::collections::VecDeque::new();
     let mut seen = HashSet::new();
     seen.insert(*parent_cidr);
@@ -327,6 +480,40 @@ pub async fn explore_downstream_networks(
             pivots.push(pivot);
         }
     }
+
+    // Routers observed on the local subnet by the primary scan.
+    //
+    // A cascaded NAT router presents itself here as an ordinary client of the parent
+    // network — one address among many — while its own LAN hangs off the far side. It is
+    // the single most important thing to interrogate, and previously nothing looked for it:
+    // route derivation only ever considered addresses *outside* the parent subnet.
+    let default_gw = crate::net::interface::detect_local_network()
+        .ok()
+        .and_then(|info| info.default_gateway);
+
+    let mut local_router_evidence: std::collections::HashMap<Ipv4Addr, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for host in config.local_hosts {
+        // IPv6-only hosts share the placeholder 0.0.0.0, so they cannot be keyed or
+        // interrogated by IPv4 address. They are still reported as boundaries below.
+        if host.ip.is_unspecified() {
+            continue;
+        }
+        let evidence = router_evidence(host, default_gw == Some(host.ip), config.ipv6_router_macs);
+        if evidence.is_empty() {
+            continue;
+        }
+        local_router_evidence.insert(host.ip, evidence);
+        if pivot_seen.insert(host.ip) {
+            pivots.push(GatewayPivot {
+                ip: host.ip,
+                source: DiscoverySource::KernelRoute,
+                confidence: DiscoveryConfidence::Verified,
+            });
+        }
+    }
+
     pivots.truncate(MAX_SEED_PIVOTS);
 
     // 2. Interrogate every pivot and enqueue the networks each one advertises.
@@ -348,11 +535,24 @@ pub async fn explore_downstream_networks(
         pivot_results.push(handle.await.ok().flatten());
     }
 
+    let snmp_enabled = config.snmp.map(|c| c.enabled).unwrap_or(false);
+    let mut pivot_outcomes: Vec<(Ipv4Addr, DiscoverySource, BoundaryReason)> = Vec::new();
+
     for (pivot, info) in pivots.iter().zip(pivot_results) {
         let Some(info) = info else {
+            pivot_outcomes.push((
+                pivot.ip,
+                pivot.source,
+                if snmp_enabled {
+                    BoundaryReason::SnmpNoResponse
+                } else {
+                    BoundaryReason::SnmpDisabled
+                },
+            ));
             continue;
         };
 
+        let mut yielded_any = false;
         for route in networks_advertised_by(&info, pivot.ip) {
             if route.network == *parent_cidr || !seen.insert(route.network) {
                 continue;
@@ -364,6 +564,11 @@ pub async fn explore_downstream_networks(
                 route.network
             );
             queue.push_back((route, Some(pivot.ip), label, 1usize));
+            yielded_any = true;
+        }
+
+        if !yielded_any {
+            pivot_outcomes.push((pivot.ip, pivot.source, BoundaryReason::NoAdditionalNetworks));
         }
     }
 
@@ -562,7 +767,74 @@ pub async fn explore_downstream_networks(
         }
     }
 
-    discovered_networks
+    // Report every router we could see but not see past. The default gateway is excluded
+    // only when it actually produced networks; a silent default gateway is itself a finding.
+    let explored: HashSet<Ipv4Addr> = discovered_networks
+        .iter()
+        .filter_map(|n| n.gateway)
+        .collect();
+
+    let mut boundaries = Vec::new();
+    let mut boundary_seen = HashSet::new();
+
+    for (ip, source, reason) in pivot_outcomes {
+        if explored.contains(&ip) || !boundary_seen.insert(ip) {
+            continue;
+        }
+
+        // Only surface a device as a boundary when something independently marks it as a
+        // router. A pivot that came from a hop or an LLDP address is already a router by
+        // construction; a local host needs the evidence gathered from the primary scan.
+        let evidence = match local_router_evidence.get(&ip) {
+            Some(found) => found.clone(),
+            None if source != DiscoverySource::KernelRoute => {
+                vec![format!("discovered via {}", source.display_name())]
+            }
+            None => continue,
+        };
+
+        let host = config.local_hosts.iter().find(|h| h.ip == ip);
+        boundaries.push(UnexploredBoundary {
+            ip,
+            ipv6_addrs: host.map(|h| h.ipv6_addrs.clone()).unwrap_or_default(),
+            source,
+            evidence,
+            reason,
+            mac_address: host.and_then(|h| h.mac_address.clone()),
+            vendor: host.and_then(|h| h.vendor.clone()),
+            hostname: host.and_then(|h| h.hostname.clone()),
+        });
+    }
+
+    // IPv6-only routers never appear in pivot_outcomes because they have no IPv4 address to
+    // interrogate, but a router that is only reachable over IPv6 is still a boundary the
+    // operator needs to see.
+    for host in config.local_hosts {
+        if !host.ip.is_unspecified() || host.ipv6_addrs.is_empty() {
+            continue;
+        }
+        let evidence = router_evidence(host, false, config.ipv6_router_macs);
+        if evidence.is_empty() {
+            continue;
+        }
+        boundaries.push(UnexploredBoundary {
+            ip: host.ip,
+            ipv6_addrs: host.ipv6_addrs.clone(),
+            source: DiscoverySource::KernelRoute,
+            evidence,
+            reason: BoundaryReason::NoIpv4Address,
+            mac_address: host.mac_address.clone(),
+            vendor: host.vendor.clone(),
+            hostname: host.hostname.clone(),
+        });
+    }
+
+    boundaries.sort_by_key(|b| (b.ip, b.ipv6_addrs.first().copied()));
+
+    DeepScanReport {
+        networks: discovered_networks,
+        boundaries,
+    }
 }
 
 #[cfg(test)]
