@@ -140,6 +140,22 @@ pub struct ProviderRun {
     pub note: Option<String>,
 }
 
+/// A source that observes continuously rather than when asked.
+///
+/// Packet capture does not fit the request/response shape of a provider: frames arrive on
+/// their own schedule, including after the last scope has been processed. The engine polls
+/// this before every convergence decision and finishes it exactly once, so evidence that
+/// lands moments before the end is still absorbed and can still extend the traversal.
+pub trait ContinuousSource: Send + Sync {
+    /// Evidence accumulated since the previous call. Must be cheap and non-blocking.
+    fn drain(&self) -> Vec<TopologyEvidence>;
+
+    /// Stops observing and returns whatever remained buffered.
+    ///
+    /// Called once, at candidate convergence. After this the source yields nothing further.
+    fn finish(&self) -> Vec<TopologyEvidence>;
+}
+
 /// A source of topology evidence.
 pub trait DiscoveryProvider: Send + Sync {
     /// Stable name used in diagnostics.

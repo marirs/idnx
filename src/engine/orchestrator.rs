@@ -8,7 +8,11 @@ use std::collections::HashSet;
 
 use ipnet::IpNet;
 
-use crate::providers::{DiscoveryContext, DiscoveryProvider, ProviderRun, Vantage};
+use std::sync::Arc;
+
+use crate::providers::{
+    ContinuousSource, DiscoveryContext, DiscoveryProvider, ProviderRun, Vantage,
+};
 use crate::topology::TopologyGraph;
 
 /// Safety limits. These bound work; they are not user-facing tuning knobs.
@@ -73,6 +77,8 @@ pub struct DiscoveryReport {
 pub struct DiscoveryEngine {
     seed_providers: Vec<Box<dyn DiscoveryProvider>>,
     scope_providers: Vec<Box<dyn DiscoveryProvider>>,
+    /// Observed continuously and drained by the engine, which also owns its shutdown.
+    continuous: Option<Arc<dyn ContinuousSource>>,
     budget: Budget,
 }
 
@@ -93,8 +99,15 @@ impl DiscoveryEngine {
         Self {
             seed_providers,
             scope_providers,
+            continuous: None,
             budget: Budget::default(),
         }
+    }
+
+    /// Attaches a continuously observing source whose lifecycle the engine then owns.
+    pub fn with_continuous_source(mut self, source: Arc<dyn ContinuousSource>) -> Self {
+        self.continuous = Some(source);
+        self
     }
 
     pub fn with_budget(mut self, budget: Budget) -> Self {
@@ -154,7 +167,20 @@ impl DiscoveryEngine {
         // Phase 2: fixed point. Each pass processes every network not yet seen, which may
         // reveal further networks; the loop ends when a pass adds nothing new.
         let mut converged = false;
+        // Finishing the continuous source is a one-time transition, tracked so that the
+        // final drain happens exactly once and never after the source is already stopped.
+        let mut continuous_finished = self.continuous.is_none();
+
         for _ in 0..self.budget.max_iterations {
+            // Poll before anything is decided. Frames that arrived while the previous pass
+            // was running would otherwise sit in the buffer until after the convergence
+            // check had already concluded there was nothing left to do.
+            if let Some(source) = &self.continuous {
+                for ev in source.drain() {
+                    graph.absorb(ev);
+                }
+            }
+
             for net in graph.networks() {
                 if !processed.contains(&net) && !queue.contains(&net) {
                     queue.push(net);
@@ -173,6 +199,36 @@ impl DiscoveryEngine {
                 .collect();
 
             if pending.is_empty() && pivots.is_empty() {
+                if !continuous_finished {
+                    // Candidate convergence. Stop observing, take everything still
+                    // buffered, and only then decide: a frame captured moments ago may
+                    // name a network or a router that still needs traversing.
+                    continuous_finished = true;
+                    if let Some(source) = &self.continuous {
+                        let networks_before: HashSet<IpNet> =
+                            graph.networks().into_iter().collect();
+                        let pivots_before: HashSet<std::net::IpAddr> =
+                            graph.pivot_addresses().into_iter().collect();
+
+                        for ev in source.finish() {
+                            graph.absorb(ev);
+                        }
+
+                        let gained_network = graph
+                            .networks()
+                            .into_iter()
+                            .any(|n| !networks_before.contains(&n));
+                        let gained_pivot = graph
+                            .pivot_addresses()
+                            .into_iter()
+                            .any(|a| !pivots_before.contains(&a) && !interrogated.contains(&a));
+
+                        if gained_network || gained_pivot {
+                            // The final drain extended the topology, so traversal resumes.
+                            continue;
+                        }
+                    }
+                }
                 converged = true;
                 break;
             }
@@ -252,6 +308,14 @@ impl DiscoveryEngine {
                     scope: Some(scope),
                     runs,
                 });
+            }
+        }
+
+        // Reaching the iteration ceiling must still stop observation; otherwise the capture
+        // thread outlives the run and the frame count is never final.
+        if !continuous_finished && let Some(source) = &self.continuous {
+            for ev in source.finish() {
+                graph.absorb(ev);
             }
         }
 
@@ -357,7 +421,142 @@ pub fn is_virtual_interface(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{Vantage, VantageKind};
+    use crate::topology::TopologyEvidence;
+    use crate::topology::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal};
     use std::str::FromStr;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A continuous source that yields evidence only at the very end, standing in for a
+    /// frame captured moments before convergence.
+    struct LateSource {
+        drains: AtomicUsize,
+        finishes: AtomicUsize,
+        /// Emitted from `finish` only.
+        final_evidence: Mutex<Vec<TopologyEvidence>>,
+    }
+
+    impl LateSource {
+        fn new(final_evidence: Vec<TopologyEvidence>) -> Self {
+            Self {
+                drains: AtomicUsize::new(0),
+                finishes: AtomicUsize::new(0),
+                final_evidence: Mutex::new(final_evidence),
+            }
+        }
+    }
+
+    impl ContinuousSource for LateSource {
+        fn drain(&self) -> Vec<TopologyEvidence> {
+            self.drains.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+
+        fn finish(&self) -> Vec<TopologyEvidence> {
+            self.finishes.fetch_add(1, Ordering::Relaxed);
+            std::mem::take(&mut *self.final_evidence.lock().unwrap())
+        }
+    }
+
+    fn context() -> DiscoveryContext {
+        DiscoveryContext::seed(
+            Vantage {
+                interface: "test0".to_string(),
+                kind: VantageKind::Wired,
+                capture_available: true,
+            },
+            std::time::Duration::from_millis(1),
+            4,
+        )
+    }
+
+    fn evidence(fact: Fact) -> TopologyEvidence {
+        TopologyEvidence::new(fact, EvidenceSource::Stp, Confidence::Observed, "test0")
+    }
+
+    #[tokio::test]
+    async fn evidence_arriving_just_before_convergence_is_retained() {
+        // The buffer is emptied only at finish, so this evidence exists solely in the
+        // final drain. Before the fix it was discarded with the capture thread.
+        let source = Arc::new(LateSource::new(vec![evidence(Fact::Vlan { id: 77 })]));
+        let engine = DiscoveryEngine::new(Vec::new(), Vec::new())
+            .with_continuous_source(source.clone() as Arc<dyn ContinuousSource>);
+
+        let report = engine.run(context(), None).await;
+
+        assert!(
+            report.graph.vlans_without_prefix().any(|v| v == 77),
+            "evidence from the final drain must reach the graph"
+        );
+        assert!(report.converged);
+    }
+
+    #[tokio::test]
+    async fn capture_is_polled_before_every_convergence_decision_and_finished_once() {
+        let source = Arc::new(LateSource::new(Vec::new()));
+        let engine = DiscoveryEngine::new(Vec::new(), Vec::new())
+            .with_continuous_source(source.clone() as Arc<dyn ContinuousSource>);
+
+        let _ = engine.run(context(), None).await;
+
+        assert!(
+            source.drains.load(Ordering::Relaxed) >= 1,
+            "the source must be polled before convergence is decided"
+        );
+        assert_eq!(
+            source.finishes.load(Ordering::Relaxed),
+            1,
+            "capture must be finished exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_drain_that_adds_topology_resumes_traversal() {
+        // A late router observation must be able to extend the run, not merely be recorded
+        // after everything has stopped.
+        let mac = DeviceKey::mac("00:11:22:33:44:55");
+        let source = Arc::new(LateSource::new(vec![
+            evidence(Fact::DeviceAddress {
+                device: mac.clone(),
+                address: "10.9.9.1".parse().unwrap(),
+            }),
+            evidence(Fact::DeviceRoleSignal {
+                device: mac,
+                signal: RoleSignal::DefaultGateway,
+            }),
+            evidence(Fact::Network {
+                prefix: IpNet::from_str("10.9.9.0/24").unwrap(),
+            }),
+        ]));
+
+        let engine = DiscoveryEngine::new(Vec::new(), Vec::new())
+            .with_continuous_source(source.clone() as Arc<dyn ContinuousSource>);
+        let report = engine.run(context(), None).await;
+
+        assert!(
+            report
+                .graph
+                .networks()
+                .contains(&IpNet::from_str("10.9.9.0/24").unwrap()),
+            "the late network must be present"
+        );
+        // The resumed pass must have processed it as a scope like any other network.
+        assert!(
+            report
+                .scope_runs
+                .iter()
+                .any(|r| r.scope == Some(IpNet::from_str("10.9.9.0/24").unwrap())),
+            "traversal must resume so a late network is still examined"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_continuous_source_still_converges() {
+        let engine = DiscoveryEngine::new(Vec::new(), Vec::new());
+        let report = engine.run(context(), None).await;
+        assert!(report.converged);
+    }
 
     #[test]
     fn slash_24_is_enumerable() {

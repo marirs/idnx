@@ -4,13 +4,54 @@
 //! seed of every discovery run and the reason the engine still produces a useful map on a
 //! network where nothing answers SNMP.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::IpNet;
 
 use super::{DiscoveryContext, DiscoveryProvider, ProviderFuture};
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal};
+
+/// IPv4 addresses configured on the selected interface.
+///
+/// Needed because Windows `route print` reports the interface by its address where the
+/// Unix tools report a name, so route matching has to accept both forms.
+fn selected_interface_addresses(name: &str) -> Vec<Ipv4Addr> {
+    crate::net::interface::list_ipv4_interfaces()
+        .map(|list| {
+            list.into_iter()
+                .filter(|i| i.interface_name.eq_ignore_ascii_case(name))
+                .map(|i| i.ip)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a kernel route belongs to the selected interface.
+///
+/// Selecting an interface has to change what is discovered, not merely what the output is
+/// labelled: importing every interface's routes would put unrelated networks — a second NIC,
+/// a VPN tunnel, a container bridge — into the recursive queue regardless of the choice.
+///
+/// A route whose interface is unknown is excluded. Guessing that it belongs to the selected
+/// link is the same class of assumption this engine refuses everywhere else.
+pub fn route_belongs_to_interface(
+    route_interface: Option<&str>,
+    selected: &str,
+    selected_addresses: &[Ipv4Addr],
+) -> bool {
+    let Some(found) = route_interface else {
+        return false;
+    };
+    if found.eq_ignore_ascii_case(selected) {
+        return true;
+    }
+    // Windows form: the "interface" column holds an address.
+    found
+        .parse::<Ipv4Addr>()
+        .map(|addr| selected_addresses.contains(&addr))
+        .unwrap_or(false)
+}
 
 /// Local interface addresses and their prefixes.
 ///
@@ -36,6 +77,15 @@ impl DiscoveryProvider for InterfaceProvider {
             };
 
             for iface in interfaces {
+                // Only the selected vantage. Emitting every interface's network would make
+                // `idnx eth1` discover eth0's and every tunnel's topology too.
+                if !iface
+                    .interface_name
+                    .eq_ignore_ascii_case(&context.vantage.interface)
+                {
+                    continue;
+                }
+
                 let prefix = IpNet::V4(iface.cidr);
                 out.push(
                     TopologyEvidence::new(
@@ -108,8 +158,17 @@ impl DiscoveryProvider for KernelRouteProvider {
         Box::pin(async move {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
+            let selected_addresses = selected_interface_addresses(vantage);
 
             for route in crate::net::routes::harvest_kernel_routes().await {
+                if !route_belongs_to_interface(
+                    route.interface.as_deref(),
+                    vantage,
+                    &selected_addresses,
+                ) {
+                    continue;
+                }
+
                 let prefix_len = route.destination.prefix_len();
 
                 // A default route carries no network of its own, but its gateway is the
@@ -368,6 +427,40 @@ mod tests {
 
         // The neighbour cache does apply per-scope: it is filtered by the scope itself.
         assert!(NeighborCacheProvider.applies(&scoped));
+    }
+
+    #[test]
+    fn routes_on_other_interfaces_are_excluded() {
+        // `idnx eth1` must change what is discovered, not just the label. Importing eth0's
+        // or a container bridge's routes would put unrelated networks into the queue.
+        let addrs = [Ipv4Addr::new(10, 0, 0, 5)];
+
+        assert!(route_belongs_to_interface(Some("eth1"), "eth1", &addrs));
+        assert!(route_belongs_to_interface(Some("ETH1"), "eth1", &addrs));
+
+        assert!(!route_belongs_to_interface(Some("eth0"), "eth1", &addrs));
+        assert!(!route_belongs_to_interface(Some("feth466"), "eth1", &addrs));
+        assert!(!route_belongs_to_interface(Some("utun3"), "eth1", &addrs));
+        assert!(!route_belongs_to_interface(Some("docker0"), "eth1", &addrs));
+    }
+
+    #[test]
+    fn windows_routes_match_by_interface_address() {
+        // `route print` names the interface by its address rather than a device name.
+        let addrs = [Ipv4Addr::new(10, 0, 0, 5)];
+        assert!(route_belongs_to_interface(Some("10.0.0.5"), "eth1", &addrs));
+        assert!(!route_belongs_to_interface(
+            Some("10.0.0.9"),
+            "eth1",
+            &addrs
+        ));
+    }
+
+    #[test]
+    fn a_route_with_no_known_interface_is_not_assumed_to_be_ours() {
+        // Guessing that an unattributed route belongs to the selected link is the same
+        // class of assumption the engine refuses everywhere else.
+        assert!(!route_belongs_to_interface(None, "eth1", &[]));
     }
 
     #[test]

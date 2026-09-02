@@ -169,27 +169,30 @@ async fn run() {
         &start.vantage.interface,
     ));
 
-    let mut scope_providers = providers::network::network_providers();
-    if observation.is_running() {
-        scope_providers.push(Box::new(providers::passive::PassiveProvider::new(
-            std::sync::Arc::clone(&observation),
-        )));
-    }
-
-    let engine = engine::orchestrator::DiscoveryEngine::new(
+    // The engine owns the observation's lifecycle: it polls before every convergence
+    // decision and stops capture itself, so no frame is stranded in the buffer.
+    let mut engine = engine::orchestrator::DiscoveryEngine::new(
         providers::local::local_providers(),
-        scope_providers,
+        providers::network::network_providers(),
     );
+    if observation.is_running() {
+        engine = engine.with_continuous_source(
+            observation.clone() as std::sync::Arc<dyn providers::ContinuousSource>
+        );
+    }
 
     println!("{} Discovering topology...", "[*]".blue().bold());
     let mut report = engine.run(context, start.network).await;
 
-    // Convergence is the stopping condition for observation too.
-    let frames_seen = observation.frames_seen();
     if let Some(reason) = observation.unavailable_reason() {
         report.visibility.unavailable.push(reason);
     } else {
-        report.visibility.observed_frames.replace(frames_seen);
+        // Read only after the engine stopped capture, so the count is final.
+        debug_assert!(observation.is_stopped());
+        report
+            .visibility
+            .observed_frames
+            .replace(observation.frames_seen());
     }
 
     output::topology_view::render(&report, &start);

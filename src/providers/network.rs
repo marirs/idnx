@@ -183,106 +183,6 @@ impl DiscoveryProvider for MndpProvider {
     }
 }
 
-/// Layer 2 LLDP and CDP capture.
-///
-/// Privileged and vantage-dependent. Absence of frames here proves nothing: a wireless
-/// station or an access port may legitimately receive none, which the visibility report
-/// states rather than implying no switches exist.
-pub struct LinkLayerProvider;
-
-impl DiscoveryProvider for LinkLayerProvider {
-    fn name(&self) -> &'static str {
-        "lldp-cdp"
-    }
-
-    fn applies(&self, context: &DiscoveryContext) -> bool {
-        context.target.is_none() && context.vantage.capture_available
-    }
-
-    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
-            let mut out = Vec::new();
-            let vantage = &context.vantage.interface;
-
-            let result = crate::probes::lldp::capture_lldp_neighbors(
-                &context.vantage.interface,
-                Duration::from_millis(900),
-            )
-            .await;
-
-            let crate::probes::lldp::LldpCaptureResult::Success(neighbors) = result else {
-                return out;
-            };
-
-            for n in neighbors {
-                let device = DeviceKey::mac(&n.chassis_id);
-
-                if let Some(name) = n.system_name.clone() {
-                    out.push(TopologyEvidence::new(
-                        Fact::DeviceHostname {
-                            device: device.clone(),
-                            hostname: name,
-                        },
-                        EvidenceSource::Lldp,
-                        Confidence::Advertised,
-                        vantage,
-                    ));
-                }
-
-                if let Some(desc) = n.system_description.clone() {
-                    out.push(TopologyEvidence::new(
-                        Fact::DeviceDescription {
-                            device: device.clone(),
-                            text: desc,
-                        },
-                        EvidenceSource::Lldp,
-                        Confidence::Advertised,
-                        vantage,
-                    ));
-                }
-
-                // Capability bits are the neighbour's own statement of what it does.
-                for cap in &n.capabilities {
-                    let signal = if cap.contains("Router") {
-                        RoleSignal::LinkLayerCapability("Router")
-                    } else if cap.contains("Bridge") || cap.contains("Switch") {
-                        RoleSignal::LinkLayerCapability("Bridge/Switch")
-                    } else {
-                        continue;
-                    };
-                    out.push(
-                        TopologyEvidence::new(
-                            Fact::DeviceRoleSignal {
-                                device: device.clone(),
-                                signal,
-                            },
-                            EvidenceSource::Lldp,
-                            Confidence::Advertised,
-                            vantage,
-                        )
-                        .with_detail(format!("port {}", n.port_id)),
-                    );
-                }
-
-                // A management address is a pivot: a device we can go on to interrogate.
-                if let Some(mgmt) = n.management_ip {
-                    out.push(TopologyEvidence::new(
-                        Fact::DeviceAddress {
-                            device,
-                            address: IpAddr::V4(mgmt),
-                        },
-                        EvidenceSource::Lldp,
-                        Confidence::Advertised,
-                        vantage,
-                    ));
-                }
-            }
-
-            out
-        })
-    }
-}
-
 /// Vendor-proprietary discovery broadcasts.
 ///
 /// Deliberately generic. Vendor mechanisms live behind this one provider so that no
@@ -676,7 +576,6 @@ pub fn network_providers() -> Vec<Box<dyn DiscoveryProvider>> {
     vec![
         Box::new(SsdpProvider),
         Box::new(MndpProvider),
-        Box::new(LinkLayerProvider),
         Box::new(VendorDiscoveryProvider),
         Box::new(SnmpProvider),
         Box::new(HostEnrichmentProvider::default()),
@@ -701,9 +600,13 @@ mod tests {
     }
 
     #[test]
-    fn link_layer_provider_is_skipped_without_capture() {
-        assert!(!LinkLayerProvider.applies(&ctx(VantageKind::Wireless, false)));
-        assert!(LinkLayerProvider.applies(&ctx(VantageKind::Wired, true)));
+    fn no_network_provider_opens_a_capture_device() {
+        // Capture belongs solely to the continuous passive source. A second provider
+        // opening its own device competed for BPF devices on macOS and reintroduced the
+        // fixed listening delay this design removed.
+        let names: Vec<&str> = network_providers().iter().map(|p| p.name()).collect();
+        assert!(!names.contains(&"lldp-cdp"));
+        assert!(!names.contains(&"passive-capture"));
     }
 
     #[test]

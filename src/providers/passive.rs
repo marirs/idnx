@@ -1,20 +1,25 @@
-//! The passive observation provider.
+//! Passive link-layer observation.
 //!
-//! Capture opens once at startup and runs concurrently with the rest of discovery. This
-//! provider drains whatever has been decoded so far each time it is asked, so observations
-//! flow into the graph as they arrive without anyone waiting on a timer. There is no
-//! listening flag, no fixed delay, and no separate passive mode.
+//! Capture opens once at startup and runs concurrently with the rest of discovery. It is a
+//! [`ContinuousSource`](crate::providers::ContinuousSource) rather than a provider, because
+//! frames arrive on their own schedule rather than in response to a request: the engine
+//! polls it before every convergence decision and finishes it exactly once, so evidence
+//! landing moments before the end is still absorbed and can still extend the traversal.
+//!
+//! This is the only capture path. There is no listening flag, no fixed delay and no
+//! separate passive mode, and nothing else opens a capture device.
 //!
 //! It is strictly opportunistic. If capture cannot start, or the link is silent, every
-//! other provider is unaffected and the run proceeds normally.
+//! other source is unaffected and the run proceeds normally.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
-use super::{DiscoveryContext, DiscoveryProvider, ProviderFuture};
+use super::DiscoveryContext;
 use crate::net::capture::{CaptureError, CaptureSession};
 use crate::probes::passive::{FrameFact, decode_frame};
 use crate::topology::TopologyEvidence;
@@ -27,12 +32,19 @@ struct Observed {
 }
 
 /// A running passive observation, owning its capture session.
+///
+/// The session sits behind a lock because the engine stops it through a shared reference:
+/// capture must end at convergence, not whenever the last handle happens to be dropped.
 pub struct PassiveObservation {
     observed: Arc<Mutex<Observed>>,
-    session: Option<CaptureSession>,
+    session: Mutex<Option<CaptureSession>>,
     /// Why capture is not running, when it is not.
     unavailable: Option<CaptureError>,
     interface: String,
+    /// Frame count sampled at shutdown, so the reported total is final rather than a
+    /// reading taken while frames were still arriving.
+    final_frames: AtomicU64,
+    stopped: AtomicBool,
 }
 
 impl PassiveObservation {
@@ -57,35 +69,61 @@ impl PassiveObservation {
         match result {
             Ok(session) => Self {
                 observed,
-                session: Some(session),
+                session: Mutex::new(Some(session)),
                 unavailable: None,
                 interface: interface.to_string(),
+                final_frames: AtomicU64::new(0),
+                stopped: AtomicBool::new(false),
             },
             Err(err) => Self {
                 observed,
-                session: None,
+                session: Mutex::new(None),
                 unavailable: Some(err),
                 interface: interface.to_string(),
+                final_frames: AtomicU64::new(0),
+                stopped: AtomicBool::new(true),
             },
         }
     }
 
     pub fn is_running(&self) -> bool {
-        self.session.is_some()
+        self.unavailable.is_none()
     }
 
     pub fn unavailable_reason(&self) -> Option<String> {
         self.unavailable.as_ref().map(|e| e.explain())
     }
 
+    /// Frames observed. Final once capture has stopped.
     pub fn frames_seen(&self) -> u64 {
-        self.session.as_ref().map(|s| s.frames_seen()).unwrap_or(0)
+        if self.stopped.load(Ordering::Relaxed) {
+            return self.final_frames.load(Ordering::Relaxed);
+        }
+        self.session
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|s| s.frames_seen()))
+            .unwrap_or(0)
     }
 
-    /// Stops capture. Called once discovery converges.
-    pub fn stop(&mut self) {
-        if let Some(session) = self.session.as_mut() {
+    /// True once capture has been stopped.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Stops capture and records the final frame count. Idempotent.
+    pub fn stop(&self) {
+        if self.stopped.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut guard) = self.session.lock()
+            && let Some(mut session) = guard.take()
+        {
             session.stop();
+            // Sampled after the reader thread has joined, so no frame is counted late or
+            // missed.
+            self.final_frames
+                .store(session.frames_seen(), Ordering::Relaxed);
         }
     }
 
@@ -100,33 +138,18 @@ impl PassiveObservation {
     }
 }
 
-/// Provider view over a running observation.
-pub struct PassiveProvider {
-    observation: Arc<PassiveObservation>,
-}
-
-impl PassiveProvider {
-    pub fn new(observation: Arc<PassiveObservation>) -> Self {
-        Self { observation }
-    }
-}
-
-impl DiscoveryProvider for PassiveProvider {
-    fn name(&self) -> &'static str {
-        "passive-capture"
+impl crate::providers::ContinuousSource for PassiveObservation {
+    fn drain(&self) -> Vec<TopologyEvidence> {
+        let facts = PassiveObservation::drain(self);
+        convert_unscoped(&facts, &self.interface)
     }
 
-    fn applies(&self, context: &DiscoveryContext) -> bool {
-        // Observation belongs to the link, not to a remote device, so it never runs
-        // against a specific target.
-        self.observation.is_running() && context.target.is_none()
-    }
-
-    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
-            let facts = self.observation.drain();
-            convert(&facts, &self.observation.interface, context)
-        })
+    fn finish(&self) -> Vec<TopologyEvidence> {
+        // Stop first, then drain: draining first would race the reader and lose whatever it
+        // decoded between the two calls.
+        self.stop();
+        let facts = PassiveObservation::drain(self);
+        convert_unscoped(&facts, &self.interface)
     }
 }
 
@@ -498,6 +521,23 @@ fn convert(
     out
 }
 
+/// Converts frame facts with no scope filter.
+///
+/// Used by the continuous path, where evidence is absorbed for the whole vantage rather
+/// than for one network under examination.
+fn convert_unscoped(facts: &[FrameFact], interface: &str) -> Vec<TopologyEvidence> {
+    let context = DiscoveryContext::seed(
+        crate::providers::Vantage {
+            interface: interface.to_string(),
+            kind: crate::providers::VantageKind::Unknown,
+            capture_available: true,
+        },
+        std::time::Duration::from_millis(0),
+        1,
+    );
+    convert(facts, interface, &context)
+}
+
 /// Whether an address belongs to the scope currently being examined.
 fn in_scope(context: &DiscoveryContext, address: &IpAddr) -> bool {
     match context.scope {
@@ -650,6 +690,73 @@ mod tests {
             &scoped,
         );
         assert!(evidence.is_empty());
+    }
+
+    #[test]
+    fn an_unavailable_observation_reports_itself_stopped() {
+        // Capture that never started must not leave the engine waiting to stop it, and its
+        // frame count must be zero rather than an uninitialised reading.
+        let observation = PassiveObservation {
+            observed: Arc::new(Mutex::new(Observed::default())),
+            session: Mutex::new(None),
+            unavailable: Some(CaptureError::PermissionDenied),
+            interface: "test0".to_string(),
+            final_frames: AtomicU64::new(0),
+            stopped: AtomicBool::new(true),
+        };
+
+        assert!(!observation.is_running());
+        assert!(observation.is_stopped());
+        assert_eq!(observation.frames_seen(), 0);
+        assert!(
+            observation
+                .unavailable_reason()
+                .unwrap()
+                .contains("privileges")
+        );
+    }
+
+    #[test]
+    fn stopping_is_idempotent_and_freezes_the_frame_count() {
+        let observation = PassiveObservation {
+            observed: Arc::new(Mutex::new(Observed::default())),
+            session: Mutex::new(None),
+            unavailable: None,
+            interface: "test0".to_string(),
+            final_frames: AtomicU64::new(11),
+            stopped: AtomicBool::new(false),
+        };
+
+        observation.stop();
+        assert!(observation.is_stopped());
+        let first = observation.frames_seen();
+
+        // A second stop must not reset or re-sample the total.
+        observation.stop();
+        assert_eq!(observation.frames_seen(), first);
+    }
+
+    #[test]
+    fn finish_stops_capture_before_draining() {
+        use crate::providers::ContinuousSource;
+
+        let observation = PassiveObservation {
+            observed: Arc::new(Mutex::new(Observed {
+                facts: vec![FrameFact::Vlan { id: 31 }],
+            })),
+            session: Mutex::new(None),
+            unavailable: None,
+            interface: "test0".to_string(),
+            final_frames: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+        };
+
+        let evidence = ContinuousSource::finish(&observation);
+        assert!(observation.is_stopped(), "finish must stop capture");
+        assert_eq!(evidence.len(), 1, "buffered facts must still be returned");
+
+        // Nothing remains afterwards.
+        assert!(ContinuousSource::finish(&observation).is_empty());
     }
 
     #[test]
