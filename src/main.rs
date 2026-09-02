@@ -41,7 +41,11 @@ struct Cli {
     interface: Option<String>,
 
     /// Target ports or ranges separated by commas (e.g. 22,80,443 or 80-90 or 'common')
-    #[arg(short, long, default_value = "21,22,23,25,53,80,161,443,445,1234,8000,8080,8443,11434")]
+    #[arg(
+        short,
+        long,
+        default_value = "21,22,23,25,53,80,161,443,445,1234,8000,8080,8443,11434"
+    )]
     ports: String,
 
     /// Timeout in milliseconds per port probe
@@ -80,6 +84,18 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     heuristic_sweep: bool,
 
+    /// Widen each upstream TTL hop into an assumed /24 network.
+    /// A hop only proves a router interface exists on the path, so results are
+    /// reported as inferred rather than observed. Off by default.
+    #[arg(long, default_value_t = false)]
+    infer_hop_subnets: bool,
+
+    /// Off-link IPv4 destination for TTL hop discovery.
+    /// Defaults to the first public nameserver in the system resolver configuration;
+    /// hop discovery is skipped when every configured resolver is private.
+    #[arg(long)]
+    trace_target: Option<std::net::Ipv4Addr>,
+
     /// SNMP target UDP port (default: 161)
     #[arg(long, default_value_t = 161)]
     snmp_port: u16,
@@ -99,6 +115,13 @@ struct Cli {
     /// Maximum recursion depth for discovered subnets (default: 2)
     #[arg(long, default_value_t = 2)]
     max_depth: usize,
+
+    /// Largest auto-discovered network to sweep host by host (default: 4096, a /20).
+    /// Wider networks are still reported and interrogated over SNMP, but not enumerated;
+    /// kernel routes routinely carry /16s belonging to VM and container bridges.
+    /// Subnets given explicitly via --subnets are always swept in full.
+    #[arg(long, default_value_t = idnx::engine::deep::DEFAULT_MAX_SWEEP_HOSTS)]
+    max_sweep_hosts: usize,
 
     /// Download and update the local IEEE OUI vendor registry (~/.cache/idnx/oui.txt)
     #[arg(long = "update-oui", default_value_t = false)]
@@ -200,6 +223,19 @@ async fn main() {
         );
     }
 
+    // When the target was given as an explicit CIDR there is no interface context, but the
+    // OS default gateway is still knowable. Adopt it only if it actually falls inside the
+    // scanned network — attaching an unrelated router to the export would be a fabrication.
+    let resolved_local_gateway = local_info_opt
+        .as_ref()
+        .and_then(|info| info.default_gateway)
+        .or_else(|| {
+            net::interface::detect_local_network()
+                .ok()
+                .and_then(|info| info.default_gateway)
+                .filter(|gw| target_cidr.contains(gw))
+        });
+
     let ports = match engine::scanner::parse_ports(&cli.ports) {
         Ok(p) => p,
         Err(e) => {
@@ -214,9 +250,11 @@ async fn main() {
             .map(|info| info.interface_name.as_str())
     });
 
-    let iface_name = iface_filter.unwrap_or("en0");
-
-    if let Some(speed_info) = crate::net::link_speed::get_interface_link_speed(iface_name) {
+    // No hardcoded fallback: on a machine whose primary interface is not en0, guessing
+    // one silently captures on the wrong link and reports another segment's neighbours.
+    if let Some(iface_name) = iface_filter
+        && let Some(speed_info) = crate::net::link_speed::get_interface_link_speed(iface_name)
+    {
         println!(
             "{} Interface Link Speed: {}",
             "[*]".blue().bold(),
@@ -234,41 +272,66 @@ async fn main() {
         cli.timeout
     );
 
-    // Layer 2 Hardware Discovery (LLDP - IEEE 802.1AB)
-    let iface_name = iface_filter.unwrap_or("en0");
-    match probes::lldp::capture_lldp_neighbors(iface_name, Duration::from_millis(600)).await {
-        probes::lldp::LldpCaptureResult::Success(neighbors) => {
-            if !neighbors.is_empty() {
-                println!(
-                    "{} Captured {} Layer 2 LLDP hardware advertisement(s):",
-                    "[+]".green().bold(),
-                    neighbors.len().to_string().cyan().bold()
-                );
-                for n in &neighbors {
+    // Layer 2 Hardware Discovery (LLDP - IEEE 802.1AB, and CDP via the same capture)
+    //
+    // Management addresses advertised by neighbours are fed into topology discovery below
+    // as pivots to interrogate. Previously they were parsed, printed and discarded.
+    let mut lldp_management_ips: Vec<std::net::Ipv4Addr> = Vec::new();
+
+    match iface_filter {
+        Some(iface_name) => {
+            match probes::lldp::capture_lldp_neighbors(iface_name, Duration::from_millis(600)).await
+            {
+                probes::lldp::LldpCaptureResult::Success(neighbors) => {
+                    if !neighbors.is_empty() {
+                        println!(
+                            "{} Captured {} Layer 2 LLDP/CDP hardware advertisement(s):",
+                            "[+]".green().bold(),
+                            neighbors.len().to_string().cyan().bold()
+                        );
+                        for n in &neighbors {
+                            println!(
+                                "    └── 🔌 [{}] Port: {} | System: {} | Mgmt: {} | Desc: {}",
+                                n.chassis_id.cyan().bold(),
+                                n.port_id.yellow(),
+                                n.system_name.as_deref().unwrap_or("Unknown").green().bold(),
+                                n.management_ip
+                                    .map(|ip| ip.to_string())
+                                    .unwrap_or_else(|| "N/A".to_string())
+                                    .magenta(),
+                                n.system_description.as_deref().unwrap_or("N/A").dimmed()
+                            );
+                            if let Some(mgmt) = n.management_ip
+                                && !lldp_management_ips.contains(&mgmt)
+                            {
+                                lldp_management_ips.push(mgmt);
+                            }
+                        }
+                    }
+                }
+                probes::lldp::LldpCaptureResult::PermissionDenied => {
                     println!(
-                        "    └── 🔌 [{}] Port: {} | System: {} | Desc: {}",
-                        n.chassis_id.cyan().bold(),
-                        n.port_id.yellow(),
-                        n.system_name.as_deref().unwrap_or("Unknown").green().bold(),
-                        n.system_description.as_deref().unwrap_or("N/A").dimmed()
+                        "{} PRIVILEGED DISCOVERY DISABLED (Non-Root / No Sudo):",
+                        "[!]".yellow().bold()
+                    );
+                    println!(
+                        "    ├── Layer 2 LLDP/CDP hardware switch discovery: DISABLED (Requires raw BPF / AF_PACKET)"
+                    );
+                    println!("    ├── Deep switch port map detection: REDUCED");
+                    println!(
+                        "    └── Recommendation: Run with 'sudo idnx' for full infrastructure visibility."
                     );
                 }
+                probes::lldp::LldpCaptureResult::NotSupported(_) => {}
             }
         }
-        probes::lldp::LldpCaptureResult::PermissionDenied => {
+        None => {
             println!(
-                "{} PRIVILEGED DISCOVERY DISABLED (Non-Root / No Sudo):",
-                "[!]".yellow().bold()
-            );
-            println!(
-                "    ├── Layer 2 LLDP/CDP hardware switch discovery: DISABLED (Requires raw BPF / AF_PACKET)"
-            );
-            println!("    ├── Deep switch port map detection: REDUCED");
-            println!(
-                "    └── Recommendation: Run with 'sudo idnx' for full infrastructure visibility."
+                "{} Layer 2 LLDP/CDP capture skipped: no local interface resolved for target {}.",
+                "[!]".yellow().bold(),
+                target_cidr.to_string().yellow()
             );
         }
-        probes::lldp::LldpCaptureResult::NotSupported(_) => {}
     }
 
     // MikroTik Neighbor Discovery Protocol (MNDP)
@@ -291,6 +354,28 @@ async fn main() {
         }
     }
 
+    // ASUS Router Discovery Protocol (UDP 9999 / 18017)
+    let asus_routers = probes::asus::discover_asus_routers(Duration::from_millis(300)).await;
+    if !asus_routers.is_empty() {
+        println!(
+            "{} Discovered {} ASUSWRT router(s):",
+            "[+]".green().bold(),
+            asus_routers.len().to_string().cyan().bold()
+        );
+        for a in &asus_routers {
+            println!(
+                "    └── 📡 [{}] Model: {} | Firmware: {} | SSID: {}",
+                a.ip.to_string().cyan().bold(),
+                a.model_name
+                    .as_deref()
+                    .unwrap_or("ASUS Router")
+                    .green()
+                    .bold(),
+                a.firmware_version.as_deref().unwrap_or("N/A").dimmed(),
+                a.ssid.as_deref().unwrap_or("N/A").yellow()
+            );
+        }
+    }
 
     if !cli.no_deep {
         println!(
@@ -344,18 +429,25 @@ async fn main() {
             port: cli.snmp_port,
         };
 
-        engine::deep::explore_downstream_networks(
-            &target_cidr,
-            cli.subnets.as_deref(),
-            &ports,
-            cli.concurrency,
-            timeout_duration,
-            Some(&snmp_cfg),
-            cli.recursive,
-            cli.max_depth,
-            cli.heuristic_sweep,
-        )
-        .await
+        let deep_cfg = engine::deep::DeepScanConfig {
+            ports: &ports,
+            extra_subnets: cli.subnets.as_deref(),
+            interface: iface_filter,
+            lldp_management_ips: &lldp_management_ips,
+            concurrency: cli.concurrency,
+            timeout: timeout_duration,
+            snmp: Some(&snmp_cfg),
+            recursive: cli.recursive,
+            max_depth: cli.max_depth,
+            max_sweep_hosts: cli.max_sweep_hosts,
+            route_options: idnx::net::routes::RouteDiscoveryOptions {
+                enable_heuristic_sweep: cli.heuristic_sweep,
+                infer_hop_subnets: cli.infer_hop_subnets,
+                trace_target: cli.trace_target,
+            },
+        };
+
+        engine::deep::explore_downstream_networks(&target_cidr, &deep_cfg).await
     } else {
         Vec::new()
     };
@@ -391,6 +483,7 @@ async fn main() {
             &target_cidr,
             &summary,
             &child_networks,
+            resolved_local_gateway,
         ) {
             Ok(path) => {
                 println!(

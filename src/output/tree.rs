@@ -223,12 +223,31 @@ pub fn print_topology_tree(
 
             let subnet_label = child.cidr.to_string().cyan().bold().to_string();
 
+            // Show how this subnet was learned and how strong that evidence is, so a
+            // guessed network can never read as an observed one.
+            let host_summary = if child.sweep_skipped {
+                format!(
+                    "{} hosts via router ARP cache; {} addresses not swept",
+                    child.summary.active_hosts.len(),
+                    child.summary.total_hosts
+                )
+            } else {
+                format!("{} hosts active", child.summary.active_hosts.len())
+            };
+
             println!(
-                "{}{} 🔀 Subnet: {} [{} hosts active]",
+                "{}{} 🔀 Subnet: {} [{}] {}",
                 indent,
                 sub_branch,
                 subnet_label,
-                child.summary.active_hosts.len()
+                host_summary,
+                format!(
+                    "[{} {} via {}]",
+                    child.confidence.marker(),
+                    child.confidence.display_name(),
+                    child.source.display_name()
+                )
+                .dimmed()
             );
 
             // Separate gateway/switch from connected endpoints
@@ -236,7 +255,7 @@ pub fn print_topology_tree(
             let mut endpoints = Vec::new();
 
             for host in &child.summary.active_hosts {
-                let is_gw = host.ip == child.gateway;
+                let is_gw = child.gateway == Some(host.ip);
                 let role = classify_host(host, is_gw);
                 if is_gw || role == DeviceRole::GatewayRouter || role == DeviceRole::Switch {
                     switch_gws.push(host);
@@ -330,7 +349,11 @@ pub fn print_topology_tree(
     let total_ai_agents: usize = summary
         .active_hosts
         .iter()
-        .chain(child_networks.iter().flat_map(|c| c.summary.active_hosts.iter()))
+        .chain(
+            child_networks
+                .iter()
+                .flat_map(|c| c.summary.active_hosts.iter()),
+        )
         .filter(|h| h.ai_runtime.is_some())
         .count();
     if total_ai_agents > 0 {

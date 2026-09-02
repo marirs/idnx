@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod asus;
 pub mod cdp;
 pub mod lldp;
 pub mod mndp;

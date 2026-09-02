@@ -100,7 +100,9 @@ pub fn export_interactive_topology_html(
         switch_parent_id = sw_id;
     }
 
-    let default_gw = crate::net::interface::detect_local_network().ok().and_then(|i| i.default_gateway);
+    let default_gw = crate::net::interface::detect_local_network()
+        .ok()
+        .and_then(|i| i.default_gateway);
 
     // 3. Add Local Network Hosts
     for host in &summary.active_hosts {
@@ -136,21 +138,38 @@ pub fn export_interactive_topology_html(
             vendor: None,
             hostname: child.snmp_system_name.clone(),
             ports: Vec::new(),
-            details: child.snmp_system_descr.clone(),
+            details: Some(match child.snmp_system_descr {
+                Some(ref descr) => format!(
+                    "{}\nEvidence: {} ({})",
+                    descr,
+                    child.source.display_name(),
+                    child.confidence.display_name()
+                ),
+                None => format!(
+                    "Evidence: {} ({})",
+                    child.source.display_name(),
+                    child.confidence.display_name()
+                ),
+            }),
             color: "#ec4899".to_string(),
             radius: 26.0,
         });
 
-        // Link child network to local subnet
+        // Link child network to local subnet, labelled with the evidence that produced
+        // it rather than a generic "Routed Gateway" that implies more than we observed.
         links.push(GraphLink {
             source: root_id.clone(),
             target: child_net_id.clone(),
-            label: Some("Routed Gateway".to_string()),
+            label: Some(format!(
+                "{} ({})",
+                child.source.display_name(),
+                child.confidence.display_name()
+            )),
         });
 
         // Add child network hosts
         for host in &child.summary.active_hosts {
-            let is_gw = host.ip == child.gateway;
+            let is_gw = child.gateway == Some(host.ip);
             let host_node = build_host_node(host, is_gw);
             let host_id = host_node.id.clone();
             nodes.push(host_node);

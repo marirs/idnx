@@ -386,7 +386,11 @@ pub async fn scan_subnet_ext(
 
     // Populate with ARP-discovered devices first (they are 100% active on the wire!)
     for (&ip, arp) in &arp_map {
-        if ip == cidr.broadcast() || ip.is_broadcast() || arp.mac == "ff:ff:ff:ff:ff:ff" || ip.is_multicast() {
+        if ip == cidr.broadcast()
+            || ip.is_broadcast()
+            || arp.mac == "ff:ff:ff:ff:ff:ff"
+            || ip.is_multicast()
+        {
             continue;
         }
         host_results.insert(
@@ -506,18 +510,30 @@ pub async fn scan_subnet_ext(
         .collect();
 
     if !missing_ips.is_empty() {
-        // Query DNS server from:
-        // 1. Any discovered host with port 53 (DNS) open
-        // 2. Kernel default gateway
-        let dns_server_opt = host_results
-            .values()
-            .find(|h| h.open_ports.iter().any(|p| p.port == 53))
-            .map(|h| h.ip)
-            .or_else(|| {
-                crate::net::interface::detect_local_network()
-                    .ok()
-                    .and_then(|info| info.default_gateway)
-            });
+        // Pick the resolver deterministically. `host_results` is a HashMap, so taking the
+        // first port-53 host out of its iteration order made hostname resolution vary
+        // between identical runs — and it preferred an arbitrary DNS host over the router
+        // that actually holds the DHCP lease names.
+        //
+        // Order: the subnet's own gateway, then the numerically lowest host offering DNS,
+        // then the default gateway even if it never answered on 53.
+        let default_gw = crate::net::interface::detect_local_network()
+            .ok()
+            .and_then(|info| info.default_gateway);
+
+        let gateway_in_subnet = default_gw.filter(|gw| cidr.contains(gw));
+
+        let lowest_dns_host = {
+            let mut dns_hosts: Vec<Ipv4Addr> = host_results
+                .values()
+                .filter(|h| h.open_ports.iter().any(|p| p.port == 53))
+                .map(|h| h.ip)
+                .collect();
+            dns_hosts.sort();
+            dns_hosts.first().copied()
+        };
+
+        let dns_server_opt = gateway_in_subnet.or(lowest_dns_host).or(default_gw);
 
         if let Some(gw_ip) = dns_server_opt {
             let dns_ptrs = crate::net::dns::resolve_unicast_dns_ptrs(
@@ -565,9 +581,13 @@ pub async fn scan_subnet_ext(
     // 6. Targeted Deep Protocol Fingerprinting (TLS X.509 Certificate & SMB Negotiate)
     for host in host_results.values_mut() {
         // Probe SMB if port 445 or 139 is open
-        let has_smb = host.open_ports.iter().any(|p| p.port == 445 || p.port == 139);
+        let has_smb = host
+            .open_ports
+            .iter()
+            .any(|p| p.port == 445 || p.port == 139);
         if has_smb
-            && let Some(smb_info) = crate::probes::smb::probe_smb(host.ip, 445, Duration::from_millis(400)).await
+            && let Some(smb_info) =
+                crate::probes::smb::probe_smb(host.ip, 445, Duration::from_millis(400)).await
             && let Some(comp_name) = smb_info.dns_computer_name.or(smb_info.computer_name)
         {
             let domain_tag = smb_info
@@ -590,7 +610,9 @@ pub async fn scan_subnet_ext(
 
         if let Some(p) = tls_port
             && is_hostname_missing
-            && let Some(tls_info) = crate::probes::tls::probe_tls_certificate(host.ip, p, Duration::from_millis(400)).await
+            && let Some(tls_info) =
+                crate::probes::tls::probe_tls_certificate(host.ip, p, Duration::from_millis(400))
+                    .await
             && let Some(cn) = tls_info.common_name
         {
             host.hostname = Some(cn);
@@ -624,8 +646,12 @@ pub async fn scan_subnet_ext(
             .iter()
             .any(|&p| matches!(p, 11434 | 1234 | 8000 | 8080 | 5000 | 3000 | 80 | 443))
         {
-            crate::probes::ai::probe_ai_runtime(host.ip, &open_port_nums, Duration::from_millis(400))
-                .await
+            crate::probes::ai::probe_ai_runtime(
+                host.ip,
+                &open_port_nums,
+                Duration::from_millis(400),
+            )
+            .await
         } else {
             None
         };
@@ -913,18 +939,27 @@ impl Scanner {
     pub async fn scan_deep(&self) -> (ScanSummary, Vec<crate::engine::deep::ChildNetworkResult>) {
         let summary = self.scan().await;
         let children = if self.enable_deep || self.subnets.is_some() {
-            crate::engine::deep::explore_downstream_networks(
-                &self.target,
-                self.subnets.as_deref(),
-                &self.ports,
-                self.concurrency,
-                self.timeout,
-                self.snmp_config.as_ref(),
-                self.recursive,
-                self.max_depth,
-                self.enable_heuristic_sweep,
-            )
-            .await
+            let config = crate::engine::deep::DeepScanConfig {
+                ports: &self.ports,
+                extra_subnets: self.subnets.as_deref(),
+                interface: self.interface.as_deref(),
+                // Library callers that want LLDP/CDP management addresses folded into
+                // discovery capture them first and call `explore_downstream_networks`
+                // directly; the builder path stays privilege-free.
+                lldp_management_ips: &[],
+                concurrency: self.concurrency,
+                timeout: self.timeout,
+                snmp: self.snmp_config.as_ref(),
+                recursive: self.recursive,
+                max_depth: self.max_depth,
+                max_sweep_hosts: crate::engine::deep::DEFAULT_MAX_SWEEP_HOSTS,
+                route_options: crate::net::routes::RouteDiscoveryOptions {
+                    enable_heuristic_sweep: self.enable_heuristic_sweep,
+                    infer_hop_subnets: false,
+                    trace_target: None,
+                },
+            };
+            crate::engine::deep::explore_downstream_networks(&self.target, &config).await
         } else {
             Vec::new()
         };

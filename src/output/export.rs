@@ -35,7 +35,32 @@ pub struct NetworkExport {
     pub generated_at: String,
     pub primary_subnet: String,
     pub total_active_hosts: usize,
+    /// One record per network, carrying the evidence that produced it. Consumers that
+    /// only want an asset list can ignore this; consumers reasoning about topology need
+    /// to know which networks were observed and which were merely advertised.
+    pub networks: Vec<ExportNetwork>,
     pub hosts: Vec<ExportHost>,
+}
+
+/// A network in the result set, with its discovery provenance.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportNetwork {
+    pub cidr: String,
+    /// `local` for the scanned subnet, `cascaded` for anything reached through discovery.
+    pub role: String,
+    /// Router address on this network, when one was actually observed.
+    pub gateway: Option<String>,
+    /// Router this network was learned *from*, when it was learned from one.
+    pub parent_router: Option<String>,
+    pub discovery_source: String,
+    /// `verified`, `advertised`, `user-supplied` or `inferred`.
+    pub confidence: String,
+    /// False when the network was too wide to enumerate; `active_hosts` then reflects only
+    /// hosts recovered from a router's ARP cache.
+    pub swept: bool,
+    pub total_addresses: usize,
+    pub active_hosts: usize,
+    pub snmp_system_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,15 +77,41 @@ pub struct ExportHost {
     pub status: String,
     pub open_ports: Vec<String>,
     pub latency_ms: Option<f64>,
+    /// How the network this host sits on was discovered. `None` for the local subnet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_source: Option<String>,
+    /// Confidence grade of the network this host sits on. `None` for the local subnet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
 }
 
-/// Generates a unified host list from primary scan and cascaded networks
+/// Generates a unified host list from primary scan and cascaded networks.
+///
+/// `local_gateway` is passed in rather than re-detected here: export must be a pure
+/// transformation of data already gathered, not a second round of network I/O.
 pub fn build_export_data(
     primary_cidr: &Ipv4Net,
     summary: &ScanSummary,
     child_networks: &[ChildNetworkResult],
+    local_gateway: Option<std::net::Ipv4Addr>,
 ) -> NetworkExport {
     let mut hosts = Vec::new();
+    let mut networks = Vec::new();
+
+    networks.push(ExportNetwork {
+        cidr: primary_cidr.to_string(),
+        role: "local".to_string(),
+        gateway: local_gateway.map(|ip| ip.to_string()),
+        parent_router: None,
+        discovery_source: "Local Interface".to_string(),
+        confidence: crate::net::routes::DiscoveryConfidence::Verified
+            .display_name()
+            .to_string(),
+        swept: true,
+        total_addresses: summary.total_hosts,
+        active_hosts: summary.active_hosts.len(),
+        snmp_system_name: None,
+    });
 
     for h in &summary.active_hosts {
         let ports: Vec<String> = h
@@ -85,10 +136,25 @@ pub fn build_export_data(
             },
             open_ports: ports,
             latency_ms,
+            discovery_source: None,
+            confidence: None,
         });
     }
 
     for child in child_networks {
+        networks.push(ExportNetwork {
+            cidr: child.cidr.to_string(),
+            role: "cascaded".to_string(),
+            gateway: child.gateway.map(|ip| ip.to_string()),
+            parent_router: child.parent_router_ip.map(|ip| ip.to_string()),
+            discovery_source: child.source.display_name().to_string(),
+            confidence: child.confidence.display_name().to_string(),
+            swept: !child.sweep_skipped,
+            total_addresses: child.summary.total_hosts,
+            active_hosts: child.summary.active_hosts.len(),
+            snmp_system_name: child.snmp_system_name.clone(),
+        });
+
         for h in &child.summary.active_hosts {
             let ports: Vec<String> = h
                 .open_ports
@@ -112,6 +178,8 @@ pub fn build_export_data(
                 },
                 open_ports: ports,
                 latency_ms,
+                discovery_source: Some(child.source.display_name().to_string()),
+                confidence: Some(child.confidence.display_name().to_string()),
             });
         }
     }
@@ -122,6 +190,7 @@ pub fn build_export_data(
         generated_at: Local::now().to_rfc3339(),
         primary_subnet: primary_cidr.to_string(),
         total_active_hosts: hosts.len(),
+        networks,
         hosts,
     }
 }
@@ -142,8 +211,9 @@ pub fn export_results(
     primary_cidr: &Ipv4Net,
     summary: &ScanSummary,
     child_networks: &[ChildNetworkResult],
+    local_gateway: Option<std::net::Ipv4Addr>,
 ) -> Result<PathBuf, String> {
-    let export_data = build_export_data(primary_cidr, summary, child_networks);
+    let export_data = build_export_data(primary_cidr, summary, child_networks, local_gateway);
     let filename = custom_path
         .map(|p| p.to_string())
         .unwrap_or_else(|| get_default_filename(format));
@@ -167,6 +237,8 @@ pub fn export_results(
                 "Status",
                 "Open Ports",
                 "Latency (ms)",
+                "Discovery Source",
+                "Confidence",
             ])
             .map_err(|e| format!("CSV header error: {}", e))?;
 
@@ -184,6 +256,8 @@ pub fn export_results(
                     &h.status,
                     &h.open_ports.join("; "),
                     &lat,
+                    h.discovery_source.as_deref().unwrap_or("Local Interface"),
+                    h.confidence.as_deref().unwrap_or("verified"),
                 ])
                 .map_err(|e| format!("CSV write error: {}", e))?;
             }
@@ -203,6 +277,25 @@ pub fn export_results(
                 "Total Active Hosts: {}\n\n",
                 export_data.total_active_hosts
             ));
+
+            text.push_str("NETWORKS AND DISCOVERY EVIDENCE\n");
+            text.push_str(&format!(
+                "{:<22} {:<10} {:<18} {:<36} {:<14} {:<8}\n",
+                "CIDR", "ROLE", "GATEWAY", "DISCOVERED VIA", "CONFIDENCE", "SWEPT"
+            ));
+            text.push_str(&format!("{}\n", "-".repeat(130)));
+            for n in &export_data.networks {
+                text.push_str(&format!(
+                    "{:<22} {:<10} {:<18} {:<36} {:<14} {:<8}\n",
+                    n.cidr,
+                    n.role,
+                    n.gateway.as_deref().unwrap_or("-"),
+                    n.discovery_source,
+                    n.confidence,
+                    if n.swept { "yes" } else { "no" }
+                ));
+            }
+            text.push('\n');
 
             text.push_str(&format!(
                 "{:<26} {:<16} {:<28} {:<18} {:<24} {:<8} {:<10}\n",
@@ -289,9 +382,15 @@ mod tests {
             let test_file = tmp_dir.join(format!("test_export.{}", format.extension()));
             let test_path = test_file.to_str().unwrap();
 
-            let exported_path =
-                export_results(format, Some(test_path), &primary_cidr, &summary, &children)
-                    .expect("Export should succeed");
+            let exported_path = export_results(
+                format,
+                Some(test_path),
+                &primary_cidr,
+                &summary,
+                &children,
+                Some(Ipv4Addr::new(192, 168, 1, 1)),
+            )
+            .expect("Export should succeed");
             assert!(exported_path.exists());
 
             let content = std::fs::read_to_string(&exported_path).expect("Should read file");
