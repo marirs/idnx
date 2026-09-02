@@ -12,6 +12,44 @@ use ipnet::IpNet;
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
 use super::role::{DeviceRole, score_role};
 
+/// True when a prefix represents real topology.
+///
+/// Loopback, link-local, multicast and unspecified ranges are protocol machinery, not
+/// networks anyone administers. This is deliberately not an RFC 1918 filter: public,
+/// CGNAT, VPN and IPv6 global prefixes are all legitimate internal topology and are kept.
+pub fn is_topology_network(net: &IpNet) -> bool {
+    if net.prefix_len() == 0 {
+        return false;
+    }
+    match net {
+        IpNet::V4(v4) => {
+            let a = v4.addr();
+            !a.is_loopback() && !a.is_link_local() && !a.is_multicast() && !a.is_unspecified()
+        }
+        IpNet::V6(v6) => {
+            let a = v6.addr();
+            !a.is_loopback() && !a.is_multicast() && !a.is_unspecified() && !is_v6_link_local(&a)
+        }
+    }
+}
+
+/// True when an address is worth sending a query to.
+pub fn is_interrogable(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            !v4.is_loopback() && !v4.is_link_local() && !v4.is_multicast() && !v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_multicast() && !v6.is_unspecified() && !is_v6_link_local(v6)
+        }
+    }
+}
+
+/// `Ipv6Addr::is_unicast_link_local` is still unstable, so the fe80::/10 test is written out.
+fn is_v6_link_local(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
 /// Stable identity for a graph node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
@@ -235,6 +273,25 @@ impl TopologyGraph {
             .collect()
     }
 
+    /// Addresses of devices that show any infrastructure behaviour.
+    ///
+    /// These are the pivots the engine interrogates. Membership comes from observed
+    /// behaviour only, so a device is never queued because of who manufactured it.
+    pub fn pivot_addresses(&self) -> Vec<IpAddr> {
+        let mut out: Vec<IpAddr> = self
+            .role_weights
+            .keys()
+            .filter_map(|id| self.nodes.get(id))
+            .flat_map(|node| node.addresses.iter().copied())
+            // A link-local or loopback address cannot be interrogated meaningfully, and
+            // queueing one only produces a guaranteed timeout in the coverage report.
+            .filter(is_interrogable)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Resolves the canonical device key for an address, if one is already known.
     pub fn device_for_address(&self, addr: &IpAddr) -> Option<&DeviceKey> {
         self.address_owner.get(addr)
@@ -248,27 +305,25 @@ impl TopologyGraph {
                 // Reaching here means a prefix was actually observed or advertised. The
                 // Vlan arm below is the only other way a network-ish node appears, and it
                 // deliberately cannot produce a prefix.
-                let id = NodeId::Network(prefix);
-                self.upsert(id, NodeKind::Network, ev.confidence, prov);
+                self.upsert_network(prefix, ev.confidence, prov);
             }
             Fact::InterfaceNetwork { interface, prefix } => {
+                // Same rule as the Network arm: loopback, link-local and multicast ranges
+                // are protocol machinery, not networks. Filtering only there let them back
+                // in through this path.
+                if !self.upsert_network(prefix, ev.confidence, prov.clone()) {
+                    return;
+                }
                 let iface_id = NodeId::Interface(interface);
-                let net_id = NodeId::Network(prefix);
                 self.upsert(
                     iface_id.clone(),
                     NodeKind::Interface,
                     ev.confidence,
                     prov.clone(),
                 );
-                self.upsert(
-                    net_id.clone(),
-                    NodeKind::Network,
-                    ev.confidence,
-                    prov.clone(),
-                );
                 self.link(
                     iface_id,
-                    net_id,
+                    NodeId::Network(prefix),
                     Relationship::AttachedTo,
                     ev.confidence,
                     prov,
@@ -332,12 +387,9 @@ impl TopologyGraph {
                 let dev_id = NodeId::Device(key);
                 let net_id = NodeId::Network(network);
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
-                self.upsert(
-                    net_id.clone(),
-                    NodeKind::Network,
-                    ev.confidence,
-                    prov.clone(),
-                );
+                if !self.upsert_network(network, ev.confidence, prov.clone()) {
+                    return;
+                }
                 self.link(
                     dev_id,
                     net_id,
@@ -355,12 +407,9 @@ impl TopologyGraph {
                 let dev_id = NodeId::Device(key);
                 let net_id = NodeId::Network(network);
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
-                self.upsert(
-                    net_id.clone(),
-                    NodeKind::Network,
-                    ev.confidence,
-                    prov.clone(),
-                );
+                if !self.upsert_network(network, ev.confidence, prov.clone()) {
+                    return;
+                }
                 self.link(
                     dev_id,
                     net_id,
@@ -379,12 +428,9 @@ impl TopologyGraph {
                 let dev_id = NodeId::Device(key);
                 let net_id = NodeId::Network(network);
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
-                self.upsert(
-                    net_id.clone(),
-                    NodeKind::Network,
-                    ev.confidence,
-                    prov.clone(),
-                );
+                if !self.upsert_network(network, ev.confidence, prov.clone()) {
+                    return;
+                }
                 self.link(
                     dev_id,
                     net_id,
@@ -475,11 +521,92 @@ impl TopologyGraph {
         }
     }
 
+    /// Folds address-keyed device nodes into the MAC-keyed node that owns the address.
+    ///
+    /// Providers learn about the same device at different times and with different
+    /// identifiers: the kernel routing table yields a gateway address before the ARP cache
+    /// yields its MAC. Without this pass the default gateway appears twice, once per
+    /// identifier, splitting its evidence across two nodes.
+    fn merge_address_identities(&mut self) {
+        let mut merges: Vec<(NodeId, NodeId)> = Vec::new();
+        for id in self.nodes.keys() {
+            let NodeId::Device(DeviceKey::Address(addr)) = id else {
+                continue;
+            };
+            if let Some(owner) = self.address_owner.get(addr)
+                && matches!(owner, DeviceKey::Mac(_))
+            {
+                merges.push((id.clone(), NodeId::Device(owner.clone())));
+            }
+        }
+
+        for (from, to) in merges {
+            if from == to || !self.nodes.contains_key(&to) {
+                continue;
+            }
+            let Some(source) = self.nodes.remove(&from) else {
+                continue;
+            };
+
+            if let Some(target) = self.nodes.get_mut(&to) {
+                target.addresses.extend(source.addresses);
+                target.hostnames.extend(source.hostnames);
+                target.descriptions.extend(source.descriptions);
+                target.role_signals.extend(source.role_signals);
+                target.provenance.extend(source.provenance);
+                if target.vendor.is_none() {
+                    target.vendor = source.vendor;
+                }
+                if target.opaque_reason.is_none() {
+                    target.opaque_reason = source.opaque_reason;
+                }
+                if source.confidence > target.confidence {
+                    target.confidence = source.confidence;
+                }
+            }
+
+            if let Some(signals) = self.role_weights.remove(&from) {
+                self.role_weights
+                    .entry(to.clone())
+                    .or_default()
+                    .extend(signals);
+            }
+
+            // Re-point every edge that referenced the absorbed identity.
+            let affected: Vec<(NodeId, NodeId, Relationship)> = self
+                .edges
+                .keys()
+                .filter(|(f, t, _)| *f == from || *t == from)
+                .cloned()
+                .collect();
+            for key in affected {
+                let Some(mut edge) = self.edges.remove(&key) else {
+                    continue;
+                };
+                if edge.from == from {
+                    edge.from = to.clone();
+                }
+                if edge.to == from {
+                    edge.to = to.clone();
+                }
+                if edge.from == edge.to {
+                    continue;
+                }
+                self.edges
+                    .entry((edge.from.clone(), edge.to.clone(), edge.relationship))
+                    .and_modify(|existing| existing.provenance.extend(edge.provenance.clone()))
+                    .or_insert(edge);
+            }
+        }
+    }
+
     /// Applies role scoring to every device node.
     ///
     /// Run after all evidence is absorbed so that corroborating signals gathered by
     /// different providers are weighed together rather than in arrival order.
     pub fn finalize_roles(&mut self) {
+        self.merge_address_identities();
+
         let assignments: Vec<(NodeId, DeviceRole)> = self
             .role_weights
             .iter()
@@ -535,6 +662,21 @@ impl TopologyGraph {
                     })
             }
         }
+    }
+
+    /// Creates a network node, refusing prefixes that are not real topology.
+    ///
+    /// Every path that can introduce a network goes through here. When the filter lived
+    /// only in the `Network` fact arm, loopback and link-local ranges reappeared through
+    /// the `AttachedTo`, `GatewayFor` and `RoutesTo` arms, which also create network nodes.
+    ///
+    /// Returns false when the prefix was rejected, so callers skip linking to it.
+    fn upsert_network(&mut self, prefix: IpNet, confidence: Confidence, prov: Provenance) -> bool {
+        if !is_topology_network(&prefix) {
+            return false;
+        }
+        self.upsert(NodeId::Network(prefix), NodeKind::Network, confidence, prov);
+        true
     }
 
     fn upsert(&mut self, id: NodeId, kind: NodeKind, confidence: Confidence, prov: Provenance) {

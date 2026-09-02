@@ -55,6 +55,9 @@ pub struct VisibilityReport {
 pub struct DiscoveryReport {
     pub graph: TopologyGraph,
     pub scope_runs: Vec<ScopeRun>,
+    /// Per-device interrogation results, so a pivot that disclosed nothing is visible
+    /// rather than silently dropped.
+    pub pivot_runs: Vec<PivotRun>,
     pub visibility: VisibilityReport,
     /// Scopes discovered but not enumerated because they exceeded the safety budget.
     pub oversized_scopes: Vec<IpNet>,
@@ -66,6 +69,15 @@ pub struct DiscoveryEngine {
     seed_providers: Vec<Box<dyn DiscoveryProvider>>,
     scope_providers: Vec<Box<dyn DiscoveryProvider>>,
     budget: Budget,
+}
+
+/// What interrogating one infrastructure device produced.
+#[derive(Debug, Clone)]
+pub struct PivotRun {
+    pub address: std::net::IpAddr,
+    pub runs: Vec<ProviderRun>,
+    /// Networks this pivot disclosed that were not already known.
+    pub networks_learned: Vec<IpNet>,
 }
 
 impl DiscoveryEngine {
@@ -96,7 +108,9 @@ impl DiscoveryEngine {
     ) -> DiscoveryReport {
         let mut graph = TopologyGraph::new();
         let mut scope_runs = Vec::new();
+        let mut pivot_runs: Vec<PivotRun> = Vec::new();
         let mut processed: HashSet<IpNet> = HashSet::new();
+        let mut interrogated: HashSet<std::net::IpAddr> = HashSet::new();
         let mut oversized = Vec::new();
 
         // Phase 1: seed from local OS state. This always runs and never depends on any
@@ -144,9 +158,58 @@ impl DiscoveryEngine {
 
             let pending: Vec<IpNet> = queue.drain(..).filter(|n| !processed.contains(n)).collect();
 
-            if pending.is_empty() {
+            // Devices showing infrastructure behaviour are interrogated directly. This is
+            // the path that turns a router into new networks, and it never depends on any
+            // one provider succeeding.
+            let pivots: Vec<std::net::IpAddr> = graph
+                .pivot_addresses()
+                .into_iter()
+                .filter(|a| !interrogated.contains(a))
+                .collect();
+
+            if pending.is_empty() && pivots.is_empty() {
                 converged = true;
                 break;
+            }
+
+            for address in pivots {
+                interrogated.insert(address);
+                let before: HashSet<IpNet> = graph.networks().into_iter().collect();
+
+                let targeted = context.for_target(address);
+                let mut runs = Vec::new();
+                for provider in &self.scope_providers {
+                    if !provider.applies(&targeted) {
+                        continue;
+                    }
+                    let evidence = provider.discover(&targeted).await;
+                    runs.push(ProviderRun {
+                        provider: provider.name(),
+                        evidence_count: evidence.len(),
+                        note: if evidence.is_empty() {
+                            Some("no response".to_string())
+                        } else {
+                            None
+                        },
+                    });
+                    for ev in evidence {
+                        graph.absorb(ev);
+                    }
+                }
+
+                let learned: Vec<IpNet> = graph
+                    .networks()
+                    .into_iter()
+                    .filter(|n| !before.contains(n))
+                    .collect();
+
+                if !runs.is_empty() {
+                    pivot_runs.push(PivotRun {
+                        address,
+                        runs,
+                        networks_learned: learned,
+                    });
+                }
             }
 
             for scope in pending {
@@ -209,6 +272,7 @@ impl DiscoveryEngine {
         DiscoveryReport {
             graph,
             scope_runs,
+            pivot_runs,
             visibility: VisibilityReport {
                 vantage: context.vantage.clone(),
                 blind_to,

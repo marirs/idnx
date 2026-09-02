@@ -14,6 +14,34 @@ pub struct UpnpDevice {
     pub model_description: Option<String>,
     pub manufacturer: Option<String>,
     pub location: Option<String>,
+    /// UPnP `deviceType` URN, e.g.
+    /// `urn:schemas-upnp-org:device:InternetGatewayDevice:2`.
+    ///
+    /// A device declaring itself an InternetGatewayDevice is asserting that it routes.
+    /// That is behavioural role evidence available without any credential, which is why it
+    /// is captured rather than discarded with the rest of the descriptor.
+    pub device_type: Option<String>,
+    /// Every device and service URN the responder announced over SSDP.
+    pub announced_types: Vec<String>,
+}
+
+impl UpnpDevice {
+    /// True when the device advertises the UPnP InternetGatewayDevice profile.
+    ///
+    /// Checks the announced URNs as well as the fetched descriptor: a router may refuse a
+    /// connection to its own description document while still announcing the profile, and
+    /// the announcement alone is sufficient evidence that it routes.
+    pub fn is_internet_gateway(&self) -> bool {
+        let in_descriptor = self
+            .device_type
+            .as_deref()
+            .is_some_and(|t| t.contains("InternetGatewayDevice"));
+        in_descriptor
+            || self
+                .announced_types
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains("internetgatewaydevice"))
+    }
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
@@ -30,14 +58,16 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// Fetches UPnP device description XML from a location URL (e.g. http://192.168.1.1:49153/wps_device.xml)
-async fn fetch_upnp_description(
-    location_url: &str,
-) -> Option<(
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-)> {
+/// Fields extracted from a UPnP device description document.
+struct UpnpDescription {
+    friendly_name: Option<String>,
+    model_name: Option<String>,
+    model_description: Option<String>,
+    manufacturer: Option<String>,
+    device_type: Option<String>,
+}
+
+async fn fetch_upnp_description(location_url: &str) -> Option<UpnpDescription> {
     // Parse URL: http://host:port/path
     let stripped = location_url.strip_prefix("http://")?;
     let slash_pos = stripped.find('/')?;
@@ -80,12 +110,13 @@ async fn fetch_upnp_description(
     }
 
     let xml = String::from_utf8_lossy(&buf);
-    let friendly_name = extract_tag(&xml, "friendlyName");
-    let model_name = extract_tag(&xml, "modelName");
-    let model_desc = extract_tag(&xml, "modelDescription");
-    let manufacturer = extract_tag(&xml, "manufacturer");
-
-    Some((friendly_name, model_name, model_desc, manufacturer))
+    Some(UpnpDescription {
+        friendly_name: extract_tag(&xml, "friendlyName"),
+        model_name: extract_tag(&xml, "modelName"),
+        model_description: extract_tag(&xml, "modelDescription"),
+        manufacturer: extract_tag(&xml, "manufacturer"),
+        device_type: extract_tag(&xml, "deviceType"),
+    })
 }
 
 /// Broadcasts SSDP M-SEARCH query and fetches device descriptions for routers/gateways
@@ -107,7 +138,11 @@ ST: ssdp:all\r\n\r\n";
         return Vec::new();
     }
 
-    let mut locations: HashMap<Ipv4Addr, String> = HashMap::new();
+    // Per responder: every advertised descriptor location, and every device/service URN it
+    // announced. Keeping only the first location loses working descriptors when a device
+    // publishes several, and the URNs are themselves evidence.
+    let mut locations: HashMap<Ipv4Addr, Vec<String>> = HashMap::new();
+    let mut urns: HashMap<Ipv4Addr, Vec<String>> = HashMap::new();
     let mut buf = [0u8; 2048];
 
     let start = tokio::time::Instant::now();
@@ -127,7 +162,25 @@ ST: ssdp:all\r\n\r\n";
                         let lower = line.to_lowercase();
                         if lower.starts_with("location:") {
                             let loc = line[9..].trim().to_string();
-                            locations.entry(ip).or_insert(loc);
+                            let entry = locations.entry(ip).or_default();
+                            if !entry.contains(&loc) {
+                                entry.push(loc);
+                            }
+                        } else if let Some(rest) = lower
+                            .strip_prefix("st:")
+                            .or_else(|| lower.strip_prefix("nt:"))
+                        {
+                            // The ST/NT header names the device or service type directly.
+                            // This is the reliable route to identifying an
+                            // InternetGatewayDevice: it needs no HTTP fetch, and routers
+                            // are observed resetting connections to their own descriptor.
+                            let urn = rest.trim().to_string();
+                            if urn.contains("urn:") {
+                                let entry = urns.entry(ip).or_default();
+                                if !entry.contains(&urn) {
+                                    entry.push(urn);
+                                }
+                            }
                         }
                     }
                 }
@@ -136,21 +189,55 @@ ST: ssdp:all\r\n\r\n";
         }
     }
 
+    let mut responders: Vec<Ipv4Addr> = locations.keys().copied().collect();
+    for ip in urns.keys() {
+        if !responders.contains(ip) {
+            responders.push(*ip);
+        }
+    }
+    responders.sort();
+
     let mut devices = Vec::new();
-    for (ip, loc) in locations {
-        let (friendly_name, model_name, model_desc, manufacturer) = fetch_upnp_description(&loc)
-            .await
-            .unwrap_or((None, None, None, None));
+    for ip in responders {
+        let device_locations = locations.get(&ip).cloned().unwrap_or_default();
+
+        // Try every advertised descriptor and keep the first that answers. A device may
+        // publish several and refuse some of them.
+        let mut described = None;
+        for loc in &device_locations {
+            if let Some(d) = fetch_upnp_description(loc).await {
+                described = Some(d);
+                break;
+            }
+        }
+
+        // Fall back to the announced URNs when no descriptor could be retrieved, so an
+        // unreachable descriptor never hides that the device is a gateway.
+        let device_type = described
+            .as_ref()
+            .and_then(|d| d.device_type.clone())
+            .or_else(|| {
+                urns.get(&ip).and_then(|list| {
+                    list.iter()
+                        .find(|u| u.contains(":device:"))
+                        .map(|u| u.to_string())
+                })
+            });
 
         devices.push(UpnpDevice {
             ip,
-            friendly_name,
-            model_name,
-            model_description: model_desc,
-            manufacturer,
-            location: Some(loc),
+            friendly_name: described.as_ref().and_then(|d| d.friendly_name.clone()),
+            model_name: described.as_ref().and_then(|d| d.model_name.clone()),
+            model_description: described.as_ref().and_then(|d| d.model_description.clone()),
+            manufacturer: described.as_ref().and_then(|d| d.manufacturer.clone()),
+            location: device_locations.first().cloned(),
+            device_type,
+            announced_types: urns.get(&ip).cloned().unwrap_or_default(),
         });
     }
 
+    // Deterministic ordering: SSDP replies arrive in arbitrary order, and unstable output
+    // would defeat comparing two runs.
+    devices.sort_by_key(|d| d.ip);
     devices
 }
