@@ -5,9 +5,11 @@
 //! returns the same evidence type. No provider is privileged, and none can report a result
 //! any way other than by emitting evidence into the graph.
 
+pub mod ai;
 pub mod local;
 pub mod network;
 pub mod passive;
+pub mod target;
 
 use std::future::Future;
 use std::net::IpAddr;

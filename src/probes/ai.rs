@@ -81,7 +81,10 @@ async fn http_get(
          User-Agent: idnx/{}\r\n\
          Accept: application/json, text/event-stream, */*\r\n\
          Connection: close\r\n\r\n",
-        path, ip, port, env!("CARGO_PKG_VERSION")
+        path,
+        ip,
+        port,
+        env!("CARGO_PKG_VERSION")
     );
 
     timeout(timeout_duration, stream.write_all(request.as_bytes()))
@@ -116,11 +119,7 @@ async fn http_get(
     let status_line = lines.next()?;
 
     // Parse status code from "HTTP/1.1 200 OK"
-    let status_code: u16 = status_line
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
+    let status_code: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
 
     let body = match response_str.find("\r\n\r\n") {
         Some(idx) => response_str[idx + 4..].to_string(),
@@ -218,15 +217,14 @@ pub async fn probe_ai_runtime(
         && status == 200
     {
         let models = parse_ollama_tags(&body);
-        let version = if let Some((_, ver_body)) =
-            http_get(ip, 11434, "/api/version", probe_timeout).await
-        {
-            serde_json::from_str::<OllamaVersion>(&ver_body)
-                .ok()
-                .and_then(|v| v.version)
-        } else {
-            None
-        };
+        let version =
+            if let Some((_, ver_body)) = http_get(ip, 11434, "/api/version", probe_timeout).await {
+                serde_json::from_str::<OllamaVersion>(&ver_body)
+                    .ok()
+                    .and_then(|v| v.version)
+            } else {
+                None
+            };
 
         return Some(AiRuntimeInfo {
             runtime_type: AiRuntimeType::Ollama,

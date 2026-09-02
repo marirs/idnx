@@ -726,6 +726,9 @@ pub fn network_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         Box::new(VendorDiscoveryProvider),
         Box::new(SnmpProvider),
         Box::new(HostEnrichmentProvider::default()),
+        // Runs against every interrogated device, so "interrogated" means a full protocol
+        // pass rather than a single anonymous SNMP query.
+        Box::new(crate::providers::target::TargetEnrichmentProvider::default()),
     ]
 }
 

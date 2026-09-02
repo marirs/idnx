@@ -83,6 +83,12 @@ pub enum EvidenceSource {
     RouterAdvertisement,
     Snmp,
     VendorDiscovery,
+    /// NAT-PMP / PCP gateway response.
+    NatPmp,
+    /// An AI runtime's own protocol endpoint.
+    AiProtocol,
+    /// A negotiated Model Context Protocol session.
+    Mcp,
     UserSupplied,
 }
 
@@ -110,6 +116,9 @@ impl EvidenceSource {
             EvidenceSource::RouterAdvertisement => "IPv6 router advertisement",
             EvidenceSource::Snmp => "SNMP",
             EvidenceSource::VendorDiscovery => "vendor discovery",
+            EvidenceSource::NatPmp => "NAT-PMP",
+            EvidenceSource::AiProtocol => "AI runtime protocol",
+            EvidenceSource::Mcp => "MCP (negotiated)",
             EvidenceSource::UserSupplied => "user supplied",
         }
     }

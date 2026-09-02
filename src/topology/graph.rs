@@ -12,6 +12,58 @@ use ipnet::IpNet;
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
 use super::role::{DeviceRole, score_role};
 
+/// Hostname tokens that suggest network equipment.
+///
+/// Matched on token boundaries, never as substrings. A bare `contains("ap")` classified
+/// `dmaker-fan-p30_miapD143` -- a desk fan -- as an access point, which then consumed
+/// interrogation budget sending it SNMP queries.
+const INFRASTRUCTURE_HOSTNAME_TOKENS: &[&str] = &[
+    "router",
+    "gateway",
+    "gw",
+    "switch",
+    "ap",
+    "accesspoint",
+    "firewall",
+    "modem",
+    "bridge",
+    "wifi",
+    "wlan",
+    "edgerouter",
+    "unifi",
+    "openwrt",
+];
+
+/// True when a hostname carries an infrastructure token as a whole word.
+///
+/// A token matches when it equals a keyword, or when it is a keyword followed only by
+/// digits -- `ap1`, `gw02` -- which is how such devices are conventionally numbered. Two
+/// adjacent tokens are also joined and tested, so `access-point-lobby` matches while
+/// `dmaker-fan-p30_miapD143` does not: `miapd143` neither equals nor begins with a keyword.
+pub fn hostname_suggests_infrastructure(hostname: &str) -> bool {
+    let lowered = hostname.to_ascii_lowercase();
+    let tokens: Vec<&str> = lowered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let matches = |token: &str| {
+        INFRASTRUCTURE_HOSTNAME_TOKENS.iter().any(|keyword| {
+            token == *keyword
+                || token.strip_prefix(keyword).is_some_and(|rest| {
+                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+    };
+
+    if tokens.iter().any(|t| matches(t)) {
+        return true;
+    }
+    tokens
+        .windows(2)
+        .any(|pair| matches(&format!("{}{}", pair[0], pair[1])))
+}
+
 /// Manufacturers whose registrations commonly cover network equipment.
 ///
 /// Used only to decide who is worth interrogating. It never contributes to a role: plenty
@@ -377,13 +429,11 @@ impl TopologyGraph {
             }
         }
 
-        if node.hostnames.iter().any(|h| {
-            let h = h.to_ascii_lowercase();
-            h.contains("router")
-                || h.contains("gateway")
-                || h.contains("switch")
-                || h.contains("ap")
-        }) {
+        if node
+            .hostnames
+            .iter()
+            .any(|h| hostname_suggests_infrastructure(h))
+        {
             return true;
         }
 
@@ -1160,6 +1210,49 @@ mod tests {
         assert!(
             !g.candidate_addresses().contains(&gateway),
             "an established pivot must not be queued twice"
+        );
+    }
+
+    #[test]
+    fn hostname_hints_match_whole_tokens_only() {
+        // The exact false positive this replaces: a desk fan was treated as an access
+        // point because "miapD143" contains the letters "ap".
+        assert!(!hostname_suggests_infrastructure("dmaker-fan-p30_miapD143"));
+        assert!(!hostname_suggests_infrastructure("grape-pi"));
+        assert!(!hostname_suggests_infrastructure("laptop-7"));
+
+        assert!(hostname_suggests_infrastructure("office-ap-3"));
+        assert!(hostname_suggests_infrastructure("AP1"));
+        assert!(hostname_suggests_infrastructure("core.router.lan"));
+        assert!(hostname_suggests_infrastructure("main_gateway"));
+        assert!(hostname_suggests_infrastructure("access-point-lobby"));
+    }
+
+    #[test]
+    fn a_fan_is_not_an_infrastructure_candidate() {
+        let mut g = TopologyGraph::new();
+        let mac = DeviceKey::mac("7c:c2:94:a1:d1:43");
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: mac.clone(),
+                address: "192.168.1.166".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceHostname {
+                device: mac,
+                hostname: "dmaker-fan-p30_miapD143".to_string(),
+            },
+            EvidenceSource::Mdns,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        assert!(
+            g.candidate_addresses().is_empty(),
+            "a desk fan must not consume interrogation budget"
         );
     }
 

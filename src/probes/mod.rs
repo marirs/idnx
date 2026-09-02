@@ -3,6 +3,7 @@ pub mod asus;
 pub mod cdp;
 pub mod lldp;
 pub mod mndp;
+pub mod natpmp;
 pub mod passive;
 pub mod smb;
 pub mod snmp;

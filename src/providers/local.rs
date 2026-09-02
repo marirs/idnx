@@ -449,6 +449,8 @@ pub fn local_providers() -> Vec<Box<dyn DiscoveryProvider>> {
 mod tests {
     use super::*;
     use crate::providers::{Vantage, VantageKind};
+    use crate::topology::TopologyEvidence;
+    use crate::topology::evidence::Capability;
     use std::time::Duration;
 
     fn ctx() -> DiscoveryContext {
@@ -508,6 +510,92 @@ mod tests {
         // Guessing that an unattributed route belongs to the selected link is the same
         // class of assumption the engine refuses everywhere else.
         assert!(!route_belongs_to_interface(None, "eth1", &[]));
+    }
+
+    #[test]
+    fn a_scoped_ipv6_next_hop_survives_without_a_neighbour_entry() {
+        // Reproduces the live case end to end, from parsed route to graph relationship.
+        // The device owning fe80::1812:faa5:e4ee:1b9 left the neighbour table while its
+        // route remained; without this the network kept its route but the gateway stopped
+        // being recognised as routing at all.
+        use crate::topology::TopologyGraph;
+        use crate::topology::graph::{NodeId, Relationship};
+
+        let sample = "\
+Routing tables
+
+Internet6:
+Destination                             Gateway                                 Flags               Netif Expire
+fd84:3bfe:bf84::/64                     fe80::1812:faa5:e4ee:1b9%en0            UGc                   en0
+";
+        let routes = crate::net::routes::parse_netstat_routes(sample);
+        let route = routes.first().expect("the routed prefix parses");
+
+        // Exactly what KernelRouteProvider emits for such a route.
+        let gateway = route.gateway.expect("scoped next hop");
+        let device = DeviceKey::scoped_address(gateway, route.gateway_zone.as_deref());
+        let network = route.destination;
+
+        let mut graph = TopologyGraph::new();
+        for fact in [
+            Fact::Network { prefix: network },
+            Fact::DeviceAddress {
+                device: device.clone(),
+                address: gateway,
+            },
+            Fact::RoutesTo {
+                device: device.clone(),
+                network,
+                next_hop: Some(gateway),
+            },
+            Fact::DeviceRoleSignal {
+                device: device.clone(),
+                signal: RoleSignal::KernelNextHop,
+            },
+            Fact::DeviceCapability {
+                device: device.clone(),
+                capability: Capability::Ipv6Router,
+                detail: Some(format!("next hop for {network}")),
+            },
+        ] {
+            graph.absorb(TopologyEvidence::new(
+                fact,
+                EvidenceSource::KernelRoute,
+                Confidence::Observed,
+                "en0",
+            ));
+        }
+        graph.finalize_roles();
+
+        // The network exists.
+        assert!(graph.networks().contains(&network));
+
+        // The gateway is a router, from the route alone and with no NDP entry present.
+        let node = graph
+            .node(&NodeId::Device(device.clone()))
+            .expect("gateway node");
+        assert_eq!(node.kind, crate::topology::graph::NodeKind::Router);
+        assert!(
+            node.capabilities.iter().any(|c| c.contains("IPv6 router")),
+            "capability must name IPv6 routing specifically"
+        );
+        assert!(
+            !node
+                .capabilities
+                .iter()
+                .any(|c| c.contains("default gateway")),
+            "a routed prefix must never imply the Internet gateway"
+        );
+
+        // And it is attached to the prefix it routes to.
+        assert!(
+            graph.edges().any(|e| {
+                e.relationship == Relationship::RoutesTo
+                    && e.from == NodeId::Device(device.clone())
+                    && e.to == NodeId::Network(network)
+            }),
+            "the routed prefix must remain attached to its next hop"
+        );
     }
 
     #[test]
