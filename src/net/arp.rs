@@ -55,8 +55,24 @@ pub fn read_system_arp_table(interface_filter: Option<&str>) -> Vec<ArpEntry> {
         }
     }
 
-    // 2. Standard `arp -a` (macOS, BSD, Windows, Linux)
-    let output = match Command::new("arp").arg("-a").output() {
+    // 2. Standard system ARP table (macOS, BSD, Windows, Linux)
+    //
+    // `-n` (numeric) is essential on macOS/BSD: without it, `arp -a` performs a reverse
+    // DNS lookup for every entry in the table. On a host with a VM or container bridge the
+    // table runs to thousands of addresses with no PTR records, and each one blocks until
+    // the resolver gives up — measured at 35.8s versus 109ms for `arp -an` on a table of
+    // ~4800 entries. Since this runs once per scanned network it dominated total runtime.
+    //
+    // Losing the resolved name here costs nothing: hostnames are recovered deliberately
+    // later via mDNS and bounded unicast PTR queries, which is where a timeout belongs.
+    //
+    // Windows `arp` has no `-n` flag and does not resolve names, so it keeps plain `-a`.
+    #[cfg(target_os = "windows")]
+    let arp_args: &[&str] = &["-a"];
+    #[cfg(not(target_os = "windows"))]
+    let arp_args: &[&str] = &["-an"];
+
+    let output = match Command::new("arp").args(arp_args).output() {
         Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
         Err(_) => return Vec::new(),
     };

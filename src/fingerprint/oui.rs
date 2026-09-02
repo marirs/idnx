@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OuiInfo {
@@ -106,31 +108,65 @@ pub fn lookup_mac(mac_str: &str) -> OuiInfo {
         Err(_) => None,
     };
 
-    // Tier 2: User cache database (~/.cache/idnx/oui.txt)
+    // Tier 2: User cache database (~/.cache/idnx/oui.txt), parsed once per process.
     if vendor.is_none()
-        && let Some(cache_path) = get_oui_cache_path()
-        && cache_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&cache_path)
+        && let Some(v) = oui_cache_index().get(&prefix)
     {
-        let hex_prefix = format!("{:02X}-{:02X}-{:02X}", prefix[0], prefix[1], prefix[2]);
-        for line in content.lines() {
-            if line.starts_with(&hex_prefix)
-                && line.contains("(hex)")
-                && let Some(v) = line.split("(hex)").nth(1)
-            {
-                let trimmed = v.trim();
-                if !trimmed.is_empty() {
-                    vendor = Some(trimmed.to_string());
-                    break;
-                }
-            }
-        }
+        vendor = Some(v.clone());
     }
 
     OuiInfo {
         vendor,
         is_randomized,
     }
+}
+
+/// Lazily parsed index of the user OUI cache, built at most once per process.
+///
+/// This was previously read and linearly scanned from disk on *every* cache miss. The
+/// IEEE registry is several megabytes and a scan of a populated ARP table produces
+/// thousands of misses, so the old path re-read and re-scanned the whole file thousands
+/// of times per run. Parsing once into a map keeps `lookup_mac` a pure in-memory
+/// operation after the first call.
+fn oui_cache_index() -> &'static HashMap<[u8; 3], String> {
+    static CACHE: OnceLock<HashMap<[u8; 3], String>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut map = HashMap::new();
+        let Some(cache_path) = get_oui_cache_path() else {
+            return map;
+        };
+        let Ok(content) = std::fs::read_to_string(&cache_path) else {
+            return map;
+        };
+        for line in content.lines() {
+            // Registry lines look like: "00-11-22   (hex)		Vendor Name"
+            let Some((prefix_part, vendor_part)) = line.split_once("(hex)") else {
+                continue;
+            };
+            let vendor = vendor_part.trim();
+            if vendor.is_empty() {
+                continue;
+            }
+            let Some(prefix) = parse_hex_oui_prefix(prefix_part.trim()) else {
+                continue;
+            };
+            map.entry(prefix).or_insert_with(|| vendor.to_string());
+        }
+        map
+    })
+}
+
+/// Parses an IEEE registry prefix such as `00-1A-2B` into raw bytes.
+fn parse_hex_oui_prefix(text: &str) -> Option<[u8; 3]> {
+    let mut octets = [0u8; 3];
+    let mut parts = text.split('-');
+    for octet in octets.iter_mut() {
+        *octet = u8::from_str_radix(parts.next()?.trim(), 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(octets)
 }
 
 /// Pre-sorted compile-time static IEEE OUI table
@@ -216,6 +252,16 @@ static OUI_DATABASE: &[([u8; 3], &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_hex_oui_prefix() {
+        assert_eq!(parse_hex_oui_prefix("00-1A-2B"), Some([0x00, 0x1A, 0x2B]));
+        assert_eq!(parse_hex_oui_prefix("FF-FF-FF"), Some([0xFF, 0xFF, 0xFF]));
+        // Malformed registry lines must be skipped, not panic or half-parse.
+        assert_eq!(parse_hex_oui_prefix("00-1A"), None);
+        assert_eq!(parse_hex_oui_prefix("00-1A-2B-3C"), None);
+        assert_eq!(parse_hex_oui_prefix("ZZ-1A-2B"), None);
+    }
 
     #[test]
     fn test_oui_lookup_asus() {
