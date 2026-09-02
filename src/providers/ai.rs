@@ -49,83 +49,250 @@ pub fn mcp_list_request(id: u32, method: &str) -> String {
     format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}"}}"#)
 }
 
-/// Extracts a string field from a flat JSON object body.
-///
-/// Deliberately minimal: only the few identity fields below are read, and anything the
-/// server sends that does not parse simply yields nothing rather than a guess.
-fn json_string_field(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let start = body.find(&needle)? + needle.len();
-    let rest = &body[start..];
-    let colon = rest.find(':')? + 1;
-    let rest = &rest[colon..];
-    let open = rest.find('"')? + 1;
-    let rest = &rest[open..];
-    let close = rest.find('"')?;
-    Some(rest[..close].to_string())
+/// A parsed HTTP response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    /// Header values are matched case-insensitively, as HTTP requires.
+    pub headers: Vec<(String, String)>,
+    pub body: String,
 }
 
-/// Extracts the `name` of each entry in a JSON-RPC list result.
-pub fn json_names(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(index) = rest.find("\"name\"") {
-        rest = &rest[index + 6..];
-        let Some(colon) = rest.find(':') else { break };
-        let after = &rest[colon + 1..];
-        let Some(open) = after.find('"') else { break };
-        let after = &after[open + 1..];
-        let Some(close) = after.find('"') else { break };
-        out.push(after[..close].to_string());
-        rest = &after[close..];
+impl HttpResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
+}
+
+/// Parses a raw HTTP response, decoding chunked transfer and SSE framing.
+///
+/// Both matter for MCP: Streamable HTTP servers commonly reply chunked, and the legacy
+/// transport replies as `text/event-stream` where the JSON sits behind `data:` prefixes.
+/// Reading the raw bytes as if they were JSON fails against either.
+pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))?;
+    let mut lines = head.lines();
+    let status_line = lines.next()?;
+    let status: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    let content_type = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.to_ascii_lowercase());
+
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+
+    let mut body = if chunked {
+        decode_chunked(body)
+    } else {
+        body.to_string()
+    };
+
+    if content_type
+        .as_deref()
+        .is_some_and(|c| c.contains("text/event-stream"))
+    {
+        body = decode_sse(&body);
+    }
+
+    Some(HttpResponse {
+        status,
+        content_type,
+        headers,
+        body,
+    })
+}
+
+/// Reassembles a chunked transfer-encoded body.
+pub fn decode_chunked(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+
+    while let Some((size_line, remainder)) = rest.split_once("\r\n") {
+        // A chunk size may carry extensions after a semicolon.
+        let size_text = size_line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            break;
+        };
+        if size == 0 || remainder.len() < size {
+            break;
+        }
+        out.push_str(&remainder[..size]);
+        rest = remainder[size..].trim_start_matches("\r\n");
+    }
+
+    if out.is_empty() {
+        body.to_string()
+    } else {
+        out
+    }
+}
+
+/// Extracts the concatenated `data:` payload from an SSE stream.
+pub fn decode_sse(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            out.push_str(data.trim());
+        }
+    }
+    if out.is_empty() {
+        body.to_string()
+    } else {
+        out
+    }
+}
+
+/// A validated JSON-RPC result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonRpcResult {
+    pub id: u64,
+    pub result: serde_json::Value,
+}
+
+/// Validates a JSON-RPC 2.0 response against the request that produced it.
+///
+/// Checks the envelope structurally rather than by substring: version, absence of an
+/// error, a matching request id, and a result object. A body that merely contains the
+/// characters `jsonrpc` is not a response.
+pub fn parse_json_rpc(body: &str, expected_id: u64) -> Option<JsonRpcResult> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let object = value.as_object()?;
+
+    if object.get("jsonrpc")?.as_str()? != "2.0" {
+        return None;
+    }
+    if object.contains_key("error") {
+        return None;
+    }
+    if object.get("id")?.as_u64()? != expected_id {
+        return None;
+    }
+
+    Some(JsonRpcResult {
+        id: expected_id,
+        result: object.get("result")?.clone(),
+    })
+}
+
+/// What an `initialize` handshake established.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpSession {
+    pub protocol_version: String,
+    pub server_name: Option<String>,
+    pub server_version: Option<String>,
+    /// Server-assigned session id, which stateful servers require on later requests.
+    pub session_id: Option<String>,
+    /// Capabilities the server advertised. Only these are enumerated afterwards.
+    pub capabilities: Vec<String>,
+}
+
+/// Validates an `initialize` result.
+///
+/// Requires `protocolVersion` and `serverInfo`, which together are what distinguishes an
+/// MCP server from anything else that happens to speak JSON-RPC.
+pub fn parse_initialize_result(result: &serde_json::Value) -> Option<McpSession> {
+    let object = result.as_object()?;
+    let protocol_version = object.get("protocolVersion")?.as_str()?.to_string();
+    let server_info = object.get("serverInfo")?.as_object()?;
+
+    let capabilities = object
+        .get("capabilities")
+        .and_then(|c| c.as_object())
+        .map(|c| c.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    Some(McpSession {
+        protocol_version,
+        server_name: server_info
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        server_version: server_info
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        session_id: None,
+        capabilities,
+    })
+}
+
+/// Extracts the `name` of each entry in a named result collection.
+///
+/// Reads `result.<collection>[].name` structurally, so a tool description mentioning the
+/// word "name" cannot be mistaken for an entry.
+pub fn parse_listing(result: &serde_json::Value, collection: &str) -> Vec<String> {
+    let mut out: Vec<String> = result
+        .as_object()
+        .and_then(|o| o.get(collection))
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_object()?.get("name")?.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     out.sort();
     out.dedup();
     out
 }
 
-/// Confirms whether a JSON-RPC response is a valid MCP `initialize` result.
-///
-/// A server that merely returns 200 is not enough: the body must be a JSON-RPC result
-/// carrying a protocol version, which is what an MCP server and nothing else produces.
-pub fn parse_initialize_result(body: &str) -> Option<(String, Option<String>, Option<String>)> {
-    if !body.contains("\"jsonrpc\"") || body.contains("\"error\"") {
-        return None;
-    }
-    let version = json_string_field(body, "protocolVersion")?;
-    let name = json_string_field(body, "name");
-    let server_version = json_string_field(body, "version");
-    Some((version, name, server_version))
-}
-
-/// Sends a JSON-RPC request over HTTP and returns the response body.
-async fn json_rpc_post(
+/// One HTTP request/response exchange.
+async fn http_exchange(
     ip: Ipv4Addr,
     port: u16,
     path: &str,
-    payload: &str,
+    method: &str,
+    payload: Option<&str>,
+    extra_headers: &[(String, String)],
     timeout_duration: Duration,
-) -> Option<String> {
+) -> Option<HttpResponse> {
     let mut stream = timeout(timeout_duration, TcpStream::connect((ip, port)))
         .await
         .ok()?
         .ok()?;
 
-    let request = format!(
-        "POST {} HTTP/1.1\r\n\
+    let mut request = format!(
+        "{} {} HTTP/1.1\r\n\
          Host: {}:{}\r\n\
          User-Agent: idnx/{}\r\n\
-         Content-Type: application/json\r\n\
-         Accept: application/json, text/event-stream\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n{}",
+         Accept: application/json, text/event-stream\r\n",
+        method,
         path,
         ip,
         port,
-        env!("CARGO_PKG_VERSION"),
-        payload.len(),
-        payload
+        env!("CARGO_PKG_VERSION")
     );
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    match payload {
+        Some(body) => {
+            request.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ));
+        }
+        None => request.push_str("Connection: close\r\n\r\n"),
+    }
 
     timeout(timeout_duration, stream.write_all(request.as_bytes()))
         .await
@@ -133,62 +300,112 @@ async fn json_rpc_post(
         .ok()?;
 
     let mut buf = Vec::with_capacity(8192);
-    let mut chunk = [0u8; 2048];
+    let mut chunk = [0u8; 4096];
     while let Ok(Ok(n)) = timeout(timeout_duration, stream.read(&mut chunk)).await {
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
+        // Bounded so a streaming endpoint cannot hold the probe open indefinitely.
         if buf.len() > 262_144 {
             break;
         }
     }
 
-    let text = String::from_utf8_lossy(&buf).to_string();
-    // Return the body only; headers are not evidence.
-    text.split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .or(Some(text))
+    parse_http_response(&String::from_utf8_lossy(&buf))
 }
 
-/// Attempts a full MCP handshake against one endpoint.
+/// Performs the full MCP lifecycle against one endpoint.
+///
+/// initialize -> notifications/initialized -> enumerate advertised collections. The
+/// notification is required by the specification before normal requests, and the session
+/// id and negotiated protocol version are echoed on every subsequent request, without
+/// which a stateful server rejects them.
 pub async fn confirm_mcp(
     ip: Ipv4Addr,
     port: u16,
     path: &str,
     timeout_duration: Duration,
 ) -> Option<McpServer> {
-    let body = json_rpc_post(ip, port, path, &mcp_initialize_request(), timeout_duration).await?;
-    let (protocol_version, server_name, server_version) = parse_initialize_result(&body)?;
+    let response = http_exchange(
+        ip,
+        port,
+        path,
+        "POST",
+        Some(&mcp_initialize_request()),
+        &[],
+        timeout_duration,
+    )
+    .await?;
 
-    // Only after a successful negotiation is it worth enumerating anything.
+    // An authentication challenge means something MCP-shaped may be present but was not
+    // confirmed; it is not evidence of a server.
+    if response.status == 401 || response.status == 403 {
+        return None;
+    }
+
+    let rpc = parse_json_rpc(&response.body, 1)?;
+    let mut session = parse_initialize_result(&rpc.result)?;
+    session.session_id = response.header("Mcp-Session-Id").map(|s| s.to_string());
+
+    // Headers every subsequent request must carry.
+    let mut headers = vec![(
+        "MCP-Protocol-Version".to_string(),
+        session.protocol_version.clone(),
+    )];
+    if let Some(id) = &session.session_id {
+        headers.push(("Mcp-Session-Id".to_string(), id.clone()));
+    }
+
+    // The specification requires this notification before normal operation. It takes no
+    // response, so its outcome is deliberately ignored.
+    let _ = http_exchange(
+        ip,
+        port,
+        path,
+        "POST",
+        Some(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+        &headers,
+        timeout_duration,
+    )
+    .await;
+
+    // Enumerate only what the server said it supports.
     let mut tools = Vec::new();
     let mut resources = Vec::new();
     let mut prompts = Vec::new();
 
-    for (id, method, sink) in [
-        (2u32, "tools/list", &mut tools),
-        (3, "resources/list", &mut resources),
-        (4, "prompts/list", &mut prompts),
+    for (id, method, collection, sink) in [
+        (2u64, "tools/list", "tools", &mut tools),
+        (3, "resources/list", "resources", &mut resources),
+        (4, "prompts/list", "prompts", &mut prompts),
     ] {
-        if let Some(listing) = json_rpc_post(
+        if !session.capabilities.iter().any(|c| c == collection) {
+            continue;
+        }
+        let Some(listing) = http_exchange(
             ip,
             port,
             path,
-            &mcp_list_request(id, method),
+            "POST",
+            Some(&mcp_list_request(id as u32, method)),
+            &headers,
             timeout_duration,
         )
         .await
-        {
-            *sink = json_names(&listing);
+        else {
+            continue;
+        };
+        if let Some(rpc) = parse_json_rpc(&listing.body, id) {
+            *sink = parse_listing(&rpc.result, collection);
         }
     }
 
     Some(McpServer {
         endpoint: format!("http://{ip}:{port}{path}"),
-        protocol_version,
-        server_name,
-        server_version,
+        protocol_version: session.protocol_version,
+        server_name: session.server_name,
+        server_version: session.server_version,
         tools,
         resources,
         prompts,
@@ -333,75 +550,190 @@ pub async fn probe_ai_services(
 mod tests {
     use super::*;
 
-    #[test]
-    fn initialize_result_requires_a_protocol_version() {
-        let good = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"demo-server","version":"1.2.3"}}}"#;
-        let parsed = parse_initialize_result(good).expect("valid initialize result");
-        assert_eq!(parsed.0, "2024-11-05");
-        assert_eq!(parsed.1.as_deref(), Some("demo-server"));
+    /// Deterministic responses standing in for the three server shapes MCP defines.
+    mod fixtures {
+        pub const STATELESS_JSON: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 210\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{},\"resources\":{}},\"serverInfo\":{\"name\":\"demo-server\",\"version\":\"1.2.3\"}}}";
+
+        pub const STATEFUL_WITH_SESSION: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: 7f3c9a\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"stateful\",\"version\":\"2.0\"}}}";
+
+        pub const LEGACY_SSE: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"prompts\":{}},\"serverInfo\":{\"name\":\"sse-server\",\"version\":\"0.9\"}}}\n\n";
+
+        /// Builds a chunked response, splitting the body so the sizes are correct by
+        /// construction rather than hand-counted.
+        pub fn chunked(body: &str) -> String {
+            let mid = body.len() / 2;
+            let (first, second) = body.split_at(mid);
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{}\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                first.len(),
+                first,
+                second.len(),
+                second
+            )
+        }
+
+        /// What an unrelated server answering /sse produces. Must never confirm MCP.
+        pub const NOT_MCP_405: &str =
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n\r\nMethod Not Allowed";
+        pub const NOT_MCP_200: &str =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>Hello</body></html>";
+        pub const AUTH_REQUIRED: &str =
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\n\r\n";
     }
 
     #[test]
-    fn a_bare_http_response_is_not_mcp() {
-        // These are exactly what an unrelated server answering /sse produces. None of them
-        // may be accepted as MCP.
-        assert!(parse_initialize_result("").is_none());
-        assert!(parse_initialize_result("OK").is_none());
-        assert!(parse_initialize_result("<html><body>404</body></html>").is_none());
-        assert!(parse_initialize_result(r#"{"status":"ok"}"#).is_none());
+    fn http_response_headers_and_status_are_parsed() {
+        let r = parse_http_response(fixtures::STATELESS_JSON).expect("parses");
+        assert_eq!(r.status, 200);
         assert!(
-            parse_initialize_result(r#"{"message":"Method Not Allowed"}"#).is_none(),
-            "a 405 body must never confirm MCP"
+            r.content_type
+                .as_deref()
+                .unwrap()
+                .contains("application/json")
         );
+    }
+
+    #[test]
+    fn a_session_id_header_is_preserved() {
+        // Stateful servers reject later requests without it.
+        let r = parse_http_response(fixtures::STATEFUL_WITH_SESSION).expect("parses");
+        assert_eq!(r.header("mcp-session-id"), Some("7f3c9a"));
+        assert_eq!(r.header("Mcp-Session-Id"), Some("7f3c9a"));
+    }
+
+    #[test]
+    fn an_sse_body_is_decoded_before_parsing() {
+        // The JSON sits behind `data:` prefixes; reading raw bytes as JSON fails.
+        let r = parse_http_response(fixtures::LEGACY_SSE).expect("parses");
+        let rpc = parse_json_rpc(&r.body, 1).expect("JSON-RPC inside the SSE frame");
+        let session = parse_initialize_result(&rpc.result).expect("initialize result");
+        assert_eq!(session.protocol_version, "2024-11-05");
+        assert_eq!(session.server_name.as_deref(), Some("sse-server"));
+    }
+
+    #[test]
+    fn a_chunked_body_is_reassembled() {
+        // Streamable HTTP servers commonly reply chunked; reading the frame as JSON fails.
+        let payload = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"chunky","version":"1"}}}"#;
+        let raw = fixtures::chunked(payload);
+
+        let r = parse_http_response(&raw).expect("parses");
+        assert_eq!(r.body, payload, "chunk sizes must not remain in the body");
+
+        let rpc = parse_json_rpc(&r.body, 1).expect("valid envelope after reassembly");
+        assert_eq!(
+            parse_initialize_result(&rpc.result)
+                .expect("initialize result")
+                .server_name
+                .as_deref(),
+            Some("chunky")
+        );
+    }
+
+    #[test]
+    fn initialize_requires_protocol_version_and_server_info() {
+        let r = parse_http_response(fixtures::STATELESS_JSON).expect("parses");
+        let rpc = parse_json_rpc(&r.body, 1).expect("valid envelope");
+        let session = parse_initialize_result(&rpc.result).expect("valid result");
+
+        assert_eq!(session.protocol_version, "2024-11-05");
+        assert_eq!(session.server_name.as_deref(), Some("demo-server"));
+        assert!(session.capabilities.contains(&"tools".to_string()));
+        assert!(session.capabilities.contains(&"resources".to_string()));
+        assert!(
+            !session.capabilities.contains(&"prompts".to_string()),
+            "only advertised collections may be enumerated"
+        );
+    }
+
+    #[test]
+    fn a_bare_http_response_is_never_mcp() {
+        for raw in [
+            fixtures::NOT_MCP_405,
+            fixtures::NOT_MCP_200,
+            fixtures::AUTH_REQUIRED,
+        ] {
+            let parsed = parse_http_response(raw).expect("parses as HTTP");
+            assert!(
+                parse_json_rpc(&parsed.body, 1).is_none(),
+                "an HTTP status must never confirm MCP: {raw}"
+            );
+        }
     }
 
     #[test]
     fn a_json_rpc_error_is_not_a_confirmation() {
-        let err =
+        let body =
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
-        assert!(
-            parse_initialize_result(err).is_none(),
-            "a server that rejects initialize is not an MCP server"
-        );
+        assert!(parse_json_rpc(body, 1).is_none());
     }
 
     #[test]
-    fn json_rpc_without_a_protocol_version_is_rejected() {
-        // Something speaking JSON-RPC is still not necessarily MCP.
-        let other = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
-        assert!(parse_initialize_result(other).is_none());
+    fn a_mismatched_request_id_is_rejected() {
+        // A response to some other request must not be accepted as ours.
+        let body = r#"{"jsonrpc":"2.0","id":99,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"x"}}}"#;
+        assert!(parse_json_rpc(body, 1).is_none());
     }
 
     #[test]
-    fn tool_names_are_enumerated_from_a_list_result() {
+    fn a_wrong_jsonrpc_version_is_rejected() {
+        let body = r#"{"jsonrpc":"1.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+        assert!(parse_json_rpc(body, 1).is_none());
+    }
+
+    #[test]
+    fn json_rpc_without_mcp_fields_is_not_mcp() {
+        // Speaking JSON-RPC is not the same as speaking MCP.
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let rpc = parse_json_rpc(body, 1).expect("valid JSON-RPC");
+        assert!(parse_initialize_result(&rpc.result).is_none());
+    }
+
+    #[test]
+    fn listings_are_read_from_their_own_collection() {
+        // Structural, so a description mentioning "name" is not mistaken for an entry.
         let body = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
-            {"name":"search","description":"..."},
-            {"name":"fetch_url","inputSchema":{}},
-            {"name":"search"}
-        ]}}"#;
-        assert_eq!(json_names(body), vec!["fetch_url", "search"]);
+            {"name":"search","description":"look up by name"},
+            {"name":"fetch_url","inputSchema":{"properties":{"name":{}}}}
+        ],"resources":[{"name":"README"}]}}"#;
+        let rpc = parse_json_rpc(body, 2).expect("valid envelope");
+
+        assert_eq!(
+            parse_listing(&rpc.result, "tools"),
+            vec!["fetch_url", "search"]
+        );
+        assert_eq!(parse_listing(&rpc.result, "resources"), vec!["README"]);
+        assert!(parse_listing(&rpc.result, "prompts").is_empty());
     }
 
     #[test]
     fn the_initialize_request_is_well_formed_json_rpc() {
         let request = mcp_initialize_request();
-        assert!(request.contains("\"jsonrpc\":\"2.0\""));
-        assert!(request.contains("\"method\":\"initialize\""));
-        assert!(request.contains("\"protocolVersion\""));
-        assert!(request.contains("\"clientInfo\""));
+        let value: serde_json::Value = serde_json::from_str(&request).expect("valid JSON");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["method"], "initialize");
+        assert!(value["params"]["protocolVersion"].is_string());
+        assert!(value["params"]["clientInfo"]["name"].is_string());
     }
 
     #[test]
     fn list_requests_use_the_documented_methods() {
-        assert!(mcp_list_request(2, "tools/list").contains("\"method\":\"tools/list\""));
-        assert!(mcp_list_request(3, "resources/list").contains("\"resources/list\""));
-        assert!(mcp_list_request(4, "prompts/list").contains("\"prompts/list\""));
+        for (id, method) in [
+            (2, "tools/list"),
+            (3, "resources/list"),
+            (4, "prompts/list"),
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_str(&mcp_list_request(id, method)).expect("valid JSON");
+            assert_eq!(value["method"], method);
+            assert_eq!(value["id"], id);
+        }
     }
 
     #[test]
     fn candidate_ports_schedule_work_without_asserting_anything() {
-        // These are where AI software is commonly found; membership must never be treated
-        // as evidence, which is why nothing in this module reads the port alone.
+        // Where AI software is commonly found. Membership never becomes evidence: every
+        // result in this module comes from a protocol response.
         assert!(AI_CANDIDATE_PORTS.contains(&11434));
         assert!(AI_CANDIDATE_PORTS.contains(&3000));
     }

@@ -17,7 +17,6 @@ pub enum AiRuntimeType {
     LmStudio,
     Vllm,
     LocalAi,
-    McpServer,
     AgentPin,
     GenericLlm,
 }
@@ -29,7 +28,6 @@ impl AiRuntimeType {
             AiRuntimeType::LmStudio => "LM Studio",
             AiRuntimeType::Vllm => "vLLM",
             AiRuntimeType::LocalAi => "LocalAI",
-            AiRuntimeType::McpServer => "Model Context Protocol (MCP)",
             AiRuntimeType::AgentPin => "AgentPin Agent",
             AiRuntimeType::GenericLlm => "LLM Inference Server",
         }
@@ -261,22 +259,8 @@ pub async fn probe_ai_runtime(
         }
     }
 
-    // 3. Probe MCP (Model Context Protocol) Streaming SSE Endpoints
-    for &port in &[3000, 8000, 8080] {
-        if open_ports.contains(&port)
-            && let Some((status, _)) = http_get(ip, port, "/sse", probe_timeout).await
-            && (status == 200 || status == 400 || status == 405)
-        {
-            return Some(AiRuntimeInfo {
-                runtime_type: AiRuntimeType::McpServer,
-                version: None,
-                models: Vec::new(),
-                mcp_endpoints: vec![format!("http://{}:{}/sse", ip, port)],
-                agent_name: Some("MCP Server (SSE)".to_string()),
-                agent_description: Some("Model Context Protocol streaming endpoint".to_string()),
-            });
-        }
-    }
+    // MCP detection deliberately does not live here. It requires a JSON-RPC handshake, not
+    // an HTTP status, and is implemented once in `providers::ai`.
 
     // 4. Probe AgentPin Standard Identity on standard HTTP ports
     for &port in &[80, 443, 3000, 8080] {

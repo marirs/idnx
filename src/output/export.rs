@@ -145,6 +145,9 @@ pub struct ProviderOutcomeExport {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SummaryExport {
+    /// Node count per kind, so `total_nodes` is interpretable rather than an opaque
+    /// figure that silently includes networks, interfaces and services.
+    pub nodes_by_kind: std::collections::BTreeMap<String, usize>,
     pub observed: usize,
     pub advertised: usize,
     pub inferred: usize,
@@ -302,7 +305,15 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
         }
     }));
 
+    let mut nodes_by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+    for node in graph.nodes() {
+        *nodes_by_kind
+            .entry(node.kind.label().to_string())
+            .or_default() += 1;
+    }
+
     let mut summary = SummaryExport {
+        nodes_by_kind,
         observed: 0,
         advertised: 0,
         inferred: 0,

@@ -202,10 +202,12 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node) {
 }
 
 fn render_hosts(graph: &TopologyGraph) {
-    let mut hosts: Vec<_> = graph
-        .nodes_of_kind(NodeKind::Host)
-        // A device known only by a loopback or link-local address is this machine's own
-        // plumbing, not a discovered host.
+    let all_hosts: Vec<_> = graph.nodes_of_kind(NodeKind::Host).collect();
+    // A device known only by a loopback or link-local address is this machine's own
+    // plumbing, not a discovered host.
+    let mut hosts: Vec<_> = all_hosts
+        .iter()
+        .copied()
         .filter(|n| {
             n.addresses
                 .iter()
@@ -217,7 +219,19 @@ fn render_hosts(graph: &TopologyGraph) {
     }
     hosts.sort_by_key(|n| n.addresses.iter().next().copied());
 
-    println!("\n{} ({})", "Hosts".bold().green(), hosts.len());
+    // State the omission rather than letting the heading disagree with the node total.
+    let omitted = all_hosts.len() - hosts.len();
+    let note = if omitted > 0 {
+        format!(" ({omitted} more known only by a link-local or loopback address)")
+    } else {
+        String::new()
+    };
+    println!(
+        "\n{} ({}){}",
+        "Hosts".bold().green(),
+        hosts.len(),
+        note.dimmed()
+    );
     for node in hosts {
         // Lead with a routable address; link-local ones are shown as extras.
         let mut addrs: Vec<String> = node
@@ -454,9 +468,28 @@ fn render_coverage(report: &DiscoveryReport) {
     let facts = grade_counts_facts(&report.graph);
     let edges = grade_counts_edges(&report.graph);
 
+    // A bare node total is not interpretable: it counts networks, interfaces and services
+    // alongside devices, so "29 nodes" beside "11 hosts" read as a contradiction. The
+    // composition is spelled out so the two figures reconcile.
+    let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for node in report.graph.nodes() {
+        *by_kind.entry(node.kind.label()).or_default() += 1;
+    }
+    let composition = by_kind
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     println!(
-        "\n  {:<16}{} observed · {} advertised · {} inferred",
+        "\n  {:<16}{} total — {}",
         "Nodes:".bold(),
+        report.graph.node_count().to_string().bold(),
+        composition.dimmed()
+    );
+    println!(
+        "  {:<16}{} observed · {} advertised · {} inferred",
+        "by grade:".dimmed(),
         nodes.observed.to_string().green().bold(),
         nodes.advertised.to_string().cyan().bold(),
         nodes.inferred.to_string().yellow().bold(),

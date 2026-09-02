@@ -579,25 +579,6 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                     ));
                 }
 
-                // AI runtime evidence was previously computed by the scanner and then
-                // dropped on the floor, so no AI fact ever reached the graph.
-                if let Some(ai) = &host.ai_runtime {
-                    // Attribute the finding to the port it was confirmed on.
-                    let ai_port = host
-                        .open_ports
-                        .iter()
-                        .map(|p| p.port)
-                        .find(|p| matches!(p, 11434 | 1234 | 8000 | 8080 | 5000 | 3000))
-                        .unwrap_or_else(|| host.open_ports.first().map(|p| p.port).unwrap_or(0));
-                    out.extend(ai_evidence(
-                        ai,
-                        &device,
-                        IpAddr::V4(host.ip),
-                        ai_port,
-                        vantage,
-                    ));
-                }
-
                 if serves_dns {
                     out.push(TopologyEvidence::new(
                         Fact::DeviceCapability {
@@ -640,82 +621,6 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             out
         })
     }
-}
-
-/// Converts an AI runtime finding into graph evidence.
-///
-/// Modelled as capabilities and services on the owning device rather than as a separate
-/// node, so an AI host still appears once with everything known about it.
-fn ai_evidence(
-    ai: &crate::probes::ai::AiRuntimeInfo,
-    device: &DeviceKey,
-    address: IpAddr,
-    port: u16,
-    vantage: &str,
-) -> Vec<TopologyEvidence> {
-    let mut out = Vec::new();
-
-    out.push(
-        TopologyEvidence::new(
-            Fact::DeviceCapability {
-                device: device.clone(),
-                capability: Capability::AiRuntime,
-                detail: Some(ai.summary_label()),
-            },
-            EvidenceSource::TcpProbe,
-            // The runtime answered its own protocol endpoint, so this is observed.
-            Confidence::Observed,
-            vantage,
-        )
-        .with_detail(format!(
-            "{} on port {}",
-            ai.runtime_type.display_name(),
-            port
-        )),
-    );
-
-    out.push(TopologyEvidence::new(
-        Fact::Service {
-            address,
-            port,
-            protocol: "tcp",
-            detail: Some(ai.summary_label()),
-        },
-        EvidenceSource::TcpProbe,
-        Confidence::Observed,
-        vantage,
-    ));
-
-    // The model catalogue is what the runtime reported about itself.
-    for model in &ai.models {
-        out.push(TopologyEvidence::new(
-            Fact::DeviceDescription {
-                device: device.clone(),
-                text: format!("model: {model}"),
-            },
-            EvidenceSource::TcpProbe,
-            Confidence::Advertised,
-            vantage,
-        ));
-    }
-
-    if !ai.mcp_endpoints.is_empty() {
-        out.push(TopologyEvidence::new(
-            Fact::DeviceCapability {
-                device: device.clone(),
-                capability: Capability::McpServer,
-                detail: Some(format!(
-                    "Model Context Protocol endpoints: {}",
-                    ai.mcp_endpoints.join(", ")
-                )),
-            },
-            EvidenceSource::TcpProbe,
-            Confidence::Observed,
-            vantage,
-        ));
-    }
-
-    out
 }
 
 /// Providers that examine a network scope or a specific device.

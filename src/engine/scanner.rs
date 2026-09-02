@@ -33,7 +33,6 @@ pub struct HostResult {
     pub open_ports: Vec<PortInfo>,
     pub min_latency: Option<Duration>,
     pub ipv6_addrs: Vec<std::net::Ipv6Addr>,
-    pub ai_runtime: Option<crate::probes::ai::AiRuntimeInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -404,7 +403,6 @@ pub async fn scan_subnet_ext(
                 open_ports: Vec::new(),
                 min_latency: None,
                 ipv6_addrs: Vec::new(),
-                ai_runtime: None,
             },
         );
     }
@@ -422,7 +420,6 @@ pub async fn scan_subnet_ext(
                     open_ports: Vec::new(),
                     min_latency: None,
                     ipv6_addrs: Vec::new(),
-                    ai_runtime: None,
                 });
 
                 entry.is_alive = true;
@@ -474,7 +471,6 @@ pub async fn scan_subnet_ext(
                     open_ports: Vec::new(),
                     min_latency: None,
                     ipv6_addrs: Vec::new(),
-                    ai_runtime: None,
                 });
             }
         }
@@ -617,54 +613,6 @@ pub async fn scan_subnet_ext(
         {
             host.hostname = Some(cn);
         }
-
-        // Probe AI Agent & Local LLM Runtimes (Ollama 11434, LM Studio 1234, vLLM 8000, LocalAI 8080, MCP)
-        let is_local_machine = if let Ok(info) = crate::net::interface::detect_local_network() {
-            info.ip == host.ip
-        } else {
-            false
-        };
-
-        let open_port_nums: Vec<u16> = host.open_ports.iter().map(|p| p.port).collect();
-
-        // If scanning the local host, also probe loopback (default Ollama/LM Studio bind address)
-        let local_ai = if is_local_machine {
-            let loopback = Ipv4Addr::new(127, 0, 0, 1);
-            crate::probes::ai::probe_ai_runtime(
-                loopback,
-                &[11434, 1234, 8000, 8080],
-                Duration::from_millis(300),
-            )
-            .await
-        } else {
-            None
-        };
-
-        let detected_ai = if local_ai.is_some() {
-            local_ai
-        } else if open_port_nums
-            .iter()
-            .any(|&p| matches!(p, 11434 | 1234 | 8000 | 8080 | 5000 | 3000 | 80 | 443))
-        {
-            crate::probes::ai::probe_ai_runtime(
-                host.ip,
-                &open_port_nums,
-                Duration::from_millis(400),
-            )
-            .await
-        } else {
-            None
-        };
-
-        if let Some(ai_info) = detected_ai {
-            if host.hostname.is_none()
-                || host.hostname.as_deref() == Some("?")
-                || host.hostname.as_deref() == Some("-")
-            {
-                host.hostname = Some(ai_info.summary_label());
-            }
-            host.ai_runtime = Some(ai_info);
-        }
     }
 
     // 7. Dual-Stack IPv6 NDP Neighbor Harvesting & Correlation
@@ -724,7 +672,6 @@ pub async fn scan_subnet_ext(
                     open_ports: Vec::new(),
                     min_latency: None,
                     ipv6_addrs: vec![ndp.ip],
-                    ai_runtime: None,
                 });
             }
         }
