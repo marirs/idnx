@@ -197,9 +197,9 @@ impl DiscoveryProvider for MndpProvider {
 
 /// Vendor-proprietary discovery broadcasts.
 ///
-/// Deliberately generic. Vendor mechanisms live behind this one provider so that no
-/// manufacturer is privileged in the graph or the scheduler; adding another vendor means
-/// adding a probe here, not a branch anywhere else.
+/// A thin shell over the vendor broadcast registry, so that no manufacturer is privileged
+/// in the graph or the scheduler: adding one means adding an entry to that registry, not a
+/// branch here. Whether any broadcast answers never affects recursion.
 pub struct VendorDiscoveryProvider;
 
 impl DiscoveryProvider for VendorDiscoveryProvider {
@@ -213,52 +213,11 @@ impl DiscoveryProvider for VendorDiscoveryProvider {
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
         Box::pin(async move {
-            let mut out = Vec::new();
-            let vantage = &context.vantage.interface;
-
-            for r in crate::probes::asus::discover_asus_routers(Duration::from_millis(600)).await {
-                let addr = IpAddr::V4(r.ip);
-                let device = DeviceKey::Address(addr);
-
-                out.push(TopologyEvidence::new(
-                    Fact::DeviceAddress {
-                        device: device.clone(),
-                        address: addr,
-                    },
-                    EvidenceSource::VendorDiscovery,
-                    Confidence::Observed,
-                    vantage,
-                ));
-
-                if let Some(model) = r.model_name.clone() {
-                    out.push(TopologyEvidence::new(
-                        Fact::DeviceDescription {
-                            device: device.clone(),
-                            text: model,
-                        },
-                        EvidenceSource::VendorDiscovery,
-                        Confidence::Advertised,
-                        vantage,
-                    ));
-                }
-
-                // Responding to a router-management discovery protocol is behaviour, not
-                // manufacture: the device is running router firmware and said so.
-                out.push(
-                    TopologyEvidence::new(
-                        Fact::DeviceRoleSignal {
-                            device,
-                            signal: RoleSignal::LinkLayerCapability("Router"),
-                        },
-                        EvidenceSource::VendorDiscovery,
-                        Confidence::Advertised,
-                        vantage,
-                    )
-                    .with_detail("answered a router management discovery broadcast"),
-                );
-            }
-
-            out
+            crate::providers::vendor::run_broadcasts(
+                &context.vantage.interface,
+                context.timeout.max(Duration::from_millis(600)),
+            )
+            .await
         })
     }
 }

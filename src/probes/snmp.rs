@@ -22,9 +22,9 @@ const TAG_SEQUENCE: u8 = 0x30;
 
 // SNMP Application Tags
 const TAG_IP_ADDRESS: u8 = 0x40; // Application 0
-const TAG_COUNTER32: u8 = 0x41;  // Application 1
-const TAG_GAUGE32: u8 = 0x42;    // Application 2
-const TAG_TIMETICKS: u8 = 0x43;  // Application 3
+const TAG_COUNTER32: u8 = 0x41; // Application 1
+const TAG_GAUGE32: u8 = 0x42; // Application 2
+const TAG_TIMETICKS: u8 = 0x43; // Application 3
 
 // SNMP PDU Tags
 pub const PDU_GET_REQUEST: u8 = 0xA0;
@@ -35,8 +35,8 @@ pub const PDU_GET_RESPONSE: u8 = 0xA2;
 pub const OID_SYS_DESCR: &str = "1.3.6.1.2.1.1.1.0";
 pub const OID_SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
 pub const OID_IP_NET_TO_MEDIA_TABLE: &str = "1.3.6.1.2.1.4.22.1"; // ARP table
-pub const OID_IP_ROUTE_TABLE: &str = "1.3.6.1.2.1.4.21.1";        // Route table
-pub const OID_IP_ADDR_TABLE: &str = "1.3.6.1.2.1.4.20.1";         // Interface addresses
+pub const OID_IP_ROUTE_TABLE: &str = "1.3.6.1.2.1.4.21.1"; // Route table
+pub const OID_IP_ADDR_TABLE: &str = "1.3.6.1.2.1.4.20.1"; // Interface addresses
 
 /// Represents an ASN.1 Object Identifier
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -102,17 +102,15 @@ pub enum BerValue {
 impl BerValue {
     pub fn as_str(&self) -> Option<String> {
         match self {
-            BerValue::OctetString(bytes) => {
-                String::from_utf8(bytes.clone()).ok().or_else(|| {
-                    Some(
-                        bytes
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(":"),
-                    )
-                })
-            }
+            BerValue::OctetString(bytes) => String::from_utf8(bytes.clone()).ok().or_else(|| {
+                Some(
+                    bytes
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                )
+            }),
             BerValue::Oid(o) => Some(o.to_string()),
             BerValue::IpAddress(ip) => Some(ip.to_string()),
             BerValue::Integer(i) => Some(i.to_string()),
@@ -628,8 +626,15 @@ pub async fn harvest_snmp_device(
 
     // 2. Query sysName
     let sys_name_oid = Oid::from_str(OID_SYS_NAME).ok()?;
-    let sys_name = if let Ok(msg) =
-        snmp_request(target, port, community, PDU_GET_REQUEST, &sys_name_oid, timeout).await
+    let sys_name = if let Ok(msg) = snmp_request(
+        target,
+        port,
+        community,
+        PDU_GET_REQUEST,
+        &sys_name_oid,
+        timeout,
+    )
+    .await
     {
         msg.pdu.varbinds.first().and_then(|vb| vb.1.as_str())
     } else {
@@ -650,8 +655,10 @@ pub async fn harvest_snmp_device(
     // .3 = ipNetToMediaNetAddress (IP)
     if let Ok(arp_root) = Oid::from_str(OID_IP_NET_TO_MEDIA_TABLE) {
         let arp_results = snmp_walk(target, port, community, &arp_root, timeout, 512).await;
-        let mut ip_map: std::collections::HashMap<Vec<u32>, (Option<Ipv4Addr>, Option<String>, u32)> =
-            std::collections::HashMap::new();
+        let mut ip_map: std::collections::HashMap<
+            Vec<u32>,
+            (Option<Ipv4Addr>, Option<String>, u32),
+        > = std::collections::HashMap::new();
 
         for (oid, val) in arp_results {
             // OID structure: 1.3.6.1.2.1.4.22.1.<column>.<ifIndex>.<ip0>.<ip1>.<ip2>.<ip3>
@@ -659,9 +666,7 @@ pub async fn harvest_snmp_device(
                 let column = oid.0[9];
                 let if_index = oid.0[10];
                 let entry_key = oid.0[10..].to_vec();
-                let entry = ip_map
-                    .entry(entry_key)
-                    .or_insert((None, None, if_index));
+                let entry = ip_map.entry(entry_key).or_insert((None, None, if_index));
 
                 match column {
                     2 => entry.1 = val.as_mac(),
@@ -729,8 +734,10 @@ pub async fn harvest_snmp_device(
     // .3 = ipAdEntNetMask
     if let Ok(addr_root) = Oid::from_str(OID_IP_ADDR_TABLE) {
         let addr_results = snmp_walk(target, port, community, &addr_root, timeout, 64).await;
-        let mut addr_map: std::collections::HashMap<Vec<u32>, (Option<Ipv4Addr>, Option<Ipv4Addr>)> =
-            std::collections::HashMap::new();
+        let mut addr_map: std::collections::HashMap<
+            Vec<u32>,
+            (Option<Ipv4Addr>, Option<Ipv4Addr>),
+        > = std::collections::HashMap::new();
 
         for (oid, val) in addr_results {
             if oid.0.len() >= 11 {
@@ -844,9 +851,6 @@ mod tests {
         assert_eq!(decoded.pdu.request_id, 999);
         assert_eq!(decoded.pdu.varbinds.len(), 1);
         assert_eq!(decoded.pdu.varbinds[0].0, oid);
-        assert_eq!(
-            decoded.pdu.varbinds[0].1.as_str().unwrap(),
-            "ASUS RT-BE92U"
-        );
+        assert_eq!(decoded.pdu.varbinds[0].1.as_str().unwrap(), "ASUS RT-BE92U");
     }
 }

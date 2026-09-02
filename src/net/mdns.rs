@@ -232,12 +232,7 @@ pub async fn resolve_ipv6_mdns_hostnames(
         Err(_) => return HashMap::new(),
     };
 
-    let mdns_dest = SocketAddrV6::new(
-        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb),
-        5353,
-        0,
-        0,
-    );
+    let mdns_dest = SocketAddrV6::new(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb), 5353, 0, 0);
 
     for &ip in ips {
         let q = build_ipv6_ptr_query(ip);

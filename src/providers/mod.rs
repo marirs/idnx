@@ -10,6 +10,7 @@ pub mod local;
 pub mod network;
 pub mod passive;
 pub mod target;
+pub mod vendor;
 
 use std::future::Future;
 use std::net::IpAddr;

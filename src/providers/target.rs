@@ -126,6 +126,22 @@ async fn interrogate(
     // Stage 3: control-plane probes that do not depend on an open TCP port.
     out.extend(probe_control_plane(target, address, &device, &open_ports, context, vantage).await);
 
+    // Stage 4: vendor adapters, chosen from what the device has disclosed in the stages
+    // above. Optional throughout -- no adapter is required, none gates recursion, and a
+    // device that selects none (unknown manufacturer, white-label or randomized MAC, or a
+    // software router on generic hardware) is mapped identically by the standard protocols.
+    let fingerprint = crate::providers::vendor::DeviceFingerprint::from_evidence(&out, &open_ports);
+    out.extend(
+        crate::providers::vendor::run_adapters(&crate::providers::vendor::VendorContext {
+            target,
+            device,
+            fingerprint,
+            timeout,
+            vantage: vantage.to_string(),
+        })
+        .await,
+    );
+
     out
 }
 

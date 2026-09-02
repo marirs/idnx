@@ -26,27 +26,27 @@ pub fn build_smb2_negotiate_request() -> Vec<u8> {
 
     // SMB2 Header (64 bytes)
     smb.extend_from_slice(&[0xFE, b'S', b'M', b'B']); // Protocol ID: "\xFESMB"
-    smb.extend_from_slice(&64u16.to_le_bytes());        // StructureSize = 64
-    smb.extend_from_slice(&0u16.to_le_bytes());         // CreditCharge = 0
-    smb.extend_from_slice(&0u32.to_le_bytes());         // Status = 0
-    smb.extend_from_slice(&0x0000u16.to_le_bytes());     // Command: NEGOTIATE (0)
-    smb.extend_from_slice(&0u16.to_le_bytes());         // CreditsRequested = 0
-    smb.extend_from_slice(&0u32.to_le_bytes());         // Flags = 0
-    smb.extend_from_slice(&0u32.to_le_bytes());         // NextCommand = 0
-    smb.extend_from_slice(&1u64.to_le_bytes());         // MessageId = 1
-    smb.extend_from_slice(&0u32.to_le_bytes());         // ProcessId = 0
-    smb.extend_from_slice(&0u32.to_le_bytes());         // TreeId = 0
-    smb.extend_from_slice(&0u64.to_le_bytes());         // SessionId = 0
-    smb.extend_from_slice(&[0u8; 16]);                  // Signature = 16 zeros
+    smb.extend_from_slice(&64u16.to_le_bytes()); // StructureSize = 64
+    smb.extend_from_slice(&0u16.to_le_bytes()); // CreditCharge = 0
+    smb.extend_from_slice(&0u32.to_le_bytes()); // Status = 0
+    smb.extend_from_slice(&0x0000u16.to_le_bytes()); // Command: NEGOTIATE (0)
+    smb.extend_from_slice(&0u16.to_le_bytes()); // CreditsRequested = 0
+    smb.extend_from_slice(&0u32.to_le_bytes()); // Flags = 0
+    smb.extend_from_slice(&0u32.to_le_bytes()); // NextCommand = 0
+    smb.extend_from_slice(&1u64.to_le_bytes()); // MessageId = 1
+    smb.extend_from_slice(&0u32.to_le_bytes()); // ProcessId = 0
+    smb.extend_from_slice(&0u32.to_le_bytes()); // TreeId = 0
+    smb.extend_from_slice(&0u64.to_le_bytes()); // SessionId = 0
+    smb.extend_from_slice(&[0u8; 16]); // Signature = 16 zeros
 
     // SMB2 Negotiate Request Body (36 bytes + dialects)
-    smb.extend_from_slice(&36u16.to_le_bytes());        // StructureSize = 36
-    smb.extend_from_slice(&2u16.to_le_bytes());         // DialectCount = 2
-    smb.extend_from_slice(&0x01u16.to_le_bytes());      // SecurityMode = SMB2_NEGOTIATE_SIGNING_ENABLED
-    smb.extend_from_slice(&0u16.to_le_bytes());         // Reserved = 0
+    smb.extend_from_slice(&36u16.to_le_bytes()); // StructureSize = 36
+    smb.extend_from_slice(&2u16.to_le_bytes()); // DialectCount = 2
+    smb.extend_from_slice(&0x01u16.to_le_bytes()); // SecurityMode = SMB2_NEGOTIATE_SIGNING_ENABLED
+    smb.extend_from_slice(&0u16.to_le_bytes()); // Reserved = 0
     smb.extend_from_slice(&0x0000007Fu32.to_le_bytes()); // Capabilities = 0x7F
-    smb.extend_from_slice(&[0x11; 16]);                 // ClientGUID: 16 bytes
-    smb.extend_from_slice(&0u64.to_le_bytes());         // ClientStartTime = 0
+    smb.extend_from_slice(&[0x11; 16]); // ClientGUID: 16 bytes
+    smb.extend_from_slice(&0u64.to_le_bytes()); // ClientStartTime = 0
 
     // Dialects: SMB 2.0.2 (0x0202) and SMB 2.1 (0x0210)
     smb.extend_from_slice(&0x0202u16.to_le_bytes());
@@ -194,11 +194,7 @@ pub fn parse_smb2_response(buf: &[u8]) -> Option<SmbInfo> {
 }
 
 /// Asynchronously probes target IP on port 445/139 for SMB host identity
-pub async fn probe_smb(
-    target: Ipv4Addr,
-    port: u16,
-    timeout_duration: Duration,
-) -> Option<SmbInfo> {
+pub async fn probe_smb(target: Ipv4Addr, port: u16, timeout_duration: Duration) -> Option<SmbInfo> {
     let dest = SocketAddrV4::new(target, port);
     let connect_fut = TcpStream::connect(dest);
     let mut stream = timeout(timeout_duration, connect_fut).await.ok()?.ok()?;
@@ -239,7 +235,7 @@ mod tests {
         let mut ntlm = Vec::new();
         ntlm.extend_from_slice(b"NTLMSSP\0");
         ntlm.extend_from_slice(&2u32.to_le_bytes()); // Type 2 Challenge
-        ntlm.extend_from_slice(&[0u8; 28]);          // Dummy fields
+        ntlm.extend_from_slice(&[0u8; 28]); // Dummy fields
 
         // AV_PAIRs
         let mut av_pairs = Vec::new();
