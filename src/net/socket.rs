@@ -76,6 +76,13 @@ pub struct SocketBinding {
     pub v6_source: Option<Ipv6Addr>,
     /// Source address for link-local IPv6 probes, which need a source on the same link.
     pub v6_link_local_source: Option<Ipv6Addr>,
+    /// Whether asking the kernel to pin this interface actually succeeded.
+    ///
+    /// Established by trying it, not by asking whether the platform has the option.
+    /// `SO_BINDTODEVICE` needs `CAP_NET_RAW`, so on an unprivileged Linux run the call is
+    /// refused -- and reporting "interface bound" on the strength of the platform alone
+    /// claimed a guarantee that was never obtained.
+    native_binding: bool,
 }
 
 impl SocketBinding {
@@ -90,11 +97,13 @@ impl SocketBinding {
     }
 
     /// The strongest guarantee this binding can make for a destination.
+    ///
+    /// Reports what was achieved, not what the platform advertises.
     pub fn mode(&self, destination: &SocketAddr) -> BindingMode {
         if !self.selected {
             return BindingMode::Unbound;
         }
-        if native_binding_supported() && self.index != 0 {
+        if self.native_binding {
             return BindingMode::NativeInterface;
         }
         if self.local_address_for(destination).is_some() {
@@ -142,6 +151,10 @@ impl SocketBinding {
                 }
             }
         }
+
+        // Establish the guarantee by attempting it once, rather than inferring it from the
+        // target platform. The scratch socket is discarded; only the outcome is kept.
+        binding.native_binding = binding.index != 0 && probe_native_binding(&binding);
 
         binding
     }
@@ -335,7 +348,9 @@ impl SocketBinding {
         if !self.selected || self.index == 0 {
             return Ok(());
         }
-        bind_socket_to_interface(socket, &self.interface, self.index, ipv4);
+        // A refusal is not fatal: source binding still applies, and `mode` already reports
+        // that the weaker guarantee is the one in force.
+        let _ = bind_socket_to_interface(socket, &self.interface, self.index, ipv4);
         Ok(())
     }
 
@@ -370,6 +385,9 @@ impl ProbeChannel {
 }
 
 /// Whether the platform offers a way to pin a socket to an interface.
+///
+/// Support is necessary but not sufficient: the call can still be refused at runtime, which
+/// is why [`probe_native_binding`] tries it rather than trusting this.
 pub fn native_binding_supported() -> bool {
     cfg!(any(
         target_os = "macos",
@@ -378,10 +396,35 @@ pub fn native_binding_supported() -> bool {
     ))
 }
 
+/// Tries the native interface bind once and reports whether the kernel accepted it.
+#[cfg(unix)]
+fn probe_native_binding(binding: &SocketBinding) -> bool {
+    if !native_binding_supported() {
+        return false;
+    }
+    // A scratch socket, never sent on. Binding to port 0 on the wildcard address always
+    // succeeds, so a failure below is the interface option being refused and nothing else.
+    let Ok(scratch) = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    bind_socket_to_interface(&scratch, &binding.interface, binding.index, true).is_ok()
+}
+
+/// Windows exposes no libc equivalent, so the native bind is never attempted there.
+#[cfg(not(unix))]
+fn probe_native_binding(_binding: &SocketBinding) -> bool {
+    false
+}
+
 /// macOS: `IP_BOUND_IF` / `IPV6_BOUND_IF`. Works without privileges, which makes it the
 /// strongest guarantee available to an ordinary run.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn bind_socket_to_interface<S: AsFd>(socket: &S, _name: &str, index: u32, ipv4: bool) {
+fn bind_socket_to_interface<S: AsFd>(
+    socket: &S,
+    _name: &str,
+    index: u32,
+    ipv4: bool,
+) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
     const IP_BOUND_IF: libc::c_int = 25;
@@ -394,38 +437,51 @@ fn bind_socket_to_interface<S: AsFd>(socket: &S, _name: &str, index: u32, ipv4: 
     };
     let value = index as libc::c_uint;
     // SAFETY: the fd is owned by `socket` and outlives the call; the value is a c_uint of
-    // the length declared. A refusal is ignored on purpose -- source binding still holds.
-    unsafe {
+    // the length declared.
+    let result = unsafe {
         libc::setsockopt(
             socket.as_fd().as_raw_fd(),
             level,
             option,
             std::ptr::addr_of!(value).cast(),
             std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-        );
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
 }
 
 /// Linux: `SO_BINDTODEVICE`. Needs `CAP_NET_RAW`, so an unprivileged run falls back to
 /// source binding, which [`SocketBinding::mode`] reports honestly.
 #[cfg(target_os = "linux")]
-fn bind_socket_to_interface<S: AsFd>(socket: &S, name: &str, _index: u32, _ipv4: bool) {
+fn bind_socket_to_interface<S: AsFd>(
+    socket: &S,
+    name: &str,
+    _index: u32,
+    _ipv4: bool,
+) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let Ok(cname) = std::ffi::CString::new(name) else {
-        return;
-    };
+    let cname = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name"))?;
     // SAFETY: the fd is owned by `socket`, and the name is a NUL-terminated string that
-    // outlives the call. EPERM without CAP_NET_RAW is expected and ignored.
-    unsafe {
+    // outlives the call. EPERM without CAP_NET_RAW is expected; the caller reports the
+    // weaker guarantee rather than failing.
+    let result = unsafe {
         libc::setsockopt(
             socket.as_fd().as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_BINDTODEVICE,
             cname.as_ptr().cast(),
             cname.as_bytes_with_nul().len() as libc::socklen_t,
-        );
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
 }
 
 /// Other Unix platforms offer no portable equivalent; source binding stands alone.
@@ -616,6 +672,33 @@ mod tests {
             .await
             .expect_err("must not fall back to default routing");
         assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[test]
+    fn the_reported_mode_is_what_was_achieved_not_what_the_platform_offers() {
+        // A fabricated interface index cannot be bound to on any platform, so the native
+        // bind must fail and the reported mode must fall back rather than claim it.
+        // Reporting NativeInterface from `cfg!` alone would have said "interface bound" on
+        // an unprivileged Linux run where SO_BINDTODEVICE was refused.
+        let unbindable = SocketBinding::for_interface(
+            "eth1",
+            &[address("eth1", "10.0.0.5", 24)],
+            // An index no interface has.
+            0x7fff_ffff,
+        );
+        assert!(!unbindable.native_binding);
+        assert_eq!(
+            unbindable.mode(&"10.0.0.1:80".parse().unwrap()),
+            BindingMode::SourceAddress
+        );
+
+        // And with no source address either, nothing is constrained and it says so.
+        let nothing = SocketBinding::for_interface("eth9", &[], 0x7fff_ffff);
+        assert!(nothing.is_selected());
+        assert_eq!(
+            nothing.mode(&"10.0.0.1:80".parse().unwrap()),
+            BindingMode::Unbound
+        );
     }
 
     #[tokio::test]
