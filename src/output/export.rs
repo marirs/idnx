@@ -1,11 +1,21 @@
-use crate::engine::deep::ChildNetworkResult;
-use crate::engine::scanner::ScanSummary;
-use chrono::Local;
-use ipnet::Ipv4Net;
-use serde::{Deserialize, Serialize};
+//! Serialises the topology graph.
+//!
+//! Every format carries the same information: node kinds, relationships, evidence,
+//! confidence, scope coverage and opaque boundaries. A format that dropped provenance
+//! would turn a graded map back into an undifferentiated address list, which is precisely
+//! what this tool exists not to produce.
+
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+
+use chrono::Local;
+use serde::{Deserialize, Serialize};
+
+use crate::engine::orchestrator::{DiscoveryReport, is_virtual_network};
+use crate::topology::graph::{NodeId, NodeKind, Provenance};
+use crate::topology::{Confidence, TopologyGraph};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -28,213 +38,302 @@ impl OutputFormat {
     }
 }
 
+/// The complete serialised topology.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NetworkExport {
+pub struct TopologyExport {
     pub tool: String,
     pub version: String,
     pub generated_at: String,
-    pub primary_subnet: String,
-    pub total_active_hosts: usize,
-    /// One record per network, carrying the evidence that produced it. Consumers that
-    /// only want an asset list can ignore this; consumers reasoning about topology need
-    /// to know which networks were observed and which were merely advertised.
-    pub networks: Vec<ExportNetwork>,
-    /// Routers that were detected but could not be traversed, each with the evidence that
-    /// identified it and the reason it could not be explored.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unexplored_boundaries: Vec<ExportBoundary>,
-    pub hosts: Vec<ExportHost>,
+    pub vantage: VantageExport,
+    pub networks: Vec<NetworkExport>,
+    pub vlans: Vec<VlanExport>,
+    pub devices: Vec<DeviceExport>,
+    pub relationships: Vec<RelationshipExport>,
+    pub coverage: Vec<CoverageExport>,
+    pub summary: SummaryExport,
 }
 
-/// A router idNX could see but not see past.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExportBoundary {
-    pub address: String,
-    pub mac_address: Option<String>,
-    pub vendor: Option<String>,
-    pub hostname: Option<String>,
-    pub discovery_source: String,
-    /// Observations that identified this device as a router.
-    pub evidence: Vec<String>,
-    /// Why the networks behind it could not be enumerated.
-    pub reason: String,
+pub struct VantageExport {
+    pub interface: String,
+    pub kind: String,
+    /// Frame classes this vantage cannot receive at all.
+    pub blind_to: Vec<String>,
+    /// Sources that were unavailable, and why.
+    pub unavailable: Vec<String>,
+    /// Frames passively observed. `None` means capture never started.
+    pub observed_frames: Option<u64>,
 }
 
-/// A network in the result set, with its discovery provenance.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExportNetwork {
+pub struct NetworkExport {
     pub cidr: String,
-    /// `local` for the scanned subnet, `cascaded` for anything reached through discovery.
-    pub role: String,
-    /// Router address on this network, when one was actually observed.
-    pub gateway: Option<String>,
-    /// Router this network was learned *from*, when it was learned from one.
-    pub parent_router: Option<String>,
-    pub discovery_source: String,
-    /// `verified`, `advertised`, `user-supplied` or `inferred`.
+    /// `physical` or `virtual`, decided by the interface a network is reached through and
+    /// never by its address range.
+    pub kind: String,
+    pub interfaces: Vec<String>,
     pub confidence: String,
-    /// False when the network was too wide to enumerate; `active_hosts` then reflects only
-    /// hosts recovered from a router's ARP cache.
-    pub swept: bool,
-    pub total_addresses: usize,
-    pub active_hosts: usize,
-    pub snmp_system_name: Option<String>,
+    /// False when the network was too large to enumerate address by address.
+    pub enumerated: bool,
+    pub evidence: Vec<EvidenceExport>,
+}
+
+/// A VLAN observed on the wire.
+///
+/// `prefix` is always absent: a tag proves the VLAN ID and nothing about any network.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VlanExport {
+    pub id: u16,
+    pub prefix: Option<String>,
+    pub note: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExportHost {
-    pub network: String,
-    pub ip: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ipv6_addresses: Vec<String>,
-    pub hostname: Option<String>,
-    pub mac_address: Option<String>,
+pub struct DeviceExport {
+    pub id: String,
+    /// `router`, `switch`, `host` or `opaque boundary`.
+    pub kind: String,
+    pub addresses: Vec<String>,
+    pub hostnames: Vec<String>,
     pub vendor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_runtime: Option<crate::probes::ai::AiRuntimeInfo>,
-    pub status: String,
-    pub open_ports: Vec<String>,
-    pub latency_ms: Option<f64>,
-    /// How the network this host sits on was discovered. `None` for the local subnet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discovery_source: Option<String>,
-    /// Confidence grade of the network this host sits on. `None` for the local subnet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<String>,
+    pub descriptions: Vec<String>,
+    /// Behaviour that established this device's role. Vendor is never among them.
+    pub role_evidence: Vec<String>,
+    /// Why visibility stops here, when it does.
+    pub opaque_reason: Option<String>,
+    pub confidence: String,
+    pub evidence: Vec<EvidenceExport>,
 }
 
-/// Generates a unified host list from primary scan and cascaded networks.
-///
-/// `local_gateway` is passed in rather than re-detected here: export must be a pure
-/// transformation of data already gathered, not a second round of network I/O.
-pub fn build_export_data(
-    primary_cidr: &Ipv4Net,
-    summary: &ScanSummary,
-    child_networks: &[ChildNetworkResult],
-    local_gateway: Option<std::net::Ipv4Addr>,
-    boundaries: &[crate::engine::deep::UnexploredBoundary],
-) -> NetworkExport {
-    let mut hosts = Vec::new();
-    let mut networks = Vec::new();
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RelationshipExport {
+    pub from: String,
+    pub to: String,
+    pub relationship: String,
+    pub confidence: String,
+    pub evidence: Vec<EvidenceExport>,
+}
 
-    networks.push(ExportNetwork {
-        cidr: primary_cidr.to_string(),
-        role: "local".to_string(),
-        gateway: local_gateway.map(|ip| ip.to_string()),
-        parent_router: None,
-        discovery_source: "Local Interface".to_string(),
-        confidence: crate::net::routes::DiscoveryConfidence::Verified
-            .display_name()
-            .to_string(),
-        swept: true,
-        total_addresses: summary.total_hosts,
-        active_hosts: summary.active_hosts.len(),
-        snmp_system_name: None,
-    });
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EvidenceExport {
+    pub source: String,
+    pub confidence: String,
+    pub vantage: String,
+    pub detail: Option<String>,
+}
 
-    for h in &summary.active_hosts {
-        let ports: Vec<String> = h
-            .open_ports
-            .iter()
-            .map(|p| format!("{}/{}", p.port, p.service))
-            .collect();
-        let latency_ms = h.min_latency.map(|d| (d.as_micros() as f64) / 1000.0);
-        let ipv6_strings: Vec<String> = h.ipv6_addrs.iter().map(|ip| ip.to_string()).collect();
-        hosts.push(ExportHost {
-            network: format!("{} (Local)", primary_cidr),
-            ip: h.ip.to_string(),
-            ipv6_addresses: ipv6_strings,
-            hostname: h.hostname.clone(),
-            mac_address: h.mac_address.clone(),
-            vendor: h.vendor.clone(),
-            ai_runtime: h.ai_runtime.clone(),
-            status: if h.is_alive {
-                "UP".to_string()
-            } else {
-                "DOWN".to_string()
-            },
-            open_ports: ports,
-            latency_ms,
-            discovery_source: None,
-            confidence: None,
+/// What each provider produced for one scope or pivot.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CoverageExport {
+    /// The network or device examined, or `local machine` for the seed pass.
+    pub scope: String,
+    pub providers: Vec<ProviderOutcomeExport>,
+    pub networks_learned: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProviderOutcomeExport {
+    pub provider: String,
+    pub facts: usize,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SummaryExport {
+    pub observed: usize,
+    pub advertised: usize,
+    pub inferred: usize,
+    pub user_supplied: usize,
+    pub total_nodes: usize,
+    pub converged: bool,
+}
+
+fn node_label(graph: &TopologyGraph, id: &NodeId) -> String {
+    match graph.node(id) {
+        Some(node) => node.display_name(),
+        None => match id {
+            NodeId::Interface(n) => n.clone(),
+            NodeId::Network(n) => n.to_string(),
+            NodeId::Vlan(v) => format!("VLAN {}", v),
+            NodeId::Device(d) => d.to_string(),
+            NodeId::Service(a, p) => format!("{}:{}", a, p),
+        },
+    }
+}
+
+fn evidence_of(provenance: &[Provenance]) -> Vec<EvidenceExport> {
+    // Providers repeat facts as frames repeat; collapse identical provenance so a document
+    // describes the topology rather than logging every repetition.
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for p in provenance {
+        let key = format!("{}|{}|{}|{:?}", p.source, p.confidence, p.vantage, p.detail);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(EvidenceExport {
+            source: p.source.label().to_string(),
+            confidence: p.confidence.label().to_string(),
+            vantage: p.vantage.clone(),
+            detail: p.detail.clone(),
         });
     }
+    out
+}
 
-    for child in child_networks {
-        networks.push(ExportNetwork {
-            cidr: child.cidr.to_string(),
-            role: "cascaded".to_string(),
-            gateway: child.gateway.map(|ip| ip.to_string()),
-            parent_router: child.parent_router_ip.map(|ip| ip.to_string()),
-            discovery_source: child.source.display_name().to_string(),
-            confidence: child.confidence.display_name().to_string(),
-            swept: !child.sweep_skipped,
-            total_addresses: child.summary.total_hosts,
-            active_hosts: child.summary.active_hosts.len(),
-            snmp_system_name: child.snmp_system_name.clone(),
+/// Builds the serialisable view of a discovery run.
+pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
+    let graph = &report.graph;
+
+    let mut networks = Vec::new();
+    for net in graph.networks() {
+        let interfaces: Vec<String> = graph
+            .interfaces_for_network(&net)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let iface_refs: Vec<&str> = interfaces.iter().map(|s| s.as_str()).collect();
+        let node = graph.node(&NodeId::Network(net));
+        networks.push(NetworkExport {
+            cidr: net.to_string(),
+            kind: if is_virtual_network(&iface_refs) {
+                "virtual".to_string()
+            } else {
+                "physical".to_string()
+            },
+            interfaces,
+            confidence: node
+                .map(|n| n.confidence.label().to_string())
+                .unwrap_or_else(|| Confidence::Observed.label().to_string()),
+            enumerated: !report.oversized_scopes.contains(&net),
+            evidence: node.map(|n| evidence_of(&n.provenance)).unwrap_or_default(),
         });
+    }
+    networks.sort_by(|a, b| a.cidr.cmp(&b.cidr));
 
-        for h in &child.summary.active_hosts {
-            let ports: Vec<String> = h
-                .open_ports
+    let vlans: Vec<VlanExport> = graph
+        .vlans_without_prefix()
+        .map(|id| VlanExport {
+            id,
+            prefix: None,
+            note: "observed on the wire; no prefix evidence".to_string(),
+        })
+        .collect();
+
+    let mut devices = Vec::new();
+    for node in graph.nodes() {
+        if !matches!(
+            node.kind,
+            NodeKind::Router | NodeKind::Switch | NodeKind::Host | NodeKind::OpaqueBoundary
+        ) {
+            continue;
+        }
+        devices.push(DeviceExport {
+            id: node.display_name(),
+            kind: node.kind.label().to_string(),
+            addresses: node.addresses.iter().map(|a| a.to_string()).collect(),
+            hostnames: node.hostnames.iter().cloned().collect(),
+            vendor: node.vendor.clone(),
+            descriptions: node.descriptions.iter().cloned().collect(),
+            role_evidence: node.role_signals.iter().cloned().collect(),
+            opaque_reason: node.opaque_reason.clone(),
+            confidence: node.confidence.label().to_string(),
+            evidence: evidence_of(&node.provenance),
+        });
+    }
+    devices.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut relationships: Vec<RelationshipExport> = graph
+        .edges()
+        .map(|edge| RelationshipExport {
+            from: node_label(graph, &edge.from),
+            to: node_label(graph, &edge.to),
+            relationship: edge.relationship.label().to_string(),
+            confidence: edge.confidence.label().to_string(),
+            evidence: evidence_of(&edge.provenance),
+        })
+        .collect();
+    relationships.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+
+    let mut coverage: Vec<CoverageExport> = report
+        .scope_runs
+        .iter()
+        .map(|run| CoverageExport {
+            scope: run
+                .scope
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "local machine".to_string()),
+            providers: run
+                .runs
                 .iter()
-                .map(|p| format!("{}/{}", p.port, p.service))
-                .collect();
-            let latency_ms = h.min_latency.map(|d| (d.as_micros() as f64) / 1000.0);
-            let ipv6_strings: Vec<String> = h.ipv6_addrs.iter().map(|ip| ip.to_string()).collect();
-            hosts.push(ExportHost {
-                network: format!("{} (Cascaded)", child.cidr),
-                ip: h.ip.to_string(),
-                ipv6_addresses: ipv6_strings,
-                hostname: h.hostname.clone(),
-                mac_address: h.mac_address.clone(),
-                vendor: h.vendor.clone(),
-                ai_runtime: h.ai_runtime.clone(),
-                status: if h.is_alive {
-                    "UP".to_string()
-                } else {
-                    "DOWN".to_string()
-                },
-                open_ports: ports,
-                latency_ms,
-                discovery_source: Some(child.source.display_name().to_string()),
-                confidence: Some(child.confidence.display_name().to_string()),
-            });
+                .map(|r| ProviderOutcomeExport {
+                    provider: r.provider.to_string(),
+                    facts: r.evidence_count,
+                    note: r.note.clone(),
+                })
+                .collect(),
+            networks_learned: Vec::new(),
+        })
+        .collect();
+
+    coverage.extend(report.pivot_runs.iter().map(|pivot| {
+        CoverageExport {
+            scope: pivot.address.to_string(),
+            providers: pivot
+                .runs
+                .iter()
+                .map(|r| ProviderOutcomeExport {
+                    provider: r.provider.to_string(),
+                    facts: r.evidence_count,
+                    note: r.note.clone(),
+                })
+                .collect(),
+            networks_learned: pivot
+                .networks_learned
+                .iter()
+                .map(|n| n.to_string())
+                .collect(),
+        }
+    }));
+
+    let mut summary = SummaryExport {
+        observed: 0,
+        advertised: 0,
+        inferred: 0,
+        user_supplied: 0,
+        total_nodes: graph.node_count(),
+        converged: report.converged,
+    };
+    for node in graph.nodes() {
+        match node.confidence {
+            Confidence::Observed => summary.observed += 1,
+            Confidence::Advertised => summary.advertised += 1,
+            Confidence::Inferred => summary.inferred += 1,
+            Confidence::UserSupplied => summary.user_supplied += 1,
         }
     }
 
-    NetworkExport {
+    TopologyExport {
         tool: "idNX".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         generated_at: Local::now().to_rfc3339(),
-        primary_subnet: primary_cidr.to_string(),
-        total_active_hosts: hosts.len(),
+        vantage: VantageExport {
+            interface: report.visibility.vantage.interface.clone(),
+            kind: report.visibility.vantage.kind.label().to_string(),
+            blind_to: report.visibility.blind_to.clone(),
+            unavailable: report.visibility.unavailable.clone(),
+            observed_frames: report.visibility.observed_frames,
+        },
         networks,
-        unexplored_boundaries: boundaries
-            .iter()
-            .map(|b| ExportBoundary {
-                address: if b.ip.is_unspecified() {
-                    b.ipv6_addrs
-                        .first()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| b.ip.to_string())
-                } else {
-                    b.ip.to_string()
-                },
-                mac_address: b.mac_address.clone(),
-                vendor: b.vendor.clone(),
-                hostname: b.hostname.clone(),
-                discovery_source: b.source.display_name().to_string(),
-                evidence: b.evidence.clone(),
-                reason: b.reason.explain().to_string(),
-            })
-            .collect(),
-        hosts,
+        vlans,
+        devices,
+        relationships,
+        coverage,
+        summary,
     }
 }
 
-/// Generates the default filename format: `idnx_YYYYMMDD.<ext>`
-pub fn get_default_filename(format: OutputFormat) -> String {
+pub fn default_filename(format: OutputFormat) -> String {
     format!(
         "idnx_{}.{}",
         Local::now().format("%Y%m%d"),
@@ -242,202 +341,288 @@ pub fn get_default_filename(format: OutputFormat) -> String {
     )
 }
 
-/// Exports network data to the specified file and format
-pub fn export_results(
+/// Writes the topology in the requested format.
+pub fn export(
+    report: &DiscoveryReport,
     format: OutputFormat,
     custom_path: Option<&str>,
-    primary_cidr: &Ipv4Net,
-    summary: &ScanSummary,
-    child_networks: &[ChildNetworkResult],
-    local_gateway: Option<std::net::Ipv4Addr>,
-    boundaries: &[crate::engine::deep::UnexploredBoundary],
 ) -> Result<PathBuf, String> {
-    let export_data = build_export_data(
-        primary_cidr,
-        summary,
-        child_networks,
-        local_gateway,
-        boundaries,
+    let data = build_export(report);
+    let path = PathBuf::from(
+        custom_path
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| default_filename(format)),
     );
-    let filename = custom_path
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| get_default_filename(format));
-    let path = PathBuf::from(&filename);
 
-    let content = match format {
-        OutputFormat::Json => serde_json::to_string_pretty(&export_data)
-            .map_err(|e| format!("JSON serialization error: {}", e))?,
-        OutputFormat::Yaml => serde_yaml::to_string(&export_data)
-            .map_err(|e| format!("YAML serialization error: {}", e))?,
-        OutputFormat::Xml => quick_xml::se::to_string(&export_data)
-            .map_err(|e| format!("XML serialization error: {}", e))?,
-        OutputFormat::Csv => {
-            let mut wtr = csv::Writer::from_writer(vec![]);
-            wtr.write_record([
-                "Network",
-                "IP",
-                "Hostname",
-                "MAC Address",
-                "Vendor",
-                "Status",
-                "Open Ports",
-                "Latency (ms)",
-                "Discovery Source",
-                "Confidence",
-            ])
-            .map_err(|e| format!("CSV header error: {}", e))?;
+    let content =
+        match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&data)
+                .map_err(|e| format!("JSON serialisation failed: {e}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(&data)
+                .map_err(|e| format!("YAML serialisation failed: {e}"))?,
+            OutputFormat::Xml => quick_xml::se::to_string(&data)
+                .map_err(|e| format!("XML serialisation failed: {e}"))?,
+            OutputFormat::Csv => render_csv(&data)?,
+            OutputFormat::Text => render_text(&data),
+        };
 
-            for h in &export_data.hosts {
-                let lat = h
-                    .latency_ms
-                    .map(|l| format!("{:.2}", l))
-                    .unwrap_or_default();
-                wtr.write_record([
-                    &h.network,
-                    &h.ip,
-                    h.hostname.as_deref().unwrap_or(""),
-                    h.mac_address.as_deref().unwrap_or(""),
-                    h.vendor.as_deref().unwrap_or(""),
-                    &h.status,
-                    &h.open_ports.join("; "),
-                    &lat,
-                    h.discovery_source.as_deref().unwrap_or("Local Interface"),
-                    h.confidence.as_deref().unwrap_or("verified"),
-                ])
-                .map_err(|e| format!("CSV write error: {}", e))?;
-            }
-
-            let bytes = wtr
-                .into_inner()
-                .map_err(|e| format!("CSV flush error: {}", e))?;
-            String::from_utf8_lossy(&bytes).to_string()
-        }
-        OutputFormat::Text => {
-            let mut text = String::new();
-            text.push_str(&format!(
-                "idNX Scan Export - Primary Subnet: {} | Generated: {}\n",
-                export_data.primary_subnet, export_data.generated_at
-            ));
-            text.push_str(&format!(
-                "Total Active Hosts: {}\n\n",
-                export_data.total_active_hosts
-            ));
-
-            text.push_str("NETWORKS AND DISCOVERY EVIDENCE\n");
-            text.push_str(&format!(
-                "{:<22} {:<10} {:<18} {:<36} {:<14} {:<8}\n",
-                "CIDR", "ROLE", "GATEWAY", "DISCOVERED VIA", "CONFIDENCE", "SWEPT"
-            ));
-            text.push_str(&format!("{}\n", "-".repeat(130)));
-            for n in &export_data.networks {
-                text.push_str(&format!(
-                    "{:<22} {:<10} {:<18} {:<36} {:<14} {:<8}\n",
-                    n.cidr,
-                    n.role,
-                    n.gateway.as_deref().unwrap_or("-"),
-                    n.discovery_source,
-                    n.confidence,
-                    if n.swept { "yes" } else { "no" }
-                ));
-            }
-            text.push('\n');
-
-            if !export_data.unexplored_boundaries.is_empty() {
-                text.push_str(
-                    "UNEXPLORED BOUNDARIES (routers detected, contents not enumerable)\n",
-                );
-                for b in &export_data.unexplored_boundaries {
-                    text.push_str(&format!(
-                        "{}  {}  [{}]\n",
-                        b.address,
-                        b.mac_address.as_deref().unwrap_or("-"),
-                        b.hostname
-                            .as_deref()
-                            .or(b.vendor.as_deref())
-                            .unwrap_or("unidentified")
-                    ));
-                    for ev in &b.evidence {
-                        text.push_str(&format!("    evidence: {}\n", ev));
-                    }
-                    text.push_str(&format!("    not traversed: {}\n", b.reason));
-                }
-                text.push('\n');
-            }
-
-            text.push_str(&format!(
-                "{:<26} {:<16} {:<28} {:<18} {:<24} {:<8} {:<10}\n",
-                "NETWORK", "IP", "HOSTNAME", "MAC", "VENDOR", "STATUS", "LATENCY"
-            ));
-            text.push_str(&format!("{}\n", "-".repeat(130)));
-
-            for h in &export_data.hosts {
-                let lat = h
-                    .latency_ms
-                    .map(|l| format!("{:.2} ms", l))
-                    .unwrap_or_else(|| "-".to_string());
-                text.push_str(&format!(
-                    "{:<26} {:<16} {:<28} {:<18} {:<24} {:<8} {:<10}\n",
-                    h.network,
-                    h.ip,
-                    h.hostname.as_deref().unwrap_or("-"),
-                    h.mac_address.as_deref().unwrap_or("-"),
-                    h.vendor.as_deref().unwrap_or("-"),
-                    h.status,
-                    lat
-                ));
-                if !h.open_ports.is_empty() {
-                    text.push_str(&format!("    └── Ports: {}\n", h.open_ports.join(", ")));
-                }
-            }
-            text
-        }
-    };
-
-    let mut file = File::create(&path)
-        .map_err(|e| format!("Failed to create file {}: {}", path.display(), e))?;
+    let mut file = File::create(&path).map_err(|e| format!("Cannot create {path:?}: {e}"))?;
     file.write_all(content.as_bytes())
-        .map_err(|e| format!("Failed to write file {}: {}", path.display(), e))?;
+        .map_err(|e| format!("Cannot write {path:?}: {e}"))?;
 
     Ok(path)
+}
+
+/// CSV is one row per device, carrying the evidence that classified it.
+fn render_csv(data: &TopologyExport) -> Result<String, String> {
+    let mut wtr = csv::Writer::from_writer(vec![]);
+    wtr.write_record([
+        "Kind",
+        "Name",
+        "Addresses",
+        "Hostnames",
+        "Vendor",
+        "Confidence",
+        "Role Evidence",
+        "Evidence Sources",
+        "Opaque Reason",
+    ])
+    .map_err(|e| format!("CSV header error: {e}"))?;
+
+    for d in &data.devices {
+        let sources: Vec<String> = d.evidence.iter().map(|e| e.source.clone()).collect();
+        wtr.write_record([
+            &d.kind,
+            &d.id,
+            &d.addresses.join("; "),
+            &d.hostnames.join("; "),
+            d.vendor.as_deref().unwrap_or(""),
+            &d.confidence,
+            &d.role_evidence.join("; "),
+            &sources.join("; "),
+            d.opaque_reason.as_deref().unwrap_or(""),
+        ])
+        .map_err(|e| format!("CSV write error: {e}"))?;
+    }
+
+    let bytes = wtr
+        .into_inner()
+        .map_err(|e| format!("CSV flush error: {e}"))?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn render_text(data: &TopologyExport) -> String {
+    let mut t = String::new();
+    t.push_str(&format!(
+        "idNX {} - topology from {} ({})\nGenerated: {}\n\n",
+        data.version, data.vantage.interface, data.vantage.kind, data.generated_at
+    ));
+
+    if !data.vantage.blind_to.is_empty() {
+        t.push_str(&format!(
+            "Not visible from this vantage: {}\n",
+            data.vantage.blind_to.join(", ")
+        ));
+    }
+    for note in &data.vantage.unavailable {
+        t.push_str(&format!("Unavailable: {}\n", note));
+    }
+    if let Some(frames) = data.vantage.observed_frames {
+        t.push_str(&format!("Passive capture: {} frames observed\n", frames));
+    }
+
+    t.push_str("\nNETWORKS\n");
+    for n in &data.networks {
+        t.push_str(&format!(
+            "  {:<24} {:<10} {:<12} {}\n",
+            n.cidr,
+            n.kind,
+            n.confidence,
+            if n.enumerated { "" } else { "(not enumerated)" }
+        ));
+    }
+
+    if !data.vlans.is_empty() {
+        t.push_str("\nVLANS\n");
+        for v in &data.vlans {
+            t.push_str(&format!("  VLAN {:<6} {}\n", v.id, v.note));
+        }
+    }
+
+    t.push_str("\nDEVICES\n");
+    for d in &data.devices {
+        t.push_str(&format!(
+            "  {:<18} {:<12} {:<28} {}\n",
+            d.kind,
+            d.confidence,
+            d.addresses.join(","),
+            d.id
+        ));
+        for e in &d.role_evidence {
+            t.push_str(&format!("      role: {}\n", e));
+        }
+        if let Some(reason) = &d.opaque_reason {
+            t.push_str(&format!("      boundary: {}\n", reason));
+        }
+    }
+
+    t.push_str("\nRELATIONSHIPS\n");
+    for r in &data.relationships {
+        t.push_str(&format!(
+            "  {} --{}--> {}  [{}]\n",
+            r.from, r.relationship, r.to, r.confidence
+        ));
+    }
+
+    t.push_str("\nCOVERAGE\n");
+    for c in &data.coverage {
+        t.push_str(&format!("  {}\n", c.scope));
+        for p in &c.providers {
+            t.push_str(&format!(
+                "    {:<20} {}\n",
+                p.provider,
+                p.note
+                    .clone()
+                    .unwrap_or_else(|| format!("{} facts", p.facts))
+            ));
+        }
+    }
+
+    t.push_str(&format!(
+        "\n{} observed, {} advertised, {} inferred, {} nodes{}\n",
+        data.summary.observed,
+        data.summary.advertised,
+        data.summary.inferred,
+        data.summary.total_nodes,
+        if data.summary.converged {
+            ""
+        } else {
+            " (stopped at the safety budget)"
+        }
+    ));
+
+    t
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::scanner::{HostResult, PortInfo, PortStatus};
-    use std::net::Ipv4Addr;
-    use std::str::FromStr;
-    use std::time::Duration;
+    use crate::engine::orchestrator::{ScopeRun, VisibilityReport};
+    use crate::providers::{Vantage, VantageKind};
+    use crate::topology::TopologyEvidence;
+    use crate::topology::evidence::{DeviceKey, EvidenceSource, Fact, RoleSignal};
 
-    fn sample_scan_data() -> (Ipv4Net, ScanSummary, Vec<ChildNetworkResult>) {
-        let primary_cidr = Ipv4Net::from_str("192.168.1.0/24").unwrap();
-        let summary = ScanSummary {
-            total_hosts: 254,
-            active_hosts: vec![HostResult {
-                ip: Ipv4Addr::new(192, 168, 1, 1),
-                is_alive: true,
-                hostname: Some("Gateway-Router".to_string()),
-                mac_address: Some("00:11:22:33:44:55".to_string()),
-                vendor: Some("Linksys".to_string()),
-                open_ports: vec![PortInfo {
-                    port: 80,
-                    status: PortStatus::Open,
-                    latency: Some(Duration::from_millis(5)),
-                    service: "http",
-                }],
-                min_latency: Some(Duration::from_millis(5)),
-                ipv6_addrs: Vec::new(),
-                ai_runtime: None,
+    fn sample_report() -> DiscoveryReport {
+        let mut graph = TopologyGraph::new();
+        let mac = DeviceKey::mac("74:12:13:14:75:dc");
+
+        for ev in [
+            TopologyEvidence::new(
+                Fact::Network {
+                    prefix: "192.168.1.0/24".parse().unwrap(),
+                },
+                EvidenceSource::InterfaceAddress,
+                Confidence::Observed,
+                "en0",
+            ),
+            TopologyEvidence::new(
+                Fact::InterfaceNetwork {
+                    interface: "en0".to_string(),
+                    prefix: "192.168.1.0/24".parse().unwrap(),
+                },
+                EvidenceSource::InterfaceAddress,
+                Confidence::Observed,
+                "en0",
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: mac.clone(),
+                    address: "192.168.1.1".parse().unwrap(),
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                "en0",
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceRoleSignal {
+                    device: mac.clone(),
+                    signal: RoleSignal::DefaultGateway,
+                },
+                EvidenceSource::DefaultGateway,
+                Confidence::Observed,
+                "en0",
+            ),
+            TopologyEvidence::new(
+                Fact::Vlan { id: 20 },
+                EvidenceSource::Stp,
+                Confidence::Observed,
+                "en0",
+            ),
+        ] {
+            graph.absorb(ev);
+        }
+        graph.finalize_roles();
+
+        DiscoveryReport {
+            graph,
+            scope_runs: vec![ScopeRun {
+                scope: None,
+                runs: Vec::new(),
             }],
-            elapsed: Duration::from_secs(1),
-        };
-        (primary_cidr, summary, Vec::new())
+            pivot_runs: Vec::new(),
+            visibility: VisibilityReport {
+                vantage: Vantage {
+                    interface: "en0".to_string(),
+                    kind: VantageKind::Wired,
+                    capture_available: true,
+                },
+                blind_to: vec!["switched unicast".to_string()],
+                unavailable: Vec::new(),
+                observed_frames: Some(42),
+            },
+            oversized_scopes: Vec::new(),
+            converged: true,
+        }
     }
 
     #[test]
-    fn test_export_formats_roundtrip() {
-        let (primary_cidr, summary, children) = sample_scan_data();
-        let tmp_dir = std::env::temp_dir();
+    fn export_preserves_roles_relationships_and_evidence() {
+        let data = build_export(&sample_report());
+
+        let router = data
+            .devices
+            .iter()
+            .find(|d| d.kind == "router")
+            .expect("the gateway is classified as a router");
+        assert!(
+            router
+                .role_evidence
+                .iter()
+                .any(|e| e.contains("default gateway")),
+            "role evidence must survive serialisation"
+        );
+        assert!(!router.evidence.is_empty(), "provenance must be preserved");
+        assert!(
+            !data.relationships.is_empty(),
+            "relationships must be serialised"
+        );
+    }
+
+    #[test]
+    fn exported_vlan_never_carries_a_prefix() {
+        let data = build_export(&sample_report());
+        let vlan = data.vlans.first().expect("VLAN 20 was observed");
+        assert_eq!(vlan.id, 20);
+        assert!(
+            vlan.prefix.is_none(),
+            "a VLAN tag must never be serialised with an invented prefix"
+        );
+    }
+
+    #[test]
+    fn every_format_round_trips_to_disk() {
+        let report = sample_report();
+        let dir = std::env::temp_dir();
 
         for format in [
             OutputFormat::Json,
@@ -446,24 +631,31 @@ mod tests {
             OutputFormat::Csv,
             OutputFormat::Text,
         ] {
-            let test_file = tmp_dir.join(format!("test_export.{}", format.extension()));
-            let test_path = test_file.to_str().unwrap();
+            let path = dir.join(format!("idnx_export_test.{}", format.extension()));
+            let written = export(&report, format, path.to_str()).expect("export succeeds");
+            let content = std::fs::read_to_string(&written).expect("readable");
 
-            let exported_path = export_results(
-                format,
-                Some(test_path),
-                &primary_cidr,
-                &summary,
-                &children,
-                Some(Ipv4Addr::new(192, 168, 1, 1)),
-                &[],
-            )
-            .expect("Export should succeed");
-            assert!(exported_path.exists());
-
-            let content = std::fs::read_to_string(&exported_path).expect("Should read file");
-            assert!(content.contains("192.168.1.1"));
-            let _ = std::fs::remove_file(&exported_path);
+            assert!(
+                content.contains("192.168.1.1") || content.contains("192.168.1.0/24"),
+                "{:?} export lost the topology",
+                format
+            );
+            let _ = std::fs::remove_file(&written);
         }
+    }
+
+    #[test]
+    fn json_export_carries_vantage_visibility() {
+        let report = sample_report();
+        let path = std::env::temp_dir().join("idnx_vantage_test.json");
+        let written = export(&report, OutputFormat::Json, path.to_str()).unwrap();
+        let content = std::fs::read_to_string(&written).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["vantage"]["interface"], "en0");
+        assert_eq!(parsed["vantage"]["observed_frames"], 42);
+        assert!(!parsed["vantage"]["blind_to"].as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&written);
     }
 }

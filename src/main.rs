@@ -195,17 +195,26 @@ async fn run() {
     output::topology_view::render(&report, &start);
 
     if let Some(format) = cli.output {
-        eprintln!(
-            "\n{} Export to {:?} is being ported onto the topology graph and is unavailable in this build.",
-            "[!]".yellow().bold(),
-            format
-        );
+        match output::export::export(&report, format, cli.output_file.as_deref()) {
+            Ok(path) => println!(
+                "\n{} Exported to {}",
+                "[+]".green().bold(),
+                path.display().to_string().cyan().bold()
+            ),
+            Err(e) => eprintln!("\n{} Export failed: {}", "[!]".red().bold(), e),
+        }
     }
-    if cli.export_graph.is_some() {
-        eprintln!(
-            "{} Interactive graph export is being ported onto the topology graph and is unavailable in this build.",
-            "[!]".yellow().bold(),
-        );
+
+    if let Some(ref graph_path) = cli.export_graph {
+        let path = std::path::Path::new(graph_path);
+        match output::graph::export_interactive_topology_html(&report, path) {
+            Ok(()) => println!(
+                "{} Interactive topology written to {}",
+                "[+]".green().bold(),
+                graph_path.cyan().bold()
+            ),
+            Err(e) => eprintln!("{} Graph export failed: {}", "[!]".red().bold(), e),
+        }
     }
 }
 

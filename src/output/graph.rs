@@ -1,566 +1,529 @@
-//! Standalone, zero-dependency interactive HTML topology graph generator.
+//! Standalone interactive HTML rendering of the topology graph.
 //!
-//! Generates a self-contained HTML/SVG visualization of the network topology
-//! with force-directed physics, interactive zooming/panning, and detailed
-//! device metadata inspection panels without requiring internet access or CDN assets.
+//! Self-contained: no CDN, no build step, no network access when opened. The page shows
+//! the same graded topology as the terminal view — every node carries its kind, confidence
+//! and the evidence behind it, and every edge names the relationship that created it.
 
-use crate::engine::deep::ChildNetworkResult;
-use crate::engine::scanner::{HostResult, ScanSummary};
-use crate::fingerprint::classifier::{DeviceRole, classify_host};
-use ipnet::Ipv4Net;
-use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-#[derive(Debug, Serialize)]
+use serde::Serialize;
+
+use crate::engine::orchestrator::{DiscoveryReport, is_virtual_network};
+use crate::topology::graph::{NodeId, NodeKind};
+use crate::topology::{Confidence, TopologyGraph};
+
+#[derive(Serialize)]
 struct GraphNode {
     id: String,
     label: String,
-    role: String,
-    category: String,
-    ip: Option<String>,
-    ipv6: Vec<String>,
-    mac: Option<String>,
-    vendor: Option<String>,
-    hostname: Option<String>,
-    ports: Vec<String>,
-    details: Option<String>,
+    kind: String,
+    confidence: String,
+    detail: Vec<String>,
+    evidence: Vec<String>,
     color: String,
     radius: f32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct GraphLink {
     source: String,
     target: String,
-    label: Option<String>,
+    label: String,
+    confidence: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct GraphData {
     nodes: Vec<GraphNode>,
     links: Vec<GraphLink>,
+    vantage: String,
+    blind_to: Vec<String>,
+    unavailable: Vec<String>,
 }
 
-/// Generates a standalone interactive HTML graph file
+/// Colour by node kind. Opaque boundaries are deliberately the most prominent: a router
+/// that terminates visibility is the most operationally important thing on the map.
+fn colour_for(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Router => "#38bdf8",
+        NodeKind::Switch => "#a78bfa",
+        NodeKind::Network => "#22c55e",
+        NodeKind::Vlan => "#eab308",
+        NodeKind::OpaqueBoundary => "#f97316",
+        NodeKind::Interface => "#64748b",
+        NodeKind::Service => "#94a3b8",
+        NodeKind::Host => "#e2e8f0",
+    }
+}
+
+fn radius_for(kind: NodeKind) -> f32 {
+    match kind {
+        NodeKind::Router | NodeKind::OpaqueBoundary => 24.0,
+        NodeKind::Switch | NodeKind::Network => 20.0,
+        NodeKind::Vlan => 16.0,
+        _ => 12.0,
+    }
+}
+
+fn node_key(id: &NodeId) -> String {
+    match id {
+        NodeId::Interface(n) => format!("iface:{n}"),
+        NodeId::Network(n) => format!("net:{n}"),
+        NodeId::Vlan(v) => format!("vlan:{v}"),
+        NodeId::Device(d) => format!("dev:{d}"),
+        NodeId::Service(a, p) => format!("svc:{a}:{p}"),
+    }
+}
+
+fn build_data(report: &DiscoveryReport) -> GraphData {
+    let graph: &TopologyGraph = &report.graph;
+    let mut nodes = Vec::new();
+
+    for node in graph.nodes() {
+        // Services are attributes of a host rather than topology; they would triple the
+        // node count without adding a relationship anyone navigates.
+        if node.kind == NodeKind::Service {
+            continue;
+        }
+
+        let mut detail: Vec<String> = Vec::new();
+        if let Some(vendor) = &node.vendor {
+            detail.push(format!("vendor: {vendor}"));
+        }
+        for addr in &node.addresses {
+            detail.push(addr.to_string());
+        }
+        for signal in &node.role_signals {
+            detail.push(format!("role: {signal}"));
+        }
+        for text in &node.descriptions {
+            detail.push(text.clone());
+        }
+        if let Some(reason) = &node.opaque_reason {
+            detail.push(format!("boundary: {reason}"));
+        }
+        if let NodeId::Network(net) = &node.id {
+            let ifaces = graph.interfaces_for_network(net);
+            if is_virtual_network(&ifaces) {
+                detail.push("virtual / VPN network".to_string());
+            }
+            if report.oversized_scopes.contains(net) {
+                detail.push("too large to enumerate address by address".to_string());
+            }
+        }
+
+        let mut evidence: Vec<String> = node
+            .provenance
+            .iter()
+            .map(|p| format!("{} ({})", p.source.label(), p.confidence.label()))
+            .collect();
+        evidence.sort();
+        evidence.dedup();
+
+        nodes.push(GraphNode {
+            id: node_key(&node.id),
+            label: node.display_name(),
+            kind: node.kind.label().to_string(),
+            confidence: node.confidence.label().to_string(),
+            detail,
+            evidence,
+            color: colour_for(node.kind).to_string(),
+            radius: radius_for(node.kind),
+        });
+    }
+
+    let known: std::collections::HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let links: Vec<GraphLink> = graph
+        .edges()
+        .filter_map(|edge| {
+            let source = node_key(&edge.from);
+            let target = node_key(&edge.to);
+            // Skip edges to nodes that were not rendered, which would otherwise leave the
+            // force layout referencing ids that do not exist.
+            if !known.contains(&source) || !known.contains(&target) {
+                return None;
+            }
+            Some(GraphLink {
+                source,
+                target,
+                label: edge.relationship.label().to_string(),
+                confidence: edge.confidence.label().to_string(),
+            })
+        })
+        .collect();
+
+    GraphData {
+        nodes,
+        links,
+        vantage: format!(
+            "{} ({})",
+            report.visibility.vantage.interface,
+            report.visibility.vantage.kind.label()
+        ),
+        blind_to: report.visibility.blind_to.clone(),
+        unavailable: report.visibility.unavailable.clone(),
+    }
+}
+
+/// Writes a standalone interactive topology page.
 pub fn export_interactive_topology_html(
-    target_cidr: &Ipv4Net,
-    summary: &ScanSummary,
-    child_networks: &[ChildNetworkResult],
-    physical_switches: &[&str],
+    report: &DiscoveryReport,
     output_path: &Path,
 ) -> Result<(), String> {
-    let mut nodes = Vec::new();
-    let mut links = Vec::new();
+    let data = build_data(report);
+    let json =
+        serde_json::to_string(&data).map_err(|e| format!("Graph serialisation failed: {e}"))?;
 
-    // 1. Root Local Subnet Node
-    let root_id = format!("net_{}", target_cidr);
-    nodes.push(GraphNode {
-        id: root_id.clone(),
-        label: format!("Local Subnet\n{}", target_cidr),
-        role: "Subnet".to_string(),
-        category: "Network".to_string(),
-        ip: None,
-        ipv6: Vec::new(),
-        mac: None,
-        vendor: None,
-        hostname: None,
-        ports: Vec::new(),
-        details: Some(format!("Primary active network: {}", target_cidr)),
-        color: "#00f0ff".to_string(),
-        radius: 28.0,
-    });
-
-    // 2. Add Physical Unmanaged Switches if documented
-    let mut switch_parent_id = root_id.clone();
-    for (idx, sw_name) in physical_switches.iter().enumerate() {
-        let sw_id = format!("sw_{}", idx);
-        nodes.push(GraphNode {
-            id: sw_id.clone(),
-            label: sw_name.to_string(),
-            role: "Switch".to_string(),
-            category: "Switch".to_string(),
-            ip: None,
-            ipv6: Vec::new(),
-            mac: None,
-            vendor: None,
-            hostname: None,
-            ports: Vec::new(),
-            details: Some("Physical Layer 2 Switch".to_string()),
-            color: "#f59e0b".to_string(),
-            radius: 22.0,
-        });
-
-        links.push(GraphLink {
-            source: switch_parent_id.clone(),
-            target: sw_id.clone(),
-            label: Some("Ethernet Trunk".to_string()),
-        });
-        switch_parent_id = sw_id;
-    }
-
-    let default_gw = crate::net::interface::detect_local_network()
-        .ok()
-        .and_then(|i| i.default_gateway);
-
-    // 3. Add Local Network Hosts
-    for host in &summary.active_hosts {
-        let is_gw = default_gw.map(|gw| gw == host.ip).unwrap_or(false);
-        let host_node = build_host_node(host, is_gw);
-        let host_id = host_node.id.clone();
-        nodes.push(host_node);
-
-        links.push(GraphLink {
-            source: switch_parent_id.clone(),
-            target: host_id,
-            label: None,
-        });
-    }
-
-    // 4. Add Child & Downstream Networks
-    for (c_idx, child) in child_networks.iter().enumerate() {
-        let child_net_id = format!("child_net_{}_{}", c_idx, child.cidr);
-        let child_label = if let Some(ref name) = child.snmp_system_name {
-            format!("{}\n{}", name, child.cidr)
-        } else {
-            format!("Subnet\n{}", child.cidr)
-        };
-
-        nodes.push(GraphNode {
-            id: child_net_id.clone(),
-            label: child_label,
-            role: "Cascaded Subnet".to_string(),
-            category: "Network".to_string(),
-            ip: child.parent_router_ip.map(|ip| ip.to_string()),
-            ipv6: Vec::new(),
-            mac: None,
-            vendor: None,
-            hostname: child.snmp_system_name.clone(),
-            ports: Vec::new(),
-            details: Some(match child.snmp_system_descr {
-                Some(ref descr) => format!(
-                    "{}\nEvidence: {} ({})",
-                    descr,
-                    child.source.display_name(),
-                    child.confidence.display_name()
-                ),
-                None => format!(
-                    "Evidence: {} ({})",
-                    child.source.display_name(),
-                    child.confidence.display_name()
-                ),
-            }),
-            color: "#ec4899".to_string(),
-            radius: 26.0,
-        });
-
-        // Link child network to local subnet, labelled with the evidence that produced
-        // it rather than a generic "Routed Gateway" that implies more than we observed.
-        links.push(GraphLink {
-            source: root_id.clone(),
-            target: child_net_id.clone(),
-            label: Some(format!(
-                "{} ({})",
-                child.source.display_name(),
-                child.confidence.display_name()
-            )),
-        });
-
-        // Add child network hosts
-        for host in &child.summary.active_hosts {
-            let is_gw = child.gateway == Some(host.ip);
-            let host_node = build_host_node(host, is_gw);
-            let host_id = host_node.id.clone();
-            nodes.push(host_node);
-
-            links.push(GraphLink {
-                source: child_net_id.clone(),
-                target: host_id,
-                label: None,
-            });
+    let summary = {
+        let g = &report.graph;
+        let mut observed = 0;
+        let mut advertised = 0;
+        let mut inferred = 0;
+        for node in g.nodes() {
+            match node.confidence {
+                Confidence::Observed => observed += 1,
+                Confidence::Advertised => advertised += 1,
+                Confidence::Inferred => inferred += 1,
+                Confidence::UserSupplied => {}
+            }
         }
-    }
+        format!("{observed} observed &middot; {advertised} advertised &middot; {inferred} inferred")
+    };
 
-    // Embed JSON data and assemble HTML page
-    let graph_data = GraphData { nodes, links };
-    let json_data = serde_json::to_string(&graph_data)
-        .map_err(|e| format!("Failed to serialize graph data: {}", e))?;
+    let html = PAGE_TEMPLATE
+        .replace("{{DATA}}", &json)
+        .replace("{{SUMMARY}}", &summary)
+        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
 
-    let html_content = generate_html_document(target_cidr, &json_data);
-
-    let mut file = File::create(output_path)
-        .map_err(|e| format!("Failed to create graph file {:?}: {}", output_path, e))?;
-    file.write_all(html_content.as_bytes())
-        .map_err(|e| format!("Failed to write graph file: {}", e))?;
+    let mut file =
+        File::create(output_path).map_err(|e| format!("Cannot create {output_path:?}: {e}"))?;
+    file.write_all(html.as_bytes())
+        .map_err(|e| format!("Cannot write {output_path:?}: {e}"))?;
 
     Ok(())
 }
 
-fn build_host_node(host: &HostResult, is_gateway: bool) -> GraphNode {
-    let role = classify_host(host, is_gateway);
-
-    let (color, category, radius) = match role {
-        DeviceRole::GatewayRouter => ("#3b82f6", "Gateway Router", 24.0),
-        DeviceRole::Switch => ("#f59e0b", "Switch", 22.0),
-        DeviceRole::AiAgentRuntime => ("#8b5cf6", "AI Agent / LLM Runtime", 22.0),
-        DeviceRole::Workstation => ("#10b981", "Workstation / PC", 18.0),
-        DeviceRole::SmartDevice => ("#06b6d4", "Smart IoT Device", 16.0),
-        DeviceRole::GenericHost => {
-            if host.open_ports.is_empty() {
-                ("#64748b", "Stealth / Firewalled", 15.0)
-            } else {
-                ("#94a3b8", "Endpoint", 16.0)
-            }
-        }
-    };
-
-    let label = if let Some(ref h) = host.hostname {
-        format!("{}\n{}", h, host.ip)
-    } else if let Some(ref v) = host.vendor {
-        format!("{}\n{}", v, host.ip)
-    } else {
-        host.ip.to_string()
-    };
-
-    let ports_list: Vec<String> = host
-        .open_ports
-        .iter()
-        .map(|p| format!("{}/{} ({:?})", p.port, p.service, p.status))
-        .collect();
-
-    let details = host
-        .ai_runtime
-        .as_ref()
-        .map(|ai| format!("AI Runtime: {}", ai.summary_label()));
-
-    GraphNode {
-        id: format!("host_{}", host.ip),
-        label,
-        role: format!("{:?}", role),
-        category: category.to_string(),
-        ip: Some(host.ip.to_string()),
-        ipv6: host.ipv6_addrs.iter().map(|ip| ip.to_string()).collect(),
-        mac: host.mac_address.clone(),
-        vendor: host.vendor.clone(),
-        hostname: host.hostname.clone(),
-        ports: ports_list,
-        details,
-        color: color.to_string(),
-        radius,
-    }
-}
-
-fn generate_html_document(target_cidr: &Ipv4Net, json_data: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
+/// The page. A small hand-written force simulation keeps this dependency-free, which
+/// matters because the output must open from a file with no network access.
+const PAGE_TEMPLATE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>idNX Topology Graph - {target_cidr}</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>idNX topology</title>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: #0b0f19;
-    color: #f1f5f9;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    overflow: hidden;
-    height: 100vh;
-    display: flex;
-  }}
-  #graph-container {{
-    flex: 1;
-    height: 100vh;
-    position: relative;
-  }}
-  canvas {{
-    width: 100%;
-    height: 100%;
-    display: block;
-  }}
-  #sidebar {{
-    width: 380px;
-    height: 100vh;
-    background: rgba(15, 23, 42, 0.95);
-    backdrop-filter: blur(12px);
-    border-left: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    overflow-y: auto;
-    box-shadow: -8px 0 24px rgba(0,0,0,0.5);
-  }}
-  .badge {{
-    display: inline-block;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: bold;
-    text-transform: uppercase;
-  }}
-  .card {{
-    background: rgba(30, 41, 59, 0.7);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 8px;
-    padding: 16px;
-  }}
-  .meta-row {{
-    display: flex;
-    justify-content: space-between;
-    margin-bottom: 8px;
-    font-size: 13px;
-  }}
-  .meta-label {{ color: #94a3b8; }}
-  .meta-val {{ font-weight: 500; color: #f8fafc; word-break: break-all; }}
-  .port-tag {{
-    display: inline-block;
-    background: rgba(14, 165, 233, 0.2);
-    border: 1px solid rgba(14, 165, 233, 0.4);
-    color: #38bdf8;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 11px;
-    margin: 2px;
-  }}
-  .header-brand {{
-    font-size: 20px;
-    font-weight: 800;
-    color: #00f0ff;
-    letter-spacing: -0.5px;
-  }}
-  .legend {{
-    position: absolute;
-    bottom: 24px;
-    left: 24px;
-    background: rgba(15, 23, 42, 0.85);
-    border: 1px solid rgba(255,255,255,0.1);
-    padding: 12px 16px;
-    border-radius: 8px;
-    display: flex;
-    gap: 16px;
-    font-size: 12px;
-    pointer-events: none;
-  }}
-  .legend-item {{ display: flex; align-items: center; gap: 6px; }}
-  .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; }}
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background:#0f172a; color:#e2e8f0; }
+  header { padding:14px 20px; border-bottom:1px solid #1e293b; display:flex; gap:18px;
+           align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; font-weight:600; }
+  .meta { color:#94a3b8; font-size:12px; }
+  main { display:flex; height:calc(100vh - 58px); }
+  canvas { flex:1; display:block; cursor:grab; }
+  aside { width:330px; border-left:1px solid #1e293b; padding:16px; overflow-y:auto; }
+  aside h2 { font-size:13px; margin:0 0 8px; text-transform:uppercase; letter-spacing:.06em;
+             color:#94a3b8; }
+  .legend span { display:inline-flex; align-items:center; gap:6px; margin:0 10px 6px 0;
+                 font-size:12px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  .row { margin:2px 0; font-size:12px; color:#cbd5e1; word-break:break-word; }
+  .warn { color:#fbbf24; font-size:12px; margin:3px 0; }
+  .empty { color:#64748b; font-style:italic; }
+  code { background:#1e293b; padding:1px 5px; border-radius:4px; font-size:11px; }
 </style>
 </head>
 <body>
-
-<div id="graph-container">
-  <canvas id="canvas"></canvas>
-  <div class="legend">
-    <div class="legend-item"><span class="legend-dot" style="background:#00f0ff"></span> Subnet</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#3b82f6"></span> Gateway</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span> Switch</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#8b5cf6"></span> Server</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#10b981"></span> Workstation</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#06b6d4"></span> IoT</div>
-  </div>
-</div>
-
-<div id="sidebar">
-  <div class="header-brand">⚡ idNX Network Map</div>
-  <p style="font-size:12px; color:#94a3b8">Target Subnet: <strong style="color:#f8fafc">{target_cidr}</strong></p>
-
-  <div id="details-view">
-    <div class="card" style="text-align:center; color:#94a3b8; padding:32px 16px">
-      Click on any node in the topology graph to inspect full hardware and port details.
-    </div>
-  </div>
-</div>
-
+<header>
+  <h1>idNX topology</h1>
+  <span class="meta">v{{VERSION}}</span>
+  <span class="meta">{{SUMMARY}}</span>
+</header>
+<main>
+  <canvas id="c"></canvas>
+  <aside>
+    <h2>Vantage</h2>
+    <div class="row" id="vantage"></div>
+    <div id="limits"></div>
+    <h2 style="margin-top:18px">Legend</h2>
+    <div class="legend" id="legend"></div>
+    <h2 style="margin-top:18px">Selection</h2>
+    <div id="sel"><div class="empty">Click a node.</div></div>
+  </aside>
+</main>
 <script>
-const data = {json_data};
-const canvas = document.getElementById('canvas');
+const DATA = {{DATA}};
+const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 
-let width, height;
-function resize() {{
-  width = canvas.width = canvas.parentElement.clientWidth;
-  height = canvas.height = canvas.parentElement.clientHeight;
-}}
-window.addEventListener('resize', resize);
+document.getElementById('vantage').textContent = DATA.vantage;
+const limits = document.getElementById('limits');
+for (const b of DATA.blind_to) {
+  const d = document.createElement('div');
+  d.className = 'warn'; d.textContent = 'Not visible: ' + b; limits.appendChild(d);
+}
+for (const u of DATA.unavailable) {
+  const d = document.createElement('div');
+  d.className = 'warn'; d.textContent = u; limits.appendChild(d);
+}
+
+const kinds = {};
+for (const n of DATA.nodes) kinds[n.kind] = n.color;
+const legend = document.getElementById('legend');
+for (const [kind, color] of Object.entries(kinds)) {
+  const s = document.createElement('span');
+  s.innerHTML = '<i class="dot" style="background:' + color + '"></i>' + kind;
+  legend.appendChild(s);
+}
+
+let W = 0, H = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', () => { resize(); });
+
+// Seed positions deterministically so the same topology lays out the same way twice.
+let seed = 42;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+
+const nodes = DATA.nodes.map(n => ({...n, x: 0, y: 0, vx: 0, vy: 0}));
+const index = new Map(nodes.map((n, i) => [n.id, i]));
+const links = DATA.links
+  .map(l => ({...l, s: index.get(l.source), t: index.get(l.target)}))
+  .filter(l => l.s !== undefined && l.t !== undefined);
+
 resize();
+for (const n of nodes) { n.x = W / 2 + (rnd() - 0.5) * W * 0.7; n.y = H / 2 + (rnd() - 0.5) * H * 0.7; }
 
-// Graph nodes setup
-const nodes = data.nodes.map(n => ({{
-  ...n,
-  x: width / 2 + (Math.random() - 0.5) * 300,
-  y: height / 2 + (Math.random() - 0.5) * 300,
-  vx: 0,
-  vy: 0
-}}));
+let view = {x: 0, y: 0, k: 1};
+let selected = null, dragging = null, panning = false, last = null;
 
-const nodeMap = new Map();
-nodes.forEach(n => nodeMap.set(n.id, n));
+function step() {
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let d2 = dx*dx + dy*dy || 0.01;
+      if (d2 > 90000) continue;
+      const f = 2400 / d2;
+      const d = Math.sqrt(d2);
+      const ux = dx/d, uy = dy/d;
+      a.vx -= ux*f; a.vy -= uy*f; b.vx += ux*f; b.vy += uy*f;
+    }
+  }
+  for (const l of links) {
+    const a = nodes[l.s], b = nodes[l.t];
+    const dx = b.x-a.x, dy = b.y-a.y;
+    const d = Math.sqrt(dx*dx+dy*dy) || 0.01;
+    const f = (d - 130) * 0.012;
+    const ux = dx/d, uy = dy/d;
+    a.vx += ux*f; a.vy += uy*f; b.vx -= ux*f; b.vy -= uy*f;
+  }
+  for (const n of nodes) {
+    n.vx += (W/2 - n.x) * 0.0012;
+    n.vy += (H/2 - n.y) * 0.0012;
+    n.vx *= 0.86; n.vy *= 0.86;
+    if (n !== dragging) { n.x += n.vx; n.y += n.vy; }
+  }
+}
 
-const links = data.links.map(l => ({{
-  ...l,
-  source: nodeMap.get(l.source),
-  target: nodeMap.get(l.target)
-}})).filter(l => l.source && l.target);
+function draw() {
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
 
-// Force-directed simulation
-function stepSimulation() {{
-  // Center gravity
-  nodes.forEach(n => {{
-    n.vx += (width / 2 - n.x) * 0.0005;
-    n.vy += (height / 2 - n.y) * 0.0005;
-  }});
+  ctx.lineWidth = 1;
+  for (const l of links) {
+    const a = nodes[l.s], b = nodes[l.t];
+    ctx.strokeStyle = l.confidence === 'observed' ? '#334155' : '#1e293b';
+    ctx.setLineDash(l.confidence === 'advertised' || l.confidence === 'inferred' ? [4, 4] : []);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  ctx.setLineDash([]);
 
-  // Node repulsion
-  for (let i = 0; i < nodes.length; i++) {{
-    for (let j = i + 1; j < nodes.length; j++) {{
-      const a = nodes[i];
-      const b = nodes[j];
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-      const minDist = a.radius + b.radius + 60;
-      if (dist < minDist) {{
-        const force = (minDist - dist) / dist * 0.05;
-        a.vx -= dx * force;
-        a.vy -= dy * force;
-        b.vx += dx * force;
-        b.vy += dy * force;
-      }}
-    }}
-  }}
-
-  // Link attraction
-  links.forEach(l => {{
-    const dx = l.target.x - l.source.x;
-    const dy = l.target.y - l.source.y;
-    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-    const targetDist = 90;
-    const force = (dist - targetDist) * 0.003;
-    l.source.vx += dx * force;
-    l.source.vy += dy * force;
-    l.target.vx -= dx * force;
-    l.target.vy -= dy * force;
-  }});
-
-  // Position update & friction
-  nodes.forEach(n => {{
-    n.vx *= 0.85;
-    n.vy *= 0.85;
-    n.x += n.vx;
-    n.y += n.vy;
-  }});
-}}
-
-// Rendering loop
-let selectedNode = null;
-function render() {{
-  stepSimulation();
-  ctx.clearRect(0, 0, width, height);
-
-  // Draw links
-  links.forEach(l => {{
-    ctx.beginPath();
-    ctx.moveTo(l.source.x, l.source.y);
-    ctx.lineTo(l.target.x, l.target.y);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    if (l.label) {{
-      const midX = (l.source.x + l.target.x) / 2;
-      const midY = (l.source.y + l.target.y) / 2;
-      ctx.fillStyle = '#64748b';
-      ctx.font = '10px sans-serif';
-      ctx.fillText(l.label, midX + 4, midY - 4);
-    }}
-  }});
-
-  // Draw nodes
-  nodes.forEach(n => {{
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-    ctx.fillStyle = n.color;
-    ctx.shadowColor = n.color;
-    ctx.shadowBlur = selectedNode === n ? 20 : 8;
-    ctx.fill();
-
-    if (selectedNode === n) {{
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = '#ffffff';
-      ctx.stroke();
-    }}
-    ctx.restore();
-
-    // Node label
-    ctx.fillStyle = '#f8fafc';
-    ctx.font = '11px sans-serif';
+  for (const n of nodes) {
+    ctx.beginPath(); ctx.arc(n.x, n.y, n.radius, 0, Math.PI*2);
+    ctx.fillStyle = n.color; ctx.fill();
+    if (n === selected) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5; ctx.stroke(); }
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '11px -apple-system, sans-serif';
     ctx.textAlign = 'center';
-    const lines = n.label.split('\n');
-    lines.forEach((line, idx) => {{
-      ctx.fillText(line, n.x, n.y + n.radius + 14 + (idx * 12));
-    }});
-  }});
+    ctx.fillText(n.label, n.x, n.y + n.radius + 13);
+  }
+  ctx.restore();
+}
 
-  requestAnimationFrame(render);
-}}
-render();
+function loop() { step(); draw(); requestAnimationFrame(loop); }
+loop();
 
-// Interaction: click selection
-canvas.addEventListener('click', e => {{
-  const rect = canvas.getBoundingClientRect();
-  const mouseX = e.clientX - rect.left;
-  const mouseY = e.clientY - rect.top;
+function at(ev) {
+  const r = canvas.getBoundingClientRect();
+  const x = (ev.clientX - r.left - view.x) / view.k;
+  const y = (ev.clientY - r.top - view.y) / view.k;
+  return nodes.find(n => (n.x-x)**2 + (n.y-y)**2 <= (n.radius+5)**2) || null;
+}
 
-  let clicked = null;
-  for (let n of nodes) {{
-    const dx = mouseX - n.x;
-    const dy = mouseY - n.y;
-    if (Math.sqrt(dx * dx + dy * dy) <= n.radius + 5) {{
-      clicked = n;
-      break;
-    }}
-  }}
+canvas.addEventListener('mousedown', ev => {
+  const n = at(ev);
+  if (n) { dragging = n; selected = n; show(n); }
+  else { panning = true; }
+  last = {x: ev.clientX, y: ev.clientY};
+});
+window.addEventListener('mousemove', ev => {
+  if (dragging) {
+    const r = canvas.getBoundingClientRect();
+    dragging.x = (ev.clientX - r.left - view.x) / view.k;
+    dragging.y = (ev.clientY - r.top - view.y) / view.k;
+  } else if (panning && last) {
+    view.x += ev.clientX - last.x; view.y += ev.clientY - last.y;
+    last = {x: ev.clientX, y: ev.clientY};
+  }
+});
+window.addEventListener('mouseup', () => { dragging = null; panning = false; last = null; });
+canvas.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const f = ev.deltaY < 0 ? 1.1 : 0.9;
+  view.k = Math.max(0.15, Math.min(4, view.k * f));
+}, {passive: false});
 
-  selectedNode = clicked;
-  updateSidebar(clicked);
-}});
-
-function updateSidebar(node) {{
-  const container = document.getElementById('details-view');
-  if (!node) {{
-    container.innerHTML = `<div class="card" style="text-align:center; color:#94a3b8; padding:32px 16px">Click on any node in the topology graph to inspect full hardware and port details.</div>`;
-    return;
-  }}
-
-  let portsHtml = node.ports.length > 0 
-    ? node.ports.map(p => `<span class="port-tag">${{p}}</span>`).join('') 
-    : '<span style="color:#64748b; font-size:12px">None detected / Stealth mode</span>';
-
-  container.innerHTML = `
-    <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px">
-        <h3 style="font-size:16px; font-weight:700">${{node.hostname || node.ip || node.label.replace('\n', ' ')}}</h3>
-        <span class="badge" style="background:${{node.color}}22; color:${{node.color}}; border:1px solid ${{node.color}}">${{node.category}}</span>
-      </div>
-
-      ${{node.ip ? `<div class="meta-row"><span class="meta-label">IP Address:</span><span class="meta-val">${{node.ip}}</span></div>` : ''}}
-      ${{node.ipv6 && node.ipv6.length > 0 ? `<div class="meta-row"><span class="meta-label">IPv6 Address:</span><span class="meta-val">${{node.ipv6.join('<br>')}}</span></div>` : ''}}
-      ${{node.mac ? `<div class="meta-row"><span class="meta-label">MAC Address:</span><span class="meta-val">${{node.mac}}</span></div>` : ''}}
-      ${{node.vendor ? `<div class="meta-row"><span class="meta-label">OUI Vendor:</span><span class="meta-val">${{node.vendor}}</span></div>` : ''}}
-      ${{node.hostname ? `<div class="meta-row"><span class="meta-label">Hostname:</span><span class="meta-val">${{node.hostname}}</span></div>` : ''}}
-      ${{node.details ? `<div class="meta-row"><span class="meta-label">System Info:</span><span class="meta-val">${{node.details}}</span></div>` : ''}}
-
-      <div style="margin-top:12px; border-top:1px solid rgba(255,255,255,0.08); padding-top:12px">
-        <span class="meta-label" style="display:block; margin-bottom:6px">Open Ports & Services:</span>
-        <div style="display:flex; flex-wrap:wrap">${{portsHtml}}</div>
-      </div>
-    </div>
-  `;
-}}
+function show(n) {
+  const el = document.getElementById('sel');
+  let h = '<div class="row"><strong>' + n.label + '</strong></div>';
+  h += '<div class="row">kind: <code>' + n.kind + '</code> &middot; confidence: <code>' + n.confidence + '</code></div>';
+  for (const d of n.detail) h += '<div class="row">' + d + '</div>';
+  if (n.evidence.length) {
+    h += '<h2 style="margin-top:14px">Evidence</h2>';
+    for (const e of n.evidence) h += '<div class="row">' + e + '</div>';
+  }
+  el.innerHTML = h;
+}
 </script>
 </body>
-</html>"#
-    )
+</html>
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::orchestrator::{ScopeRun, VisibilityReport};
+    use crate::providers::{Vantage, VantageKind};
+    use crate::topology::TopologyEvidence;
+    use crate::topology::evidence::{DeviceKey, EvidenceSource, Fact, RoleSignal};
+
+    fn report() -> DiscoveryReport {
+        let mut graph = TopologyGraph::new();
+        let mac = DeviceKey::mac("aa:bb:cc:dd:ee:ff");
+        for ev in [
+            TopologyEvidence::new(
+                Fact::Network {
+                    prefix: "10.0.0.0/24".parse().unwrap(),
+                },
+                EvidenceSource::KernelRoute,
+                Confidence::Observed,
+                "eth0",
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: mac.clone(),
+                    address: "10.0.0.1".parse().unwrap(),
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                "eth0",
+            ),
+            TopologyEvidence::new(
+                Fact::GatewayFor {
+                    device: mac.clone(),
+                    network: "10.0.0.0/24".parse().unwrap(),
+                },
+                EvidenceSource::KernelRoute,
+                Confidence::Observed,
+                "eth0",
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceRoleSignal {
+                    device: mac,
+                    signal: RoleSignal::DefaultGateway,
+                },
+                EvidenceSource::DefaultGateway,
+                Confidence::Observed,
+                "eth0",
+            ),
+        ] {
+            graph.absorb(ev);
+        }
+        graph.finalize_roles();
+
+        DiscoveryReport {
+            graph,
+            scope_runs: vec![ScopeRun {
+                scope: None,
+                runs: Vec::new(),
+            }],
+            pivot_runs: Vec::new(),
+            visibility: VisibilityReport {
+                vantage: Vantage {
+                    interface: "eth0".to_string(),
+                    kind: VantageKind::Wired,
+                    capture_available: true,
+                },
+                blind_to: vec!["switched unicast".to_string()],
+                unavailable: Vec::new(),
+                observed_frames: Some(7),
+            },
+            oversized_scopes: Vec::new(),
+            converged: true,
+        }
+    }
+
+    #[test]
+    fn graph_data_keeps_kinds_relationships_and_confidence() {
+        let data = build_data(&report());
+
+        assert!(data.nodes.iter().any(|n| n.kind == "router"));
+        assert!(data.nodes.iter().any(|n| n.kind == "network"));
+        assert!(data.links.iter().any(|l| l.label == "gateway for"));
+        assert!(data.links.iter().all(|l| !l.confidence.is_empty()));
+    }
+
+    #[test]
+    fn every_link_references_a_rendered_node() {
+        // A dangling id would break the force layout silently.
+        let data = build_data(&report());
+        let ids: std::collections::HashSet<&str> =
+            data.nodes.iter().map(|n| n.id.as_str()).collect();
+        for link in &data.links {
+            assert!(ids.contains(link.source.as_str()));
+            assert!(ids.contains(link.target.as_str()));
+        }
+    }
+
+    #[test]
+    fn page_is_self_contained_and_writes() {
+        let path = std::env::temp_dir().join("idnx_graph_test.html");
+        export_interactive_topology_html(&report(), &path).expect("writes");
+        let html = std::fs::read_to_string(&path).unwrap();
+
+        assert!(html.contains("idNX topology"));
+        assert!(html.contains("\"kind\":\"router\""));
+        // No external resource may be referenced: the page must open offline.
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+        assert!(!html.contains("{{DATA}}"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vantage_limits_reach_the_page() {
+        let data = build_data(&report());
+        assert_eq!(data.vantage, "eth0 (wired)");
+        assert!(!data.blind_to.is_empty());
+    }
 }
