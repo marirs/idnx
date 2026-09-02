@@ -34,3 +34,11 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 csv = "1.3"
 chrono = "0.4"
 macaddr-ouidb = "0.1.11"
+
+[profile.release]
+strip = true          # remove debug symbols
+lto = "fat"           # Typst links a broad feature set; fat LTO recovers ~9 MB
+codegen-units = 1     # better optimization (slower compile)
+opt-level = "z"       # optimize for size (use "3" if you'd rather keep speed)
+
+
