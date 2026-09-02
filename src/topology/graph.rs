@@ -839,7 +839,14 @@ impl TopologyGraph {
     /// identifiers: the kernel routing table yields a gateway address before the ARP cache
     /// yields its MAC. Without this pass the default gateway appears twice, once per
     /// identifier, splitting its evidence across two nodes.
-    fn merge_address_identities(&mut self) {
+    /// Folds address-keyed nodes into the MAC-keyed node that owns the same address.
+    ///
+    /// Public because the engine must run it before every interrogation pass, not only at
+    /// the end. A device typically enters the graph twice -- once by address from a kernel
+    /// route or DHCP lease, once by MAC from the neighbour cache -- and until they are
+    /// merged the queue sees two devices and interrogates the same machine twice.
+    /// Idempotent: a second call over an already-merged graph does nothing.
+    pub fn merge_address_identities(&mut self) {
         let mut merges: Vec<(NodeId, NodeId)> = Vec::new();
         for id in self.nodes.keys() {
             let NodeId::Device(key) = id else {

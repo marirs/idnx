@@ -9,8 +9,9 @@
 //! an HTTPS port would report coverage that never happened; TLS ports are identified from
 //! their certificate instead.
 
-use std::net::Ipv4Addr;
 use std::time::Duration;
+
+use crate::net::endpoint::Endpoint;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -109,19 +110,25 @@ fn extract_title(response: &str) -> Option<String> {
 
 /// Asks one plaintext HTTP port to identify itself.
 pub async fn probe_http(
-    target: Ipv4Addr,
+    target: &Endpoint,
     port: u16,
     timeout_duration: Duration,
 ) -> Option<HttpIdentity> {
-    let mut stream = timeout(timeout_duration, TcpStream::connect((target, port)))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream = timeout(
+        timeout_duration,
+        TcpStream::connect(target.socket_addr(port)),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     // HEAD would skip the body, and with it the page title that most often carries the
     // model name. `Connection: close` keeps the read from waiting on keep-alive.
+    // An IPv6 literal must be bracketed in a Host header, and the zone must not appear in
+    // it: a server parsing "fe80::1%en0" as a host name rejects the request.
+    let host = target.host_literal();
     let request = format!(
-        "GET / HTTP/1.1\r\nHost: {target}\r\nUser-Agent: idnx\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: idnx\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
     timeout(timeout_duration, stream.write_all(request.as_bytes()))
         .await

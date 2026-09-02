@@ -11,7 +11,7 @@
 //! confirmed only by a JSON-RPC `initialize` that returns a protocol version and server
 //! identity, after which its tools, resources and prompts are enumerated.
 
-use std::net::Ipv4Addr;
+use crate::net::endpoint::Endpoint;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -256,7 +256,7 @@ pub fn parse_listing(result: &serde_json::Value, collection: &str) -> Vec<String
 
 /// One HTTP request/response exchange.
 async fn http_exchange(
-    ip: Ipv4Addr,
+    ip: &Endpoint,
     port: u16,
     path: &str,
     method: &str,
@@ -264,7 +264,7 @@ async fn http_exchange(
     extra_headers: &[(String, String)],
     timeout_duration: Duration,
 ) -> Option<HttpResponse> {
-    let mut stream = timeout(timeout_duration, TcpStream::connect((ip, port)))
+    let mut stream = timeout(timeout_duration, TcpStream::connect(ip.socket_addr(port)))
         .await
         .ok()?
         .ok()?;
@@ -322,7 +322,7 @@ async fn http_exchange(
 /// id and negotiated protocol version are echoed on every subsequent request, without
 /// which a stateful server rejects them.
 pub async fn confirm_mcp(
-    ip: Ipv4Addr,
+    ip: &Endpoint,
     port: u16,
     path: &str,
     timeout_duration: Duration,
@@ -414,7 +414,7 @@ pub async fn confirm_mcp(
 
 /// Runs AI and MCP discovery against one device.
 pub async fn probe_ai_services(
-    target: Ipv4Addr,
+    target: &Endpoint,
     device: &DeviceKey,
     open_ports: &[u16],
     timeout_duration: Duration,
@@ -516,7 +516,7 @@ pub async fn probe_ai_services(
 
             out.push(TopologyEvidence::new(
                 Fact::Service {
-                    address: std::net::IpAddr::V4(target),
+                    address: target.address,
                     port,
                     protocol: "tcp",
                     detail: Some(format!("MCP {}", server.protocol_version)),

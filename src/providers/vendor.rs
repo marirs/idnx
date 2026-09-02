@@ -7,18 +7,23 @@
 //! entirely unrecognised equipment must map identically given equivalent standard evidence.
 //!
 //! Two constraints keep that true. An adapter returns [`TopologyEvidence`] and nothing else,
-//! so it cannot assign a role, reach into the graph, or influence the scheduler. And no
-//! adapter is ever required: recursion never waits on one, and a failure to answer is not
-//! evidence about what a device is.
+//! so it cannot assign a role, reach into the graph, or influence the scheduler -- and its
+//! output is filtered before absorption, so it cannot assert network structure either. It
+//! *may* emit behavioural role evidence, such as "answered a router-management protocol",
+//! which the graph then scores against everything else observed exactly as it scores any
+//! other signal; emitting a signal is not assigning a role. And no adapter is ever
+//! required: recursion never waits on one, and a failure to answer is not evidence about
+//! what a device is.
 //!
 //! Selection is by observed fingerprint. A manufacturer name may *schedule* an adapter,
 //! because asking a likely-relevant question first is cheaper, but it never establishes
 //! anything on its own.
 
 use std::future::Future;
-use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::time::Duration;
+
+use crate::net::endpoint::Endpoint;
 
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{
@@ -48,32 +53,32 @@ impl DeviceFingerprint {
             .any(|text| text.to_ascii_lowercase().contains(&needle))
     }
 
-    /// Builds a fingerprint from what this run has already observed about the device.
+    /// Folds identity out of evidence into this fingerprint.
     ///
     /// Only identity the device itself disclosed is used -- certificate subjects, service
     /// banners, hostnames, the registered manufacturer. Nothing here establishes anything;
     /// it only decides which optional questions are worth asking.
-    pub fn from_evidence(evidence: &[TopologyEvidence], open_ports: &[u16]) -> Self {
-        let mut fingerprint = Self {
-            open_ports: open_ports.to_vec(),
-            ..Default::default()
-        };
+    ///
+    /// Additive rather than constructing, because the identity a device is selected on is
+    /// mostly older than the interrogation: an OUI manufacturer is recorded when the device
+    /// is first seen in an ARP table, long before any port is probed. Building the
+    /// fingerprint from interrogation output alone silently lost every one of them.
+    pub fn absorb_evidence(&mut self, evidence: &[TopologyEvidence]) {
         for record in evidence {
             match &record.fact {
                 Fact::DeviceVendor { vendor, .. } => {
-                    fingerprint.vendor = Some(vendor.clone());
+                    self.vendor.get_or_insert_with(|| vendor.clone());
                 }
-                Fact::DeviceHostname { hostname, .. } => {
-                    fingerprint.hostnames.push(hostname.clone());
-                }
-                Fact::DeviceDescription { text, .. } => {
-                    fingerprint.descriptions.push(text.clone());
-                }
-                Fact::ResolvedAs { name, .. } => fingerprint.hostnames.push(name.clone()),
+                Fact::DeviceHostname { hostname, .. } => self.hostnames.push(hostname.clone()),
+                Fact::DeviceDescription { text, .. } => self.descriptions.push(text.clone()),
+                Fact::ResolvedAs { name, .. } => self.hostnames.push(name.clone()),
                 _ => {}
             }
         }
-        fingerprint
+        self.hostnames.sort();
+        self.hostnames.dedup();
+        self.descriptions.sort();
+        self.descriptions.dedup();
     }
 
     /// True when the registered manufacturer matches.
@@ -94,7 +99,7 @@ impl DeviceFingerprint {
 /// Context handed to an adapter.
 #[derive(Debug, Clone)]
 pub struct VendorContext {
-    pub target: Ipv4Addr,
+    pub endpoint: Endpoint,
     pub device: DeviceKey,
     pub fingerprint: DeviceFingerprint,
     pub timeout: Duration,
@@ -285,14 +290,62 @@ pub fn adapters() -> Vec<Box<dyn VendorAdapter>> {
     ]
 }
 
+/// Whether a fact is one an adapter is permitted to assert.
+///
+/// Returning [`TopologyEvidence`] stops an adapter mutating the graph, but on its own it
+/// does not stop an adapter asserting topology: a `Network`, a `GatewayFor` or an
+/// `AttachedTo` would enter the graph as structure discovered by a proprietary mechanism
+/// nothing else can corroborate, and recursion would then follow it. Those are rejected.
+///
+/// Behavioural facts are permitted, `DeviceRoleSignal` included. A device answering a
+/// router-management protocol is behaviour it exhibited, and a signal is not a role: the
+/// graph scores it against everything else observed and may still decline to make the
+/// device a router. What an adapter cannot do is assign a role directly or invent topology.
+fn adapter_may_assert(fact: &Fact) -> bool {
+    !matches!(
+        fact,
+        Fact::Network { .. }
+            | Fact::Vlan { .. }
+            | Fact::InterfaceNetwork { .. }
+            | Fact::GatewayFor { .. }
+            | Fact::RoutesTo { .. }
+            | Fact::AttachedTo { .. }
+            | Fact::BridgeLink { .. }
+            | Fact::ObservedBehind { .. }
+            | Fact::OpaqueBoundary { .. }
+    )
+}
+
+/// Names of the adapters a fingerprint selects.
+///
+/// Reported in coverage so that selection is observable: an adapter that was never chosen
+/// and one that was chosen and found nothing are different outcomes.
+pub fn selected_adapters(fingerprint: &DeviceFingerprint) -> Vec<String> {
+    adapters()
+        .iter()
+        .filter(|a| a.applies(fingerprint))
+        .map(|a| a.name().to_string())
+        .collect()
+}
+
 /// Runs every applicable adapter against a device.
+///
+/// Output is filtered rather than trusted. An adapter is a vendor mechanism, often
+/// reverse-engineered and rarely corroborated by anything else on the link; letting one
+/// assert network structure would make the topology depend on it.
 pub async fn run_adapters(context: &VendorContext) -> Vec<TopologyEvidence> {
     let mut out = Vec::new();
     for adapter in adapters() {
         if !adapter.applies(&context.fingerprint) {
             continue;
         }
-        out.extend(adapter.discover(context).await);
+        out.extend(
+            adapter
+                .discover(context)
+                .await
+                .into_iter()
+                .filter(|ev| adapter_may_assert(&ev.fact)),
+        );
     }
     out
 }
@@ -355,13 +408,17 @@ mod tests {
     async fn an_adapter_that_finds_nothing_yields_no_evidence() {
         // Silence must never become a fact about the device.
         let context = VendorContext {
-            target: "10.0.0.1".parse().unwrap(),
+            endpoint: endpoint("10.0.0.1"),
             device: DeviceKey::Address("10.0.0.1".parse().unwrap()),
             fingerprint: fingerprint(Some("ASUSTek Computer")),
             timeout: Duration::from_millis(10),
             vantage: "test0".to_string(),
         };
         assert!(run_adapters(&context).await.is_empty());
+    }
+
+    fn endpoint(addr: &str) -> Endpoint {
+        Endpoint::global(addr.parse().unwrap())
     }
 
     #[test]
@@ -398,17 +455,61 @@ mod tests {
             ),
         ];
 
-        let fingerprint = DeviceFingerprint::from_evidence(&evidence, &[8728]);
+        let mut fingerprint = DeviceFingerprint {
+            open_ports: vec![8728],
+            ..Default::default()
+        };
+        fingerprint.absorb_evidence(&evidence);
         assert_eq!(fingerprint.vendor.as_deref(), Some("MikroTik"));
         assert_eq!(fingerprint.descriptions, vec!["RouterOS 7.14".to_string()]);
         assert!(fingerprint.hostnames.is_empty());
         assert!(MikroTikAdapter.applies(&fingerprint));
     }
 
+    #[test]
+    fn prior_identity_survives_absorbing_new_evidence() {
+        // The manufacturer comes from the ARP table, recorded long before interrogation.
+        // Rebuilding the fingerprint from interrogation output alone lost it, and with it
+        // every OUI-based adapter selection.
+        let mut fingerprint = DeviceFingerprint {
+            vendor: Some("ASUSTek Computer Inc.".to_string()),
+            ..Default::default()
+        };
+        assert!(AsusAdapter.applies(&fingerprint));
+
+        // Interrogation found nothing that names the device. Selection must be unchanged.
+        fingerprint.absorb_evidence(&[]);
+        assert!(AsusAdapter.applies(&fingerprint));
+    }
+
+    #[test]
+    fn an_adapter_cannot_assert_network_structure() {
+        // Filtering the output is what stops a proprietary mechanism inventing topology
+        // that nothing else on the link can corroborate.
+        let device = DeviceKey::Address("10.0.0.4".parse().unwrap());
+        assert!(!adapter_may_assert(&Fact::Network {
+            prefix: "10.9.0.0/24".parse().unwrap(),
+        }));
+        assert!(!adapter_may_assert(&Fact::GatewayFor {
+            device: device.clone(),
+            network: "10.9.0.0/24".parse().unwrap(),
+        }));
+
+        // Behaviour is permitted: a signal is scored by the graph, not obeyed by it.
+        assert!(adapter_may_assert(&Fact::DeviceRoleSignal {
+            device: device.clone(),
+            signal: RoleSignal::LinkLayerCapability("Router"),
+        }));
+        assert!(adapter_may_assert(&Fact::DeviceDescription {
+            device,
+            text: "RT-AX88U".to_string(),
+        }));
+    }
+
     #[tokio::test]
     async fn adapters_never_run_for_an_unknown_device() {
         let context = VendorContext {
-            target: "10.0.0.2".parse().unwrap(),
+            endpoint: endpoint("10.0.0.2"),
             device: DeviceKey::Address("10.0.0.2".parse().unwrap()),
             fingerprint: DeviceFingerprint::default(),
             timeout: Duration::from_millis(10),

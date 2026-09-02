@@ -8,6 +8,8 @@ use std::collections::HashSet;
 
 use ipnet::IpNet;
 
+use crate::topology::evidence::DeviceKey;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,7 +147,7 @@ impl DiscoveryEngine {
         let mut scope_runs = Vec::new();
         let mut pivot_runs: Vec<PivotRun> = Vec::new();
         let mut processed: HashSet<IpNet> = HashSet::new();
-        let mut interrogated: HashSet<std::net::IpAddr> = HashSet::new();
+        let mut interrogated: HashSet<DeviceKey> = HashSet::new();
         let mut oversized = Vec::new();
         let mut coverage: Vec<crate::providers::target::DeviceCoverage> = Vec::new();
         let mut enrichment_elapsed = Duration::ZERO;
@@ -226,7 +228,9 @@ impl DiscoveryEngine {
             // only devices with routing evidence was circular, since interrogation is how
             // that evidence is obtained. The tier decides how much work a device is worth
             // and nothing else -- role and confidence still come only from the answers.
-            let outstanding = !interrogation_queue(&graph, &interrogated).is_empty();
+            graph.merge_address_identities();
+            let outstanding =
+                !interrogation_queue(&graph, &interrogated, &context.vantage.interface).is_empty();
 
             if pending.is_empty() && !outstanding {
                 if !continuous_finished {
@@ -251,14 +255,16 @@ impl DiscoveryEngine {
                         let gained_pivot = graph
                             .pivot_addresses()
                             .into_iter()
-                            .any(|a| !pivots_before.contains(&a) && !interrogated.contains(&a));
+                            .any(|a| !pivots_before.contains(&a));
 
                         // A candidate arriving in the final drain must resume traversal
                         // just as a pivot does. Checking only pivots meant a device the
                         // capture revealed at the very end was recorded and never asked
                         // anything, which is the exact failure the two queues exist to
                         // avoid.
-                        let gained_device = !interrogation_queue(&graph, &interrogated).is_empty();
+                        let gained_device =
+                            !interrogation_queue(&graph, &interrogated, &context.vantage.interface)
+                                .is_empty();
 
                         if gained_network || gained_pivot || gained_device {
                             // The final drain extended the topology, so traversal resumes.
@@ -270,9 +276,14 @@ impl DiscoveryEngine {
                 break;
             }
 
-            let queued = interrogation_queue(&graph, &interrogated);
+            // Fold address-keyed nodes into their MAC-keyed owners before deciding who to
+            // interrogate. A device arrives twice -- by address from a route or lease, by
+            // MAC from the neighbour cache -- and an unmerged graph presents those as two
+            // devices, so the same machine was probed twice and reported twice.
+            graph.merge_address_identities();
+            let queued = interrogation_queue(&graph, &interrogated, &context.vantage.interface);
             for task in &queued {
-                interrogated.insert(task.address);
+                interrogated.insert(task.device.clone());
             }
             let networks_before_queue: HashSet<IpNet> = graph.networks().into_iter().collect();
 
@@ -305,11 +316,14 @@ impl DiscoveryEngine {
                     continue;
                 }
                 pivot_runs.push(PivotRun {
-                    address: record.address,
+                    address: record
+                        .primary_endpoint()
+                        .and_then(|e| e.split('%').next())
+                        .and_then(|e| e.parse().ok())
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
                     runs: vec![ProviderRun {
                         provider: "device-enrichment",
-                        evidence_count: record.tcp_responsive.len()
-                            + record.protocols_confirmed.len(),
+                        evidence_count: record.tcp_responsive() + record.protocols_confirmed.len(),
                         note: Some(record.summary()),
                     }],
                     networks_learned: learned.clone(),
@@ -470,9 +484,10 @@ pub fn is_virtual_interface(name: &str) -> bool {
 /// Devices still awaiting interrogation, infrastructure first.
 fn interrogation_queue(
     graph: &TopologyGraph,
-    interrogated: &HashSet<std::net::IpAddr>,
-) -> Vec<crate::engine::enrich::DeviceTask> {
-    crate::engine::enrich::queue_from_graph(graph, interrogated)
+    interrogated: &HashSet<DeviceKey>,
+    vantage: &str,
+) -> Vec<crate::providers::target::InterrogationTarget> {
+    crate::engine::enrich::queue_from_graph(graph, interrogated, vantage)
 }
 
 #[cfg(test)]

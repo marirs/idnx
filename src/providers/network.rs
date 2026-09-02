@@ -520,69 +520,14 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                     ));
                 }
 
-                let serves_dns = host.open_ports.iter().any(|p| p.port == 53);
-                let serves_admin = host
-                    .open_ports
-                    .iter()
-                    .any(|p| matches!(p.port, 80 | 443 | 8080 | 8443));
-
-                for port in &host.open_ports {
-                    // The conventional name for a port is a hint, not an identification.
-                    // Reporting 11434 as "ollama/llm" claimed a protocol nothing had
-                    // confirmed; a protocol probe is what upgrades this.
-                    out.push(TopologyEvidence::new(
-                        Fact::Service {
-                            address: IpAddr::V4(host.ip),
-                            port: port.port,
-                            protocol: "tcp",
-                            detail: Some(format!(
-                                "open; protocol unconfirmed (conventionally {})",
-                                port.service
-                            )),
-                        },
-                        EvidenceSource::TcpProbe,
-                        Confidence::Observed,
-                        vantage,
-                    ));
-                }
-
-                if serves_dns {
-                    out.push(TopologyEvidence::new(
-                        Fact::DeviceCapability {
-                            device: device.clone(),
-                            capability: Capability::DnsServer,
-                            detail: Some("answered on TCP 53".to_string()),
-                        },
-                        EvidenceSource::TcpProbe,
-                        Confidence::Observed,
-                        vantage,
-                    ));
-                }
-                if serves_admin {
-                    out.push(TopologyEvidence::new(
-                        Fact::DeviceCapability {
-                            device: device.clone(),
-                            capability: Capability::ManagementInterface,
-                            detail: Some("HTTP(S) management port open".to_string()),
-                        },
-                        EvidenceSource::TcpProbe,
-                        Confidence::Observed,
-                        vantage,
-                    ));
-                }
-
-                // Weak on its own by design: it needs corroboration to promote a device.
-                if serves_dns && serves_admin {
-                    out.push(TopologyEvidence::new(
-                        Fact::DeviceRoleSignal {
-                            device,
-                            signal: RoleSignal::ManagementSurface,
-                        },
-                        EvidenceSource::TcpProbe,
-                        Confidence::Observed,
-                        vantage,
-                    ));
-                }
+                // Liveness discovery only. Services and capabilities belong to the
+                // per-device pipeline, which confirms a protocol by speaking it.
+                //
+                // What stood here derived capabilities from port numbers: TCP 53 open
+                // became a DNS server, an open HTTP port became a management interface,
+                // and the two together emitted a role signal. None of that had been
+                // confirmed -- an open port is reachability, not a protocol -- and the
+                // combination promoted ordinary hosts on the strength of two open ports.
             }
 
             out

@@ -5,7 +5,7 @@
 //! to extract Subject Common Name (CN), Subject Alternative Names (SANs), and Issuer
 //! without any OpenSSL or C library dependencies.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use crate::net::endpoint::Endpoint;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -254,12 +254,11 @@ pub fn is_plausible_dns_name(name: &str) -> bool {
 }
 
 pub async fn probe_tls_certificate(
-    target: Ipv4Addr,
+    target: &Endpoint,
     port: u16,
     timeout_duration: Duration,
 ) -> Option<TlsCertificateInfo> {
-    let dest = SocketAddrV4::new(target, port);
-    let connect_fut = TcpStream::connect(dest);
+    let connect_fut = TcpStream::connect(target.socket_addr(port));
     let mut stream = timeout(timeout_duration, connect_fut).await.ok()?.ok()?;
 
     let client_hello = build_client_hello();

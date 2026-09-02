@@ -454,9 +454,20 @@ fn render_device_coverage(report: &DiscoveryReport) {
     for record in &report.coverage {
         println!(
             "  {} {}",
-            record.address.to_string().cyan().bold(),
+            record
+                .primary_endpoint()
+                .unwrap_or(&record.device.to_string())
+                .cyan()
+                .bold(),
             format!("[{}]", record.tier).dimmed()
         );
+        if record.addresses.len() > 1 {
+            println!(
+                "    {:<18} {}",
+                "addresses",
+                record.addresses.join(", ").dimmed()
+            );
+        }
         if !record.discovery_sources.is_empty() {
             println!(
                 "    {:<18} {}",
@@ -465,6 +476,18 @@ fn render_device_coverage(report: &DiscoveryReport) {
             );
         }
         println!("    {:<18} {}", "interrogation", record.summary().dimmed());
+        if !record.vendor_adapters.is_empty() {
+            println!(
+                "    {:<18} {}",
+                "vendor adapters",
+                record.vendor_adapters.join(", ").dimmed()
+            );
+        }
+        for omission in record.omissions() {
+            // Stated rather than glossed: a pass that left work out must not read as
+            // complete exploration.
+            println!("    {:<18} {}", "not attempted", omission.dimmed());
+        }
         if record.silent() {
             // A device that was asked and stayed silent is a finding about the device;
             // one that was never asked is a gap in coverage. They must not read alike.

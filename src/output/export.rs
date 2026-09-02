@@ -59,7 +59,12 @@ pub struct TopologyExport {
 /// Per-device interrogation record.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceCoverageExport {
-    pub address: String,
+    /// Canonical device identity. One record per device, however many addresses it has.
+    pub device: String,
+    /// Every address considered, most preferred first.
+    pub addresses: Vec<String>,
+    /// The address the full stage set ran against.
+    pub primary_address: Option<String>,
     /// Why the device was interrogated: pivot, candidate or host.
     pub tier: String,
     pub discovery_sources: Vec<String>,
@@ -70,6 +75,11 @@ pub struct DeviceCoverageExport {
     pub protocols_confirmed: Vec<String>,
     /// Ports that refused without credentials, which is a finding rather than an absence.
     pub auth_required: Vec<u16>,
+    /// Vendor adapters the device's fingerprint selected.
+    pub vendor_adapters: Vec<String>,
+    /// Work deliberately not done, and why. Present so a partial pass is never reported as
+    /// complete exploration.
+    pub omissions: Vec<String>,
     /// Set when the device was never interrogated, saying why.
     pub skipped: Option<String>,
     /// True when the device was asked and answered nothing at all.
@@ -352,15 +362,23 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
         .coverage
         .iter()
         .map(|record| DeviceCoverageExport {
-            address: record.address.to_string(),
+            device: record.device.to_string(),
+            addresses: record.addresses.clone(),
+            primary_address: record.primary_endpoint().map(|e| e.to_string()),
             tier: record.tier.label().to_string(),
             discovery_sources: record.discovery_sources.clone(),
-            stages_run: record.stages_run,
-            tcp_attempted: record.tcp_attempted,
-            tcp_responsive: record.tcp_responsive.clone(),
+            stages_run: record.stages_run(),
+            tcp_attempted: record.tcp_attempted(),
+            tcp_responsive: record
+                .endpoints
+                .iter()
+                .flat_map(|e| e.tcp_responsive.iter().copied())
+                .collect(),
             udp_attempted: record.udp_attempted.clone(),
             protocols_confirmed: record.protocols_confirmed.clone(),
             auth_required: record.auth_required.clone(),
+            vendor_adapters: record.vendor_adapters.clone(),
+            omissions: record.omissions(),
             skipped: record.skipped.clone(),
             silent: record.silent(),
             elapsed_ms: record.elapsed.as_millis(),

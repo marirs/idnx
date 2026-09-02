@@ -21,11 +21,11 @@
 //! distinguishable from "we never asked" and from "it refused without credentials".
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::DiscoveryContext;
+use crate::net::endpoint::Endpoint;
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{
     Capability, Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal,
@@ -53,15 +53,16 @@ const CONTROL_PLANE_UDP_PORTS: &[u16] = &[crate::probes::natpmp::NAT_PMP_PORT];
 
 /// Why a device is being interrogated.
 ///
-/// This changes only how much work the device is worth, never what its answers mean. Role
-/// and confidence still come from the evidence alone.
+/// This changes scheduling order and nothing else. It does not reduce the work a device
+/// receives, and it never decides what a device's answers mean: role and confidence still
+/// come from the evidence alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceTier {
     /// Positive routing or bridging evidence already exists for this device.
     EstablishedPivot,
     /// Weak hints only -- an unfamiliar appliance, a router-ish name, several addresses.
     Candidate,
-    /// No infrastructure signal. Enriched anyway, because that is how one appears.
+    /// No infrastructure signal. Enriched identically, because that is how one appears.
     Host,
 }
 
@@ -74,9 +75,14 @@ impl DeviceTier {
         }
     }
 
-    /// Whether stage 2 runs even when stage 1 found nothing.
-    fn always_broadens(&self) -> bool {
-        !matches!(self, DeviceTier::Host)
+    /// Scheduling order. Infrastructure first, so that what a pivot discloses can extend
+    /// the same pass rather than forcing another.
+    pub fn priority(&self) -> u8 {
+        match self {
+            DeviceTier::EstablishedPivot => 0,
+            DeviceTier::Candidate => 1,
+            DeviceTier::Host => 2,
+        }
     }
 }
 
@@ -86,45 +92,129 @@ impl fmt::Display for DeviceTier {
     }
 }
 
-/// What was actually attempted against one device, and what came back.
+/// One device to interrogate, with everything already known about it.
 ///
-/// Exists so that a device reported as yielding nothing can be told apart from one that was
-/// never asked. "Target enrichment: no response" answered neither question.
+/// Keyed by device rather than by address. A dual-stack device has several addresses and is
+/// one device: interrogating each address separately probed the same machine repeatedly and
+/// produced several coverage records for it, which would compound badly once federation
+/// merges records from several vantages.
 #[derive(Debug, Clone)]
-pub struct DeviceCoverage {
-    pub address: IpAddr,
+pub struct InterrogationTarget {
+    /// Canonical identity, as the graph knows it.
+    pub device: DeviceKey,
     pub tier: DeviceTier,
-    /// How the device came to be known, from the evidence already in the graph.
+    /// Reachable addresses, most preferred first. A global or ULA address is preferred over
+    /// a link-local one, and the link-local ones keep the zone they were seen on.
+    pub endpoints: Vec<Endpoint>,
+    /// Identity the graph already holds -- OUI manufacturer, hostnames, descriptions.
+    ///
+    /// Vendor adapters are selected from this together with anything interrogation adds.
+    /// Selecting from the interrogation output alone lost every OUI, because the
+    /// manufacturer was recorded when the device was first seen, long before this runs.
+    pub known: crate::providers::vendor::DeviceFingerprint,
+    /// How the device became known.
     pub discovery_sources: Vec<String>,
-    /// Stages that ran. Fewer than three means later stages had nothing to work with.
+    /// Whether liveness is already established -- an ARP or NDP entry, a captured frame, an
+    /// ICMP reply, or any TCP response. A live device is explored in full even when its
+    /// stage 1 ports are all silent, because a device whose only service is on a stage 2
+    /// port would otherwise be missed entirely.
+    pub confirmed_live: bool,
+}
+
+/// What was probed at one address, and what answered.
+#[derive(Debug, Clone)]
+pub struct EndpointCoverage {
+    pub endpoint: String,
+    /// The address the full stage set ran against.
+    pub primary: bool,
     pub stages_run: u8,
     pub tcp_attempted: usize,
     pub tcp_responsive: Vec<u16>,
+    /// Set when fewer than all stages ran here, saying which were omitted and why.
+    pub omitted: Option<String>,
+}
+
+/// What was actually attempted against one device, and what came back.
+///
+/// Exists so that a device reported as yielding nothing can be told apart from one that was
+/// never asked. "Target enrichment: no response" answered neither question. One record per
+/// device, however many addresses it has.
+#[derive(Debug, Clone)]
+pub struct DeviceCoverage {
+    pub device: DeviceKey,
+    /// Every address considered, whether or not it was probed.
+    pub addresses: Vec<String>,
+    pub tier: DeviceTier,
+    /// How the device came to be known, from the evidence already in the graph.
+    pub discovery_sources: Vec<String>,
+    /// Per-address detail, so an omission at one address is visible rather than averaged.
+    pub endpoints: Vec<EndpointCoverage>,
     pub udp_attempted: Vec<u16>,
     /// Protocols confirmed by handshake, not guessed from a port number.
     pub protocols_confirmed: Vec<String>,
     /// Ports that refused without credentials -- a positive finding, not an absence.
     pub auth_required: Vec<u16>,
+    /// Vendor adapters this device's fingerprint selected. An adapter never chosen and one
+    /// chosen that found nothing are different outcomes, so selection is reported.
+    pub vendor_adapters: Vec<String>,
     /// Set when the device was not interrogated at all, saying why.
     pub skipped: Option<String>,
     pub elapsed: Duration,
 }
 
 impl DeviceCoverage {
-    fn skipped(address: IpAddr, tier: DeviceTier, reason: impl Into<String>) -> Self {
+    fn skipped(device: DeviceKey, tier: DeviceTier, reason: impl Into<String>) -> Self {
         Self {
-            address,
+            device,
+            addresses: Vec::new(),
             tier,
             discovery_sources: Vec::new(),
-            stages_run: 0,
-            tcp_attempted: 0,
-            tcp_responsive: Vec::new(),
+            endpoints: Vec::new(),
             udp_attempted: Vec::new(),
             protocols_confirmed: Vec::new(),
             auth_required: Vec::new(),
+            vendor_adapters: Vec::new(),
             skipped: Some(reason.into()),
             elapsed: Duration::ZERO,
         }
+    }
+
+    /// Address the full stage set ran against, for display.
+    pub fn primary_endpoint(&self) -> Option<&str> {
+        self.endpoints
+            .iter()
+            .find(|e| e.primary)
+            .map(|e| e.endpoint.as_str())
+    }
+
+    pub fn tcp_attempted(&self) -> usize {
+        self.endpoints.iter().map(|e| e.tcp_attempted).sum()
+    }
+
+    pub fn tcp_responsive(&self) -> usize {
+        self.endpoints.iter().map(|e| e.tcp_responsive.len()).sum()
+    }
+
+    /// Highest stage reached at any address.
+    pub fn stages_run(&self) -> u8 {
+        self.endpoints
+            .iter()
+            .map(|e| e.stages_run)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Exactly what was left out, if anything. Reported rather than glossed, so a run is
+    /// never described as complete exploration when it was not.
+    pub fn omissions(&self) -> Vec<String> {
+        self.endpoints
+            .iter()
+            .filter_map(|e| {
+                e.omitted
+                    .as_ref()
+                    .map(|reason| format!("{}: {reason}", e.endpoint))
+            })
+            .collect()
     }
 
     /// True when the device answered nothing at all despite being asked.
@@ -132,7 +222,7 @@ impl DeviceCoverage {
     /// Distinct from being skipped: this device was reachable enough to probe and stayed
     /// silent, which is a fact about it rather than a gap in coverage.
     pub fn silent(&self) -> bool {
-        self.skipped.is_none() && self.tcp_responsive.is_empty() && self.auth_required.is_empty()
+        self.skipped.is_none() && self.tcp_responsive() == 0 && self.auth_required.is_empty()
     }
 
     /// One-line summary for the coverage report.
@@ -142,8 +232,8 @@ impl DeviceCoverage {
         }
         let mut parts = vec![format!(
             "{}/{} tcp responsive",
-            self.tcp_responsive.len(),
-            self.tcp_attempted
+            self.tcp_responsive(),
+            self.tcp_attempted()
         )];
         if !self.udp_attempted.is_empty() {
             parts.push(format!("{} udp attempted", self.udp_attempted.len()));
@@ -157,79 +247,84 @@ impl DeviceCoverage {
         }
         format!(
             "{} stage(s), {}, {}ms",
-            self.stages_run,
+            self.stages_run(),
             parts.join("; "),
             self.elapsed.as_millis()
         )
     }
 }
 
-/// Interrogates one device across every applicable protocol.
-///
-/// `discovery_sources` describes how the device became known; it is carried into the
-/// coverage record so the evidence trail is complete even when interrogation finds nothing.
+/// Interrogates one device across every applicable protocol and address family.
 pub async fn interrogate_device(
+    target: &InterrogationTarget,
     context: &DiscoveryContext,
-    tier: DeviceTier,
-    discovery_sources: Vec<String>,
 ) -> (Vec<TopologyEvidence>, DeviceCoverage) {
-    let Some(address) = context.target else {
-        return (
-            Vec::new(),
-            DeviceCoverage::skipped(IpAddr::V4(Ipv4Addr::UNSPECIFIED), tier, "no target address"),
-        );
-    };
-
-    let IpAddr::V4(target) = address else {
-        // IPv6 devices are reached through neighbour and advertisement evidence. The
-        // protocol probes below take an Ipv4Addr, and claiming to have interrogated an
-        // IPv6 device would report coverage that never happened.
+    let Some(primary) = target.endpoints.first().cloned() else {
         return (
             Vec::new(),
             DeviceCoverage::skipped(
-                address,
-                tier,
-                "IPv6 device: enriched from neighbour and advertisement evidence",
+                target.device.clone(),
+                target.tier,
+                "no reachable address: the device is known only by link-layer identity",
             ),
         );
     };
 
     let started = Instant::now();
     let mut coverage = DeviceCoverage {
-        address,
-        tier,
-        discovery_sources,
-        stages_run: 0,
-        tcp_attempted: 0,
-        tcp_responsive: Vec::new(),
+        device: target.device.clone(),
+        addresses: target.endpoints.iter().map(|e| e.to_string()).collect(),
+        tier: target.tier,
+        discovery_sources: target.discovery_sources.clone(),
+        endpoints: Vec::new(),
         udp_attempted: Vec::new(),
         protocols_confirmed: Vec::new(),
         auth_required: Vec::new(),
+        vendor_adapters: Vec::new(),
         skipped: None,
         elapsed: Duration::ZERO,
     };
 
     let vantage = &context.vantage.interface;
-    let device = DeviceKey::Address(address);
+    let device = target.device.clone();
     let timeout = context.timeout.max(Duration::from_millis(400));
     let mut out = Vec::new();
 
-    // Stage 1: the cheap universal pass.
-    coverage.stages_run = 1;
-    let mut open_ports = sweep_ports(target, STAGE_ONE_PORTS, context, timeout).await;
-    coverage.tcp_attempted += STAGE_ONE_PORTS.len();
+    // Stage 1 on the preferred address.
+    let mut open_ports = sweep_ports(&primary, STAGE_ONE_PORTS, context, timeout).await;
+    let mut primary_coverage = EndpointCoverage {
+        endpoint: primary.to_string(),
+        primary: true,
+        stages_run: 1,
+        tcp_attempted: STAGE_ONE_PORTS.len(),
+        tcp_responsive: Vec::new(),
+        omitted: None,
+    };
 
-    coverage.udp_attempted.extend(CONTROL_PLANE_UDP_PORTS);
-    out.extend(probe_control_plane(target, &device, timeout, vantage, &mut coverage).await);
+    // The UDP control plane needs no open TCP port, and NAT-PMP is IPv4 by definition.
+    if primary.is_ipv4() {
+        coverage.udp_attempted.extend(CONTROL_PLANE_UDP_PORTS);
+        out.extend(probe_control_plane(&primary, &device, timeout, vantage, &mut coverage).await);
+    }
 
-    // Stage 2: broaden, where breadth can still return something.
-    if !open_ports.is_empty() || tier.always_broadens() {
-        coverage.stages_run = 2;
-        open_ports.extend(sweep_ports(target, STAGE_TWO_PORTS, context, timeout).await);
-        coverage.tcp_attempted += STAGE_TWO_PORTS.len();
+    // Stage 2 broadens. It runs for any device already known to be alive -- an ARP or NDP
+    // entry, a captured frame, an ICMP reply, a TCP response -- and not only for one that
+    // answered a stage 1 port. A live host whose single service sits on 8728 or 32400 was
+    // otherwise probed on seventeen ports and declared silent.
+    let broaden = target.confirmed_live || !open_ports.is_empty();
+    if broaden {
+        primary_coverage.stages_run = 2;
+        primary_coverage.tcp_attempted += STAGE_TWO_PORTS.len();
+        open_ports.extend(sweep_ports(&primary, STAGE_TWO_PORTS, context, timeout).await);
+    } else {
+        primary_coverage.omitted = Some(format!(
+            "stage 2 ({} ports) not run: liveness never confirmed and no stage 1 port answered",
+            STAGE_TWO_PORTS.len()
+        ));
     }
     open_ports.sort_unstable();
-    coverage.tcp_responsive = open_ports.clone();
+    open_ports.dedup();
+    primary_coverage.tcp_responsive = open_ports.clone();
 
     // An open port is reachability, not identity. Recorded as its own fact so a later
     // protocol confirmation can be told apart from a mere guess by port number.
@@ -237,7 +332,7 @@ pub async fn interrogate_device(
         out.push(
             TopologyEvidence::new(
                 Fact::Service {
-                    address,
+                    address: primary.address,
                     port,
                     protocol: "tcp",
                     detail: None,
@@ -252,11 +347,10 @@ pub async fn interrogate_device(
 
     // Stage 3: confirm what actually speaks on the ports that answered.
     if !open_ports.is_empty() {
-        coverage.stages_run = 3;
+        primary_coverage.stages_run = 3;
         out.extend(
             confirm_protocols(
-                target,
-                address,
+                &primary,
                 &device,
                 &open_ports,
                 timeout,
@@ -267,7 +361,7 @@ pub async fn interrogate_device(
         );
         out.extend(
             crate::providers::ai::probe_ai_services(
-                target,
+                &primary,
                 &device,
                 &open_ports,
                 timeout.max(Duration::from_millis(600)),
@@ -276,15 +370,55 @@ pub async fn interrogate_device(
             .await,
         );
     }
+    coverage.endpoints.push(primary_coverage);
 
-    // Vendor adapters, chosen from what the device disclosed in the stages above. Optional
+    // Other address families the same device answers on. Stage 1 only: this is one device,
+    // and repeating the full set at every address would probe the same machine several
+    // times over. What it does catch is a service bound to one family alone.
+    for endpoint in target.endpoints.iter().skip(1) {
+        let responsive = sweep_ports(endpoint, STAGE_ONE_PORTS, context, timeout).await;
+        for &port in &responsive {
+            out.push(
+                TopologyEvidence::new(
+                    Fact::Service {
+                        address: endpoint.address,
+                        port,
+                        protocol: "tcp",
+                        detail: None,
+                    },
+                    EvidenceSource::TcpProbe,
+                    Confidence::Observed,
+                    vantage,
+                )
+                .with_detail("TCP port open; protocol not yet confirmed".to_string()),
+            );
+        }
+        coverage.endpoints.push(EndpointCoverage {
+            endpoint: endpoint.to_string(),
+            primary: false,
+            stages_run: 1,
+            tcp_attempted: STAGE_ONE_PORTS.len(),
+            tcp_responsive: responsive,
+            omitted: Some(format!(
+                "stages 2-3 ({} ports) run only at {primary}, the preferred address for this device",
+                STAGE_TWO_PORTS.len()
+            )),
+        });
+    }
+
+    // Vendor adapters, chosen from what the graph already knew about the device together
+    // with what interrogation just added. Selecting from the interrogation output alone
+    // lost the manufacturer, which is recorded when a device is first seen. Optional
     // throughout -- no adapter is required, none gates recursion, and a device that selects
     // none (unknown manufacturer, white-label or randomized MAC, or a software router on
     // generic hardware) is mapped identically by the standard protocols.
-    let fingerprint = crate::providers::vendor::DeviceFingerprint::from_evidence(&out, &open_ports);
+    let mut fingerprint = target.known.clone();
+    fingerprint.absorb_evidence(&out);
+    fingerprint.open_ports = open_ports.clone();
+    coverage.vendor_adapters = crate::providers::vendor::selected_adapters(&fingerprint);
     out.extend(
         crate::providers::vendor::run_adapters(&crate::providers::vendor::VendorContext {
-            target,
+            endpoint: primary.clone(),
             device,
             fingerprint,
             timeout,
@@ -299,7 +433,7 @@ pub async fn interrogate_device(
 
 /// Probes a port set concurrently, drawing on the run-wide probe budget.
 async fn sweep_ports(
-    target: Ipv4Addr,
+    target: &Endpoint,
     ports: &[u16],
     context: &DiscoveryContext,
     timeout: Duration,
@@ -307,9 +441,10 @@ async fn sweep_ports(
     let mut tasks = Vec::with_capacity(ports.len());
     for &port in ports {
         let permits = Arc::clone(&context.probe_permits);
+        let socket = target.socket_addr(port);
         tasks.push(tokio::spawn(async move {
             let _hold = permits.acquire().await.ok()?;
-            let probe = crate::engine::scanner::probe_tcp_port(target, port, timeout).await;
+            let probe = crate::engine::scanner::probe_tcp_socket(socket, timeout).await;
             (probe.status == crate::engine::scanner::PortStatus::Open).then_some(port)
         }));
     }
@@ -324,16 +459,15 @@ async fn sweep_ports(
 }
 
 /// Confirms protocols on ports that answered.
-#[allow(clippy::too_many_arguments)]
 async fn confirm_protocols(
-    target: Ipv4Addr,
-    address: IpAddr,
+    target: &Endpoint,
     device: &DeviceKey,
     open_ports: &[u16],
     timeout: Duration,
     vantage: &str,
     coverage: &mut DeviceCoverage,
 ) -> Vec<TopologyEvidence> {
+    let address = target.address;
     let mut out = Vec::new();
 
     // TLS: the certificate names the device far more reliably than any banner.
@@ -439,6 +573,40 @@ async fn confirm_protocols(
         }
     }
 
+    // DNS: an open port 53 is reachability, not a resolver. This asks an actual DNS
+    // question and requires a well-formed answer to the transaction it sent, which is what
+    // separates a resolver from a service that happens to sit on that port.
+    if open_ports.contains(&53)
+        && let Some(identity) = crate::probes::dns::confirm_dns(target, timeout).await
+    {
+        coverage.protocols_confirmed.push("dns/53".to_string());
+        let detail = match &identity.version {
+            Some(version) => format!("answered a DNS query ({version})"),
+            None => format!("answered a DNS query (rcode {})", identity.response_code),
+        };
+        out.push(TopologyEvidence::new(
+            Fact::DeviceCapability {
+                device: device.clone(),
+                capability: Capability::DnsServer,
+                detail: Some(detail.clone()),
+            },
+            EvidenceSource::UnicastDns,
+            Confidence::Observed,
+            vantage,
+        ));
+        out.push(TopologyEvidence::new(
+            Fact::Service {
+                address,
+                port: 53,
+                protocol: "tcp",
+                detail: Some(detail),
+            },
+            EvidenceSource::UnicastDns,
+            Confidence::Observed,
+            vantage,
+        ));
+    }
+
     // HTTP: the status line, Server header and page title are the device describing
     // itself, and on consumer gear they are often the only identity available without
     // credentials. A challenge for credentials is recorded as a finding in its own right.
@@ -499,17 +667,26 @@ async fn confirm_protocols(
 
 /// Probes that reach a device without needing a TCP service.
 async fn probe_control_plane(
-    target: Ipv4Addr,
+    target: &Endpoint,
     device: &DeviceKey,
     timeout: Duration,
     vantage: &str,
     coverage: &mut DeviceCoverage,
 ) -> Vec<TopologyEvidence> {
     let mut out = Vec::new();
+    // NAT-PMP is defined over IPv4 only; the caller gates on this already.
+    let crate::net::endpoint::Endpoint {
+        address: std::net::IpAddr::V4(v4),
+        ..
+    } = target
+    else {
+        return out;
+    };
+    let v4 = *v4;
 
     // NAT-PMP: only a NAT gateway answers, so a reply is direct role evidence and needs no
     // credentials. This reaches routers that expose no TCP service at all.
-    if let Some(external) = crate::probes::natpmp::probe_nat_gateway(target, timeout).await {
+    if let Some(external) = crate::probes::natpmp::probe_nat_gateway(v4, timeout).await {
         coverage.protocols_confirmed.push("nat-pmp".to_string());
         out.push(
             TopologyEvidence::new(
@@ -572,7 +749,7 @@ mod tests {
 
     #[test]
     fn stage_one_stays_small_and_stage_two_carries_the_breadth() {
-        // Stage 1 is what every quiet host on a subnet costs, so it must stay cheap.
+        // Stage 1 is what an unreachable address costs, so it must stay cheap.
         assert!(STAGE_ONE_PORTS.len() <= 20);
         assert!(STAGE_TWO_PORTS.len() > STAGE_ONE_PORTS.len());
         assert!(STAGE_TWO_PORTS.contains(&7547), "TR-069 management");
@@ -595,38 +772,51 @@ mod tests {
     }
 
     #[test]
-    fn only_hosts_wait_for_a_stage_one_answer_before_broadening() {
-        // A silent appliance is exactly the case worth pushing on, so pivots and
-        // candidates broaden regardless of what stage 1 found.
-        assert!(DeviceTier::EstablishedPivot.always_broadens());
-        assert!(DeviceTier::Candidate.always_broadens());
-        assert!(!DeviceTier::Host.always_broadens());
+    fn tier_orders_the_queue_and_nothing_else() {
+        // It must not reduce coverage: that is decided by confirmed liveness.
+        assert!(DeviceTier::EstablishedPivot.priority() < DeviceTier::Candidate.priority());
+        assert!(DeviceTier::Candidate.priority() < DeviceTier::Host.priority());
     }
 
     #[tokio::test]
-    async fn an_ipv6_device_is_reported_as_skipped_rather_than_silently_dropped() {
-        // Claiming to have interrogated it would report coverage that never happened.
-        let targeted = ctx().for_target("fd00::1".parse().unwrap());
-        let (evidence, coverage) =
-            interrogate_device(&targeted, DeviceTier::Host, Vec::new()).await;
+    async fn a_device_with_no_reachable_address_is_reported_as_skipped() {
+        // Known by MAC alone. Claiming to have interrogated it would report coverage that
+        // never happened.
+        let (evidence, coverage) = interrogate_device(
+            &InterrogationTarget {
+                device: DeviceKey::mac("02:00:5e:00:00:01"),
+                tier: DeviceTier::Host,
+                endpoints: Vec::new(),
+                known: Default::default(),
+                discovery_sources: Vec::new(),
+                confirmed_live: true,
+            },
+            &ctx(),
+        )
+        .await;
         assert!(evidence.is_empty());
-        assert_eq!(coverage.stages_run, 0);
-        let reason = coverage.skipped.expect("a reason");
-        assert!(reason.contains("IPv6"), "{reason}");
+        assert_eq!(coverage.stages_run(), 0);
+        assert!(coverage.skipped.expect("a reason").contains("no reachable"));
     }
 
     #[test]
     fn coverage_distinguishes_silence_from_never_having_asked() {
-        let address: IpAddr = "10.0.0.9".parse().unwrap();
+        let device = DeviceKey::Address("10.0.0.9".parse().unwrap());
 
-        let skipped = DeviceCoverage::skipped(address, DeviceTier::Host, "out of scope");
+        let skipped = DeviceCoverage::skipped(device.clone(), DeviceTier::Host, "out of scope");
         assert!(!skipped.silent());
         assert!(skipped.summary().starts_with("skipped: out of scope"));
 
-        let mut asked = DeviceCoverage::skipped(address, DeviceTier::Host, "x");
+        let mut asked = DeviceCoverage::skipped(device, DeviceTier::Host, "x");
         asked.skipped = None;
-        asked.stages_run = 2;
-        asked.tcp_attempted = 62;
+        asked.endpoints.push(EndpointCoverage {
+            endpoint: "10.0.0.9".to_string(),
+            primary: true,
+            stages_run: 2,
+            tcp_attempted: 62,
+            tcp_responsive: Vec::new(),
+            omitted: None,
+        });
         assert!(asked.silent());
         assert!(asked.summary().contains("0/62 tcp responsive"));
 
@@ -634,5 +824,42 @@ mod tests {
         asked.auth_required.push(80);
         assert!(!asked.silent());
         assert!(asked.summary().contains("auth required on 80"));
+    }
+
+    #[test]
+    fn one_record_covers_every_address_of_a_dual_stack_device() {
+        // Several addresses are one device. Reporting each separately would double-count
+        // it, and would compound once federation merges records from several vantages.
+        let mut coverage =
+            DeviceCoverage::skipped(DeviceKey::mac("02:00:5e:00:00:02"), DeviceTier::Host, "x");
+        coverage.skipped = None;
+        coverage.addresses = vec!["10.0.0.2".to_string(), "fd00::2".to_string()];
+        coverage.endpoints.push(EndpointCoverage {
+            endpoint: "10.0.0.2".to_string(),
+            primary: true,
+            stages_run: 3,
+            tcp_attempted: 62,
+            tcp_responsive: vec![80],
+            omitted: None,
+        });
+        coverage.endpoints.push(EndpointCoverage {
+            endpoint: "fd00::2".to_string(),
+            primary: false,
+            stages_run: 1,
+            tcp_attempted: 17,
+            tcp_responsive: vec![],
+            omitted: Some("stages 2-3 run only at 10.0.0.2".to_string()),
+        });
+
+        assert_eq!(coverage.primary_endpoint(), Some("10.0.0.2"));
+        assert_eq!(coverage.tcp_attempted(), 79);
+        assert_eq!(coverage.tcp_responsive(), 1);
+        assert_eq!(coverage.stages_run(), 3);
+
+        // What was left out is stated, so the pass is never described as complete when it
+        // was not.
+        let omissions = coverage.omissions();
+        assert_eq!(omissions.len(), 1);
+        assert!(omissions[0].starts_with("fd00::2:"));
     }
 }

@@ -3,8 +3,8 @@
 //! Provides zero-dependency, pure-Rust socket HTTP/1.1 interrogation of local LLM runtimes
 //! (Ollama, LM Studio, vLLM, LocalAI), Model Context Protocol (MCP) servers, and AgentPin identities.
 
+use crate::net::endpoint::Endpoint;
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -63,12 +63,12 @@ impl AiRuntimeInfo {
 
 /// Low-overhead HTTP/1.1 socket client over pure TcpStream
 async fn http_get(
-    ip: Ipv4Addr,
+    ip: &Endpoint,
     port: u16,
     path: &str,
     timeout_duration: Duration,
 ) -> Option<(u16, String)> {
-    let mut stream = timeout(timeout_duration, TcpStream::connect((ip, port)))
+    let mut stream = timeout(timeout_duration, TcpStream::connect(ip.socket_addr(port)))
         .await
         .ok()?
         .ok()?;
@@ -203,7 +203,7 @@ pub fn parse_agentpin_manifest(json_str: &str) -> Option<(String, Option<String>
 
 /// Actively interrogates an open host for AI LLM runtimes, models, and MCP servers
 pub async fn probe_ai_runtime(
-    ip: Ipv4Addr,
+    ip: &Endpoint,
     open_ports: &[u16],
     timeout_duration: Duration,
 ) -> Option<AiRuntimeInfo> {

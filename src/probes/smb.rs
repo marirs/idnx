@@ -4,7 +4,7 @@
 //! request. Parses the server's NTLMSSP security buffer to extract NetBIOS Computer Name,
 //! Workgroup/Domain Name, and DNS hostnames without external dependencies.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use crate::net::endpoint::Endpoint;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -194,9 +194,12 @@ pub fn parse_smb2_response(buf: &[u8]) -> Option<SmbInfo> {
 }
 
 /// Asynchronously probes target IP on port 445/139 for SMB host identity
-pub async fn probe_smb(target: Ipv4Addr, port: u16, timeout_duration: Duration) -> Option<SmbInfo> {
-    let dest = SocketAddrV4::new(target, port);
-    let connect_fut = TcpStream::connect(dest);
+pub async fn probe_smb(
+    target: &Endpoint,
+    port: u16,
+    timeout_duration: Duration,
+) -> Option<SmbInfo> {
+    let connect_fut = TcpStream::connect(target.socket_addr(port));
     let mut stream = timeout(timeout_duration, connect_fut).await.ok()?.ok()?;
 
     let req = build_smb2_negotiate_request();

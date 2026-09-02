@@ -146,7 +146,19 @@ pub fn parse_ports(input: &str) -> Result<Vec<u16>, String> {
 
 /// Probes a single TCP port using asynchronous connect with timeout
 pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration) -> PortInfo {
-    let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+    probe_tcp_socket(
+        SocketAddr::V4(SocketAddrV4::new(ip, port)),
+        timeout_duration,
+    )
+    .await
+}
+
+/// Probes one TCP port at a fully formed socket address.
+///
+/// Address-family neutral, so an IPv6 neighbour is interrogated exactly as an IPv4 one is.
+/// A link-local destination carries its scope index in the socket address already.
+pub async fn probe_tcp_socket(addr: SocketAddr, timeout_duration: Duration) -> PortInfo {
+    let port = addr.port();
     let start = Instant::now();
 
     match timeout(timeout_duration, tokio::net::TcpStream::connect(addr)).await {
@@ -180,7 +192,7 @@ pub async fn probe_tcp_port(ip: Ipv4Addr, port: u16, timeout_duration: Duration)
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let req = format!(
                     "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: idnx/{}\r\nConnection: close\r\n\r\n",
-                    ip,
+                    addr.ip(),
                     env!("CARGO_PKG_VERSION")
                 );
                 let _ = stream.write_all(req.as_bytes()).await;
@@ -582,8 +594,12 @@ pub async fn scan_subnet_ext(
             .iter()
             .any(|p| p.port == 445 || p.port == 139);
         if has_smb
-            && let Some(smb_info) =
-                crate::probes::smb::probe_smb(host.ip, 445, Duration::from_millis(400)).await
+            && let Some(smb_info) = crate::probes::smb::probe_smb(
+                &crate::net::endpoint::Endpoint::global(std::net::IpAddr::V4(host.ip)),
+                445,
+                Duration::from_millis(400),
+            )
+            .await
             && let Some(comp_name) = smb_info.dns_computer_name.or(smb_info.computer_name)
         {
             let domain_tag = smb_info
@@ -606,9 +622,12 @@ pub async fn scan_subnet_ext(
 
         if let Some(p) = tls_port
             && is_hostname_missing
-            && let Some(tls_info) =
-                crate::probes::tls::probe_tls_certificate(host.ip, p, Duration::from_millis(400))
-                    .await
+            && let Some(tls_info) = crate::probes::tls::probe_tls_certificate(
+                &crate::net::endpoint::Endpoint::global(std::net::IpAddr::V4(host.ip)),
+                p,
+                Duration::from_millis(400),
+            )
+            .await
             && let Some(cn) = tls_info.common_name
         {
             host.hostname = Some(cn);
