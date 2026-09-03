@@ -215,7 +215,11 @@ impl DiscoveryEngine {
                 }
             }
 
-            for net in graph.networks() {
+            // Only networks this machine observed itself. A peer's network cannot be swept
+            // from here: its addresses are not reachable, and a private prefix a peer
+            // reported may well name a different network of the same shape -- sweeping it
+            // would probe this vantage's own address space and file the result elsewhere.
+            for net in graph.local_networks() {
                 if !processed.contains(&net) && !queue.contains(&net) {
                     queue.push(net);
                 }

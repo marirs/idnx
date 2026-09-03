@@ -218,7 +218,7 @@ fn node_label(graph: &TopologyGraph, id: &NodeId) -> String {
         Some(node) => node.display_name(),
         None => match id {
             NodeId::Interface(n) => n.clone(),
-            NodeId::Network(n) => n.to_string(),
+            NodeId::Network(n, _) => n.to_string(),
             NodeId::Vlan(v) => format!("VLAN {}", v),
             NodeId::Device(d) => d.to_string(),
             NodeId::Service(a, p) => format!("{}:{}", a, p),
@@ -258,7 +258,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             .map(|s| s.to_string())
             .collect();
         let iface_refs: Vec<&str> = interfaces.iter().map(|s| s.as_str()).collect();
-        let node = graph.node(&NodeId::Network(net));
+        let node = graph.network_node(&net);
         networks.push(NetworkExport {
             cidr: net.to_string(),
             kind: if is_virtual_network(&iface_refs) {

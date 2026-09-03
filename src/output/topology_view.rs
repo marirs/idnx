@@ -74,9 +74,7 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
 
 /// A network's peer attribution, where it has one.
 fn network_origin(graph: &TopologyGraph, net: &IpNet) -> Option<String> {
-    let node = graph
-        .nodes()
-        .find(|n| matches!(&n.id, NodeId::Network(existing) if existing == net))?;
+    let node = graph.network_node(net)?;
     let origins = node.peer_origins();
     if origins.is_empty() {
         return None;
@@ -212,7 +210,7 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
         .yellow(),
         node.vendor
             .as_deref()
-            .map(|v| format!("({})", v))
+            .map(|v| format!("({})", safe::text(v)))
             .unwrap_or_default()
             .dimmed()
     );
@@ -222,17 +220,12 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
         println!(
             "  │     {} {}",
             "Capabilities:".bold(),
-            node.capabilities
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-                .green()
+            safe::all(node.capabilities.iter()).join(", ").green()
         );
     }
     render_peer_origin(node, "  │     ");
     for signal in &node.role_signals {
-        println!("  │     • {}", signal.dimmed());
+        println!("  │     • {}", safe::text(signal).dimmed());
     }
 
     // Networks this device serves, with the relationship that established it.
@@ -243,7 +236,7 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
         if matches!(
             edge.relationship,
             Relationship::GatewayFor | Relationship::RoutesTo
-        ) && let NodeId::Network(net) = &edge.to
+        ) && let NodeId::Network(net, _) = &edge.to
         {
             println!(
                 "  │     └── {} {} [{}]",
@@ -386,10 +379,10 @@ fn render_boundaries(graph: &TopologyGraph, vantage: &str) {
             format!("[{}]", addrs.join(", ")).yellow()
         );
         for signal in &node.role_signals {
-            println!("  │     • {}", signal.dimmed());
+            println!("  │     • {}", safe::text(signal).dimmed());
         }
         if let Some(reason) = &node.opaque_reason {
-            println!("  │     └── {}", reason.yellow());
+            println!("  │     └── {}", safe::text(reason).yellow());
         }
     }
 }
@@ -435,10 +428,14 @@ fn render_device_table(graph: &TopologyGraph, vantage: &str) {
             .unwrap_or_default();
 
         let services = services_for(graph, node);
+        // The vendor comes from an OUI table, but a peer can assert one too, so it is
+        // neutralised like every other device-supplied string.
         let identity = match (&node.id, &node.vendor) {
-            (NodeId::Device(key), Some(vendor)) => format!("{key}\n{vendor}"),
-            (NodeId::Device(key), None) => key.to_string(),
-            (_, Some(vendor)) => vendor.clone(),
+            (NodeId::Device(key), Some(vendor)) => {
+                format!("{}\n{}", safe::text(&key.to_string()), safe::text(vendor))
+            }
+            (NodeId::Device(key), None) => safe::text(&key.to_string()),
+            (_, Some(vendor)) => safe::text(vendor),
             _ => String::new(),
         };
 
@@ -463,18 +460,14 @@ fn render_device_table(graph: &TopologyGraph, vantage: &str) {
                 node.hostnames
                     .iter()
                     .next()
-                    .cloned()
+                    .map(|h| safe::text(h))
                     .unwrap_or_else(|| "-".to_string()),
             ),
             Cell::new(identity),
             Cell::new(if node.capabilities.is_empty() {
                 "-".to_string()
             } else {
-                node.capabilities
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                safe::all(node.capabilities.iter()).join("\n")
             }),
             Cell::new(if services.is_empty() {
                 "-".to_string()
@@ -484,11 +477,7 @@ fn render_device_table(graph: &TopologyGraph, vantage: &str) {
             Cell::new(if node.role_signals.is_empty() {
                 "-".to_string()
             } else {
-                node.role_signals
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                safe::all(node.role_signals.iter()).join("\n")
             }),
         ]);
     }
@@ -536,6 +525,8 @@ fn services_for(graph: &TopologyGraph, node: &crate::topology::Node) -> Vec<Stri
 /// the one carrying the most identity -- a certificate subject or a server banner rather
 /// than a protocol name alone.
 fn strongest_description(service: &crate::topology::Node, port: u16) -> Option<String> {
+    // Certificate subjects, HTTP banners and peer-supplied service detail all end up here,
+    // and this is the last point before they reach a terminal.
     service
         .descriptions
         .iter()
@@ -543,8 +534,8 @@ fn strongest_description(service: &crate::topology::Node, port: u16) -> Option<S
             !d.contains("protocol not yet confirmed") && !d.contains("protocol unconfirmed")
         })
         .max_by_key(|d| d.len())
-        .cloned()
-        .or_else(|| service.descriptions.iter().next().cloned())
+        .map(|d| safe::text(d))
+        .or_else(|| service.descriptions.iter().next().map(|d| safe::text(d)))
         .or_else(|| Some(format!("{port}/tcp")))
 }
 

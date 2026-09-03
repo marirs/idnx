@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use ipnet::IpNet;
 
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
+use super::realm::{Realm, network_realm, qualify_device};
 use super::role::{DeviceRole, score_role};
 
 /// How a device is presented to an operator.
@@ -221,7 +222,13 @@ fn is_v6_link_local(addr: &std::net::Ipv6Addr) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
     Interface(String),
-    Network(IpNet),
+    /// A network, in the domain it was observed in.
+    ///
+    /// The realm is part of the identity because a prefix is not: two peers both running
+    /// 10.0.0.0/24 have two networks, and keying them by prefix alone merged them into one
+    /// that neither has. Locally observed and publicly routable networks carry
+    /// [`Realm::Local`], so nothing about a single-machine run changes.
+    Network(IpNet, crate::topology::realm::Realm),
     Vlan(u16),
     Device(DeviceKey),
     Service(IpAddr, u16),
@@ -429,7 +436,7 @@ impl Node {
         }
         match &self.id {
             NodeId::Interface(n) => n.clone(),
-            NodeId::Network(n) => n.to_string(),
+            NodeId::Network(n, _) => n.to_string(),
             NodeId::Vlan(v) => format!("VLAN {}", v),
             NodeId::Device(d) => d.to_string(),
             NodeId::Service(a, p) => format!("{}:{}", a, p),
@@ -490,11 +497,45 @@ impl TopologyGraph {
     }
 
     /// Networks currently known, each backed by prefix-bearing evidence.
+    /// The node for a prefix, in whichever domain holds it.
+    ///
+    /// Callers that only have a prefix -- display, mostly -- cannot know the realm. Where
+    /// two domains hold the same prefix this returns the local one first, because that is
+    /// the one this vantage can speak about.
+    pub fn network_node(&self, prefix: &IpNet) -> Option<&Node> {
+        self.nodes
+            .get(&NodeId::Network(*prefix, Realm::Local))
+            .or_else(|| {
+                self.nodes
+                    .values()
+                    .find(|n| matches!(&n.id, NodeId::Network(existing, _) if existing == prefix))
+            })
+    }
+
+    /// Networks this machine observed itself, which are the only ones it can traverse.
+    ///
+    /// A peer's network cannot be swept from here: the addresses are not reachable and the
+    /// prefix may well belong to a different network of the same shape. Sweeping one would
+    /// probe this vantage's own address space while attributing the result elsewhere.
+    pub fn local_networks(&self) -> Vec<IpNet> {
+        let mut nets: Vec<IpNet> = self
+            .nodes
+            .values()
+            .filter_map(|n| match &n.id {
+                NodeId::Network(net, Realm::Local) => Some(*net),
+                _ => None,
+            })
+            .collect();
+        nets.sort_by_key(|n| n.to_string());
+        nets.dedup();
+        nets
+    }
+
     pub fn networks(&self) -> Vec<IpNet> {
         self.nodes
             .keys()
             .filter_map(|id| match id {
-                NodeId::Network(net) => Some(*net),
+                NodeId::Network(net, _) => Some(*net),
                 _ => None,
             })
             .collect()
@@ -548,7 +589,7 @@ impl TopologyGraph {
     /// Used to separate physical topology from VPN and virtualisation plumbing without
     /// removing anything from the graph.
     pub fn interfaces_for_network(&self, network: &IpNet) -> Vec<&str> {
-        let target = NodeId::Network(*network);
+        let target = NodeId::Network(*network, Realm::Local);
         self.edges
             .values()
             .filter(|e| e.relationship == Relationship::AttachedTo && e.to == target)
@@ -649,20 +690,25 @@ impl TopologyGraph {
     }
 
     /// Folds one piece of evidence into the graph.
+    /// Absorbs one piece of evidence, in the domain it was observed in.
     pub fn absorb(&mut self, ev: TopologyEvidence) {
+        let realm = crate::topology::realm::Realm::of(ev.origin.as_ref());
         let prov = Provenance::from_evidence(&ev);
-        match ev.fact.clone() {
+        // Identities are namespaced by the domain they were observed in before anything
+        // else happens, so a peer's ambiguous identifier can never collide with a local one
+        // or with another peer's. Locally observed evidence is returned unchanged.
+        match qualify_fact(ev.fact.clone(), &realm) {
             Fact::Network { prefix } => {
                 // Reaching here means a prefix was actually observed or advertised. The
                 // Vlan arm below is the only other way a network-ish node appears, and it
                 // deliberately cannot produce a prefix.
-                self.upsert_network(prefix, ev.confidence, prov);
+                self.upsert_network(prefix, &realm, ev.confidence, prov);
             }
             Fact::InterfaceNetwork { interface, prefix } => {
                 // Same rule as the Network arm: loopback, link-local and multicast ranges
                 // are protocol machinery, not networks. Filtering only there let them back
                 // in through this path.
-                if !self.upsert_network(prefix, ev.confidence, prov.clone()) {
+                if !self.upsert_network(prefix, &realm, ev.confidence, prov.clone()) {
                     return;
                 }
                 let iface_id = NodeId::Interface(interface);
@@ -674,7 +720,7 @@ impl TopologyGraph {
                 );
                 self.link(
                     iface_id,
-                    NodeId::Network(prefix),
+                    NodeId::Network(prefix, network_realm(&prefix, &realm)),
                     Relationship::AttachedTo,
                     ev.confidence,
                     prov,
@@ -768,9 +814,9 @@ impl TopologyGraph {
             Fact::GatewayFor { device, network } => {
                 let key = self.canonical_key(&device, None);
                 let dev_id = NodeId::Device(key);
-                let net_id = NodeId::Network(network);
+                let net_id = NodeId::Network(network, network_realm(&network, &realm));
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
-                if !self.upsert_network(network, ev.confidence, prov.clone()) {
+                if !self.upsert_network(network, &realm, ev.confidence, prov.clone()) {
                     return;
                 }
                 self.link(
@@ -788,9 +834,9 @@ impl TopologyGraph {
             } => {
                 let key = self.canonical_key(&device, None);
                 let dev_id = NodeId::Device(key);
-                let net_id = NodeId::Network(network);
+                let net_id = NodeId::Network(network, network_realm(&network, &realm));
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
-                if !self.upsert_network(network, ev.confidence, prov.clone()) {
+                if !self.upsert_network(network, &realm, ev.confidence, prov.clone()) {
                     return;
                 }
                 self.link(
@@ -809,9 +855,9 @@ impl TopologyGraph {
             Fact::AttachedTo { device, network } => {
                 let key = self.canonical_key(&device, None);
                 let dev_id = NodeId::Device(key);
-                let net_id = NodeId::Network(network);
+                let net_id = NodeId::Network(network, network_realm(&network, &realm));
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
-                if !self.upsert_network(network, ev.confidence, prov.clone()) {
+                if !self.upsert_network(network, &realm, ev.confidence, prov.clone()) {
                     return;
                 }
                 self.link(
@@ -1105,11 +1151,22 @@ impl TopologyGraph {
         self.address_owner.get(&(*address, zone)).cloned()
     }
 
-    fn upsert_network(&mut self, prefix: IpNet, confidence: Confidence, prov: Provenance) -> bool {
+    fn upsert_network(
+        &mut self,
+        prefix: IpNet,
+        realm: &Realm,
+        confidence: Confidence,
+        prov: Provenance,
+    ) -> bool {
         if !is_topology_network(&prefix) {
             return false;
         }
-        self.upsert(NodeId::Network(prefix), NodeKind::Network, confidence, prov);
+        self.upsert(
+            NodeId::Network(prefix, network_realm(&prefix, realm)),
+            NodeKind::Network,
+            confidence,
+            prov,
+        );
         true
     }
 
@@ -1146,6 +1203,89 @@ impl TopologyGraph {
             edge.confidence = confidence;
         }
         edge.provenance.push(prov);
+    }
+}
+
+/// Rewrites a fact's identities into the domain it was observed in.
+///
+/// Local evidence passes through untouched. Remote evidence has every device identity and
+/// every network qualified, so a peer's ambiguous identifier -- a private address, a
+/// randomized MAC, a link-local zone -- cannot collide with a local one or another peer's.
+fn qualify_fact(fact: Fact, realm: &Realm) -> Fact {
+    if realm.is_local() {
+        return fact;
+    }
+    let q = |key: DeviceKey| qualify_device(key, realm);
+
+    match fact {
+        Fact::DeviceAddress { device, address } => Fact::DeviceAddress {
+            device: q(device),
+            address,
+        },
+        Fact::DeviceHostname { device, hostname } => Fact::DeviceHostname {
+            device: q(device),
+            hostname,
+        },
+        Fact::DeviceVendor { device, vendor } => Fact::DeviceVendor {
+            device: q(device),
+            vendor,
+        },
+        Fact::DeviceDescription { device, text } => Fact::DeviceDescription {
+            device: q(device),
+            text,
+        },
+        Fact::DeviceRoleSignal { device, signal } => Fact::DeviceRoleSignal {
+            device: q(device),
+            signal,
+        },
+        Fact::DeviceCapability {
+            device,
+            capability,
+            detail,
+        } => Fact::DeviceCapability {
+            device: q(device),
+            capability,
+            detail,
+        },
+        Fact::GatewayFor { device, network } => Fact::GatewayFor {
+            device: q(device),
+            network,
+        },
+        Fact::RoutesTo {
+            device,
+            network,
+            next_hop,
+        } => Fact::RoutesTo {
+            device: q(device),
+            network,
+            next_hop,
+        },
+        Fact::AttachedTo { device, network } => Fact::AttachedTo {
+            device: q(device),
+            network,
+        },
+        Fact::ObservedBehind { device, via } => Fact::ObservedBehind {
+            device: q(device),
+            via: q(via),
+        },
+        Fact::OpaqueBoundary { device, why } => Fact::OpaqueBoundary {
+            device: q(device),
+            why,
+        },
+        // A bridge identifier is already a spanning-tree identity, unique within the tree
+        // it belongs to; the realm distinguishes trees.
+        Fact::BridgeLink {
+            bridge_id,
+            root_id,
+            port,
+        } => Fact::BridgeLink {
+            bridge_id: format!("{bridge_id}{}", realm.suffix()),
+            root_id: format!("{root_id}{}", realm.suffix()),
+            port,
+        },
+        // Networks, services, VLANs and resolutions carry no device identity; the network
+        // realm is applied where the node is created.
+        other => other,
     }
 }
 
@@ -1296,7 +1436,7 @@ mod tests {
         let linked = g.edges().any(|e| {
             e.relationship == Relationship::RoutesTo
                 && e.from == router
-                && e.to == NodeId::Network(routed)
+                && matches!(&e.to, NodeId::Network(net, _) if *net == routed)
         });
         assert!(
             linked,

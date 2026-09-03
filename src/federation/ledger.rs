@@ -64,6 +64,50 @@ impl std::fmt::Display for RejectReason {
     }
 }
 
+/// A verified bundle whose evidence is ready, but which the ledger has not yet committed.
+///
+/// The split exists because acceptance is not one decision. Verifying and decoding is
+/// cheap and reversible; advancing the replay cursor is neither. Doing both at once meant a
+/// bundle whose evidence the engine then declined -- because the run had already concluded
+/// -- was recorded as seen, went unacknowledged, and could never be resent: the peer would
+/// retry and be told the sequence was stale, for ever.
+///
+/// So: prepare, hand the evidence to the engine, persist the cursor, and only then commit.
+/// A prepared bundle that is dropped without committing leaves the ledger untouched, and
+/// the identical sequence can be offered again.
+#[derive(Debug)]
+#[must_use = "a prepared bundle must be committed or deliberately dropped"]
+pub struct Prepared {
+    peer: PeerId,
+    vantage: String,
+    sequence: u64,
+    evidence: Vec<TopologyEvidence>,
+}
+
+impl Prepared {
+    pub fn peer(&self) -> &PeerId {
+        &self.peer
+    }
+
+    pub fn vantage(&self) -> &str {
+        &self.vantage
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Takes the evidence, to hand to whoever owns the graph.
+    pub fn into_accepted(self) -> Accepted {
+        Accepted {
+            peer: self.peer,
+            vantage: self.vantage,
+            sequence: self.sequence,
+            evidence: self.evidence,
+        }
+    }
+}
+
 /// What accepting one bundle produced.
 #[derive(Debug, Clone)]
 pub struct Accepted {
@@ -107,8 +151,11 @@ impl PeerLedger {
         peers
     }
 
-    /// Verifies, authorises and converts a bundle.
-    pub fn accept(&mut self, bundle: &EvidenceBundle) -> Result<Accepted, RejectReason> {
+    /// Verifies, authorises and converts a bundle, without recording it as seen.
+    ///
+    /// Nothing here changes the ledger. The caller commits only once the evidence has an
+    /// owner and the cursor is durable; until then the bundle may be offered again.
+    pub fn prepare(&self, bundle: &EvidenceBundle) -> Result<Prepared, RejectReason> {
         let peer = bundle.verify().map_err(RejectReason::Unverifiable)?;
 
         if !self.is_paired(&peer) {
@@ -149,17 +196,42 @@ impl PeerLedger {
             return Err(RejectReason::Undecodable(undecodable));
         }
 
-        // Recorded only once the bundle is accepted in full, so a rejected bundle cannot
-        // advance the sequence and lock out the peer's later ones -- nor its own resend
-        // once this build understands it.
-        self.highest_sequence.insert(key, bundle.sequence);
-
-        Ok(Accepted {
+        Ok(Prepared {
             peer,
             vantage: bundle.vantage.clone(),
             sequence: bundle.sequence,
             evidence,
         })
+    }
+
+    /// Records a bundle as seen, so it is never applied again.
+    ///
+    /// Called last: after the evidence has been queued for the graph and after the inbound
+    /// cursor has been written to disk. Anything earlier risks a sequence marked consumed
+    /// by work that did not happen.
+    pub fn commit(&mut self, peer: &PeerId, sequence: u64) {
+        let entry = self.highest_sequence.entry(peer.to_hex()).or_default();
+        if sequence > *entry {
+            *entry = sequence;
+        }
+    }
+
+    /// Seeds the replay cursor from durable state at startup.
+    ///
+    /// Without this a restart forgets what it accepted, and a captured bundle replayed
+    /// afterwards is applied again.
+    pub fn restore_cursor(&mut self, peer: &PeerId, sequence: u64) {
+        self.commit(peer, sequence);
+    }
+
+    /// Verifies, converts and commits in one step.
+    ///
+    /// For callers with no separate delivery step -- tests, and single-threaded merges
+    /// where the evidence cannot be declined after the fact.
+    pub fn accept(&mut self, bundle: &EvidenceBundle) -> Result<Accepted, RejectReason> {
+        let prepared = self.prepare(bundle)?;
+        self.commit(&prepared.peer, prepared.sequence);
+        Ok(prepared.into_accepted())
     }
 }
 
@@ -329,6 +401,66 @@ mod tests {
         assert!(
             ledger.accept(&readable).is_ok(),
             "a resend at the same sequence must still be accepted"
+        );
+    }
+
+    #[test]
+    fn a_prepared_bundle_that_is_never_committed_can_be_offered_again() {
+        // The defect this closes: evidence the engine declined, because the run had
+        // already concluded, was still recorded as seen. The peer got no acknowledgement,
+        // resent, and was told the sequence was stale -- for ever.
+        let (mut ledger, key) = paired();
+        let bundle = EvidenceBundle::publish(&key, "br0", 1, &evidence());
+
+        let prepared = ledger.prepare(&bundle).expect("prepared");
+        assert_eq!(prepared.sequence(), 1);
+        // The delivery is declined, so the bundle is dropped without committing.
+        drop(prepared);
+
+        let second = ledger
+            .prepare(&bundle)
+            .expect("the same sequence is still offerable");
+        assert_eq!(second.sequence(), 1);
+
+        // Once committed, it is finished with.
+        ledger.commit(&key.id(), 1);
+        assert_eq!(
+            ledger.prepare(&bundle).unwrap_err(),
+            RejectReason::Stale {
+                seen: 1,
+                offered: 1
+            }
+        );
+    }
+
+    #[test]
+    fn preparing_a_bundle_changes_nothing_until_it_is_committed() {
+        let (ledger, key) = paired();
+        for sequence in [5u64, 5, 5] {
+            let bundle = EvidenceBundle::publish(&key, "br0", sequence, &evidence());
+            assert!(ledger.prepare(&bundle).is_ok(), "no state advanced");
+        }
+    }
+
+    #[test]
+    fn a_restored_cursor_rejects_a_bundle_captured_before_the_restart() {
+        // Replay protection must survive a restart, which means seeding the ledger from
+        // durable state rather than starting empty.
+        let (mut ledger, key) = paired();
+        ledger.restore_cursor(&key.id(), 9);
+
+        let replayed = EvidenceBundle::publish(&key, "br0", 9, &evidence());
+        assert_eq!(
+            ledger.prepare(&replayed).unwrap_err(),
+            RejectReason::Stale {
+                seen: 9,
+                offered: 9
+            }
+        );
+        assert!(
+            ledger
+                .prepare(&EvidenceBundle::publish(&key, "br0", 10, &evidence()))
+                .is_ok()
         );
     }
 

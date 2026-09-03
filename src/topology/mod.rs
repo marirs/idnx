@@ -5,6 +5,7 @@
 
 pub mod evidence;
 pub mod graph;
+pub mod realm;
 pub mod role;
 
 pub use evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};

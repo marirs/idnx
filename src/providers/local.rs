@@ -593,7 +593,7 @@ fd84:3bfe:bf84::/64                     fe80::1812:faa5:e4ee:1b9%en0            
             graph.edges().any(|e| {
                 e.relationship == Relationship::RoutesTo
                     && e.from == NodeId::Device(device.clone())
-                    && e.to == NodeId::Network(network)
+                    && matches!(&e.to, crate::topology::NodeId::Network(net, _) if *net == network)
             }),
             "the routed prefix must remain attached to its next hop"
         );

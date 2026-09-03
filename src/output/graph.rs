@@ -70,7 +70,7 @@ fn radius_for(kind: NodeKind) -> f32 {
 fn node_key(id: &NodeId) -> String {
     match id {
         NodeId::Interface(n) => format!("iface:{n}"),
-        NodeId::Network(n) => format!("net:{n}"),
+        NodeId::Network(n, realm) => format!("net:{n}{}", realm.suffix()),
         NodeId::Vlan(v) => format!("vlan:{v}"),
         NodeId::Device(d) => format!("dev:{d}"),
         NodeId::Service(a, p) => format!("svc:{a}:{p}"),
@@ -111,7 +111,7 @@ fn build_data(report: &DiscoveryReport) -> GraphData {
         if let Some(reason) = &node.opaque_reason {
             detail.push(format!("boundary: {}", safe(reason)));
         }
-        if let NodeId::Network(net) = &node.id {
+        if let NodeId::Network(net, _) = &node.id {
             let ifaces = graph.interfaces_for_network(net);
             if is_virtual_network(&ifaces) {
                 detail.push("virtual / VPN network".to_string());
@@ -283,8 +283,13 @@ const kinds = {};
 for (const n of DATA.nodes) kinds[n.kind] = n.color;
 const legend = document.getElementById('legend');
 for (const [kind, color] of Object.entries(kinds)) {
+  // The colour is ours, but the kind is a graph value; built rather than concatenated.
   const s = document.createElement('span');
-  s.innerHTML = '<i class="dot" style="background:' + color + '"></i>' + kind;
+  const dot = document.createElement('i');
+  dot.className = 'dot';
+  dot.style.background = color;
+  s.appendChild(dot);
+  s.appendChild(document.createTextNode(kind));
   legend.appendChild(s);
 }
 
@@ -401,16 +406,49 @@ canvas.addEventListener('wheel', ev => {
   view.k = Math.max(0.15, Math.min(4, view.k * f));
 }, {passive: false});
 
+// Every value below is chosen by the device it describes, or by a federated peer.
+// Built as elements with textContent rather than concatenated into innerHTML: a device
+// named '<img src=x onerror=...>' would otherwise execute the moment its node is clicked.
+// Escaping the JSON stops it terminating the script block; it does nothing about this.
+function row(text, className) {
+  const d = document.createElement('div');
+  d.className = className || 'row';
+  d.textContent = text;
+  return d;
+}
+
+function labelled(label, value) {
+  const d = document.createElement('div');
+  d.className = 'row';
+  d.appendChild(document.createTextNode(label));
+  const code = document.createElement('code');
+  code.textContent = value;
+  d.appendChild(code);
+  return d;
+}
+
 function show(n) {
   const el = document.getElementById('sel');
-  let h = '<div class="row"><strong>' + n.label + '</strong></div>';
-  h += '<div class="row">kind: <code>' + n.kind + '</code> &middot; confidence: <code>' + n.confidence + '</code></div>';
-  for (const d of n.detail) h += '<div class="row">' + d + '</div>';
+  el.replaceChildren();
+
+  const title = document.createElement('div');
+  title.className = 'row';
+  const strong = document.createElement('strong');
+  strong.textContent = n.label;
+  title.appendChild(strong);
+  el.appendChild(title);
+
+  el.appendChild(labelled('kind: ', n.kind));
+  el.appendChild(labelled('confidence: ', n.confidence));
+  for (const d of n.detail) el.appendChild(row(d));
+
   if (n.evidence.length) {
-    h += '<h2 style="margin-top:14px">Evidence</h2>';
-    for (const e of n.evidence) h += '<div class="row">' + e + '</div>';
+    const heading = document.createElement('h2');
+    heading.style.marginTop = '14px';
+    heading.textContent = 'Evidence';
+    el.appendChild(heading);
+    for (const e of n.evidence) el.appendChild(row(e));
   }
-  el.innerHTML = h;
 }
 </script>
 </body>
@@ -496,6 +534,18 @@ mod tests {
             oversized_scopes: Vec::new(),
             converged: true,
         }
+    }
+
+    #[test]
+    fn the_page_never_builds_markup_from_graph_values() {
+        // Escaping the embedded JSON stops a hostile name terminating the script block. It
+        // does nothing about the name being concatenated into markup afterwards, which is
+        // what made a device called "<img src=x onerror=...>" execute on click.
+        assert!(
+            !PAGE_TEMPLATE.contains("innerHTML ="),
+            "graph values must be set as text, not parsed as markup"
+        );
+        assert!(PAGE_TEMPLATE.contains("textContent"));
     }
 
     #[test]

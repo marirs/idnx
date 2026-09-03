@@ -411,3 +411,202 @@ fn a_peer_can_supply_identity_this_vantage_never_learned() {
         .expect("the sensor");
     assert!(sensor.provenance.iter().all(|p| p.is_remote()));
 }
+
+/// Two peers on unrelated networks that use the same identifiers.
+///
+/// This is the ordinary case, not a contrived one: `fe80::1%eth0`, `10.0.0.0/24` and
+/// locally administered MACs are what most networks look like. Keyed globally they collide,
+/// and A's topology ends up describing one router serving two unrelated subnets.
+mod colliding_peers {
+    use super::*;
+    use idnx::federation::bundle::EvidenceBundle;
+    use idnx::federation::identity::PeerKey;
+    use idnx::federation::ledger::PeerLedger;
+    use std::collections::HashSet;
+
+    /// What one peer reports: a link-local router, a private subnet, and a random-MAC host.
+    fn what_a_peer_reports(vantage: &str) -> Vec<TopologyEvidence> {
+        let router = DeviceKey::ScopedAddress("fe80::1".parse().unwrap(), vantage.to_string());
+        let host = DeviceKey::Mac("02:00:5e:00:00:01".to_string());
+        let lan: ipnet::IpNet = "10.0.0.0/24".parse().unwrap();
+
+        vec![
+            TopologyEvidence::new(
+                Fact::Network { prefix: lan },
+                EvidenceSource::InterfaceAddress,
+                Confidence::Observed,
+                vantage,
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: router.clone(),
+                    address: "fe80::1".parse().unwrap(),
+                },
+                EvidenceSource::NdpCache,
+                Confidence::Observed,
+                vantage,
+            ),
+            TopologyEvidence::new(
+                Fact::GatewayFor {
+                    device: router,
+                    network: lan,
+                },
+                EvidenceSource::KernelRoute,
+                Confidence::Observed,
+                vantage,
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: host.clone(),
+                    address: "10.0.0.9".parse().unwrap(),
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                vantage,
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceHostname {
+                    device: host,
+                    hostname: format!("host-on-{vantage}"),
+                },
+                EvidenceSource::Mdns,
+                Confidence::Observed,
+                vantage,
+            ),
+        ]
+    }
+
+    /// Merges two peers' identical-looking reports into one graph.
+    fn merged() -> TopologyGraph {
+        let mut graph = TopologyGraph::new();
+        let mut ledger = PeerLedger::new();
+
+        for vantage in ["eth0", "eth0"] {
+            let key = PeerKey::generate();
+            ledger.pair(key.id());
+            let bundle = EvidenceBundle::publish(&key, vantage, 1, &what_a_peer_reports(vantage));
+            let accepted = ledger.accept(&bundle).expect("accepted");
+            for record in accepted.evidence {
+                graph.absorb(record);
+            }
+        }
+        graph.finalize_roles();
+        graph
+    }
+
+    #[test]
+    fn two_peers_reporting_fe80_1_on_eth0_are_two_routers() {
+        // Merged, A would report one router that is the gateway for two unrelated /24s --
+        // a device that does not exist anywhere.
+        let graph = merged();
+        let routers: Vec<_> = graph
+            .nodes()
+            .filter(|n| n.addresses.iter().any(|a| a.to_string() == "fe80::1"))
+            .collect();
+        assert_eq!(routers.len(), 2, "one node per peer, not one shared node");
+
+        // Each is attributed to exactly one peer.
+        for router in &routers {
+            assert_eq!(
+                router.peer_origins().len(),
+                1,
+                "{:?}",
+                router.peer_origins()
+            );
+        }
+        assert_ne!(routers[0].peer_origins(), routers[1].peer_origins());
+    }
+
+    #[test]
+    fn two_peers_reporting_the_same_private_prefix_are_two_networks() {
+        let graph = merged();
+        let matching = graph
+            .nodes()
+            .filter(|n| {
+                matches!(&n.id, idnx::topology::NodeId::Network(net, _)
+                if net.to_string() == "10.0.0.0/24")
+            })
+            .count();
+        assert_eq!(matching, 2, "10.0.0.0/24 exists on both peers separately");
+
+        // And neither is traversable from here: this machine cannot sweep a peer's subnet.
+        assert!(
+            graph.local_networks().is_empty(),
+            "a peer's network must never be queued for local sweeping"
+        );
+    }
+
+    #[test]
+    fn two_peers_random_mac_hosts_do_not_merge() {
+        // 02:00:5e:00:00:01 is locally administered: it identifies nothing beyond its own
+        // link, and two peers both holding one is unremarkable.
+        let graph = merged();
+        let names: HashSet<String> = graph
+            .nodes()
+            .flat_map(|n| n.hostnames.iter().cloned())
+            .collect();
+        assert!(names.contains("host-on-eth0"));
+
+        let hosts = graph
+            .nodes()
+            .filter(|n| n.addresses.iter().any(|a| a.to_string() == "10.0.0.9"))
+            .count();
+        assert_eq!(hosts, 2);
+    }
+
+    #[test]
+    fn a_manufacturer_mac_seen_by_two_peers_still_merges() {
+        // The inverse must hold, or federation could never corroborate anything: an OUI
+        // address is unique worldwide, so two peers seeing it are seeing one device.
+        let mut graph = TopologyGraph::new();
+        let mut ledger = PeerLedger::new();
+        let device = DeviceKey::Mac("74:12:13:14:75:dc".to_string());
+
+        for vantage in ["eth0", "eth1"] {
+            let key = PeerKey::generate();
+            ledger.pair(key.id());
+            let record = TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: device.clone(),
+                    address: "203.0.113.7".parse().unwrap(),
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                vantage,
+            );
+            let bundle = EvidenceBundle::publish(&key, vantage, 1, &[record]);
+            for evidence in ledger.accept(&bundle).expect("accepted").evidence {
+                graph.absorb(evidence);
+            }
+        }
+        graph.finalize_roles();
+
+        let matching = graph
+            .nodes()
+            .filter(|n| n.addresses.iter().any(|a| a.to_string() == "203.0.113.7"))
+            .count();
+        assert_eq!(matching, 1, "one device, corroborated by two peers");
+
+        let node = graph
+            .nodes()
+            .find(|n| n.addresses.iter().any(|a| a.to_string() == "203.0.113.7"))
+            .expect("the device");
+        assert_eq!(node.peer_origins().len(), 2, "both peers are credited");
+    }
+
+    #[test]
+    fn local_identity_is_unaffected_by_the_scoping() {
+        // A run with no peers must produce exactly what it always did.
+        let mut graph = TopologyGraph::new();
+        for record in what_a_peer_reports("en0") {
+            graph.absorb(record);
+        }
+        graph.finalize_roles();
+
+        assert_eq!(
+            graph.local_networks(),
+            vec!["10.0.0.0/24".parse::<ipnet::IpNet>().unwrap()]
+        );
+        assert!(graph.nodes().all(|n| n.peer_origins().is_empty()));
+    }
+}
