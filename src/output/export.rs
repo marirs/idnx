@@ -118,20 +118,119 @@ pub struct NetworkExport {
     pub confidence: String,
     /// False when the network was too large to enumerate address by address.
     pub enumerated: bool,
-    /// The identity domain this network belongs to: `local` for a locally observed or
-    /// globally routable prefix, otherwise the peer and vantage whose namespace it is in.
-    /// Part of its identity, not decoration -- two peers can each hold a 10.0.0.0/24, and
-    /// merging by prefix alone would fuse two different networks.
+    /// The identity domain this network belongs to. Part of its identity, not decoration:
+    /// two peers can each hold a 10.0.0.0/24, and merging by prefix alone would fuse two
+    /// different networks.
     ///
     /// Says nothing about who observed it: a public prefix a peer reported shares the
     /// global identity domain and was never seen here. Use `observed_by`.
-    pub identity_domain: String,
-    /// Everyone who observed this network: `local`, and each peer that reported it.
-    pub observed_by: Vec<String>,
+    pub identity_domain: DomainExport,
+    /// Everyone who observed this network: the local machine, and each peer that reported
+    /// it.
+    pub observed_by: Vec<ObserverExport>,
     /// True when something on this machine observed it, which is also what decides whether
     /// it can be traversed from here.
     pub locally_observed: bool,
     pub evidence: Vec<EvidenceExport>,
+}
+
+/// An observation domain, in full.
+///
+/// Carries the complete peer identity rather than the short display form. Two peers sharing
+/// the first sixteen hex characters -- which can be ground out deliberately, and which
+/// chance eventually produces -- would otherwise be indistinguishable to anything consuming
+/// an export, reintroducing at the boundary the exact collision the internal identities
+/// were made full-length to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainExport {
+    /// `local` or `peer`.
+    pub kind: String,
+    /// Full 64-character peer identity, for a peer domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// The peer's own name for the interface it observed from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vantage: Option<String>,
+}
+
+impl DomainExport {
+    fn of(realm: &crate::topology::realm::Realm) -> Self {
+        match realm {
+            crate::topology::realm::Realm::Local => Self {
+                kind: "local".to_string(),
+                peer: None,
+                vantage: None,
+            },
+            crate::topology::realm::Realm::Peer { peer, vantage } => Self {
+                kind: "peer".to_string(),
+                peer: Some(peer.clone()),
+                vantage: Some(vantage.clone()),
+            },
+        }
+    }
+
+    /// Flat form, for the tabular formats.
+    fn flat(&self) -> String {
+        match (&self.peer, &self.vantage) {
+            (Some(peer), Some(vantage)) => format!("peer:{peer}/{vantage}"),
+            _ => self.kind.clone(),
+        }
+    }
+}
+
+/// One observer of a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserverExport {
+    /// `local` or `peer`.
+    pub kind: String,
+    /// Full peer identity, for a remote observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vantage: Option<String>,
+}
+
+impl ObserverExport {
+    fn of(origin: Option<&crate::topology::evidence::PeerOrigin>) -> Self {
+        match origin {
+            None => Self {
+                kind: "local".to_string(),
+                peer: None,
+                vantage: None,
+            },
+            Some(origin) => Self {
+                kind: "peer".to_string(),
+                peer: Some(origin.peer.clone()),
+                vantage: Some(origin.vantage.clone()),
+            },
+        }
+    }
+
+    fn flat(&self) -> String {
+        match (&self.peer, &self.vantage) {
+            (Some(peer), Some(vantage)) => format!("peer:{peer}/{vantage}"),
+            _ => self.kind.clone(),
+        }
+    }
+}
+
+/// Everyone who observed a node, in full.
+fn observers_of(node: &crate::topology::Node) -> Vec<ObserverExport> {
+    let mut out: Vec<ObserverExport> = Vec::new();
+    for provenance in &node.provenance {
+        let observer = ObserverExport::of(provenance.origin.as_ref());
+        if !out.contains(&observer) {
+            out.push(observer);
+        }
+    }
+    // Local first, then peers in a stable order.
+    out.sort_by(|a, b| {
+        (a.kind != "local")
+            .cmp(&(b.kind != "local"))
+            .then_with(|| a.peer.cmp(&b.peer))
+            .then_with(|| a.vantage.cmp(&b.vantage))
+    });
+    out
 }
 
 /// A VLAN observed on the wire.
@@ -140,8 +239,9 @@ pub struct NetworkExport {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VlanExport {
     pub id: u16,
-    /// The switched domain that uses this tag: `local`, or the peer and vantage that saw it.
-    pub observed_in: String,
+    /// The switched domain that uses this tag, with the full peer identity where it is a
+    /// peer's. Two peers' VLAN 20 are two VLANs.
+    pub observed_in: DomainExport,
     pub prefix: Option<String>,
     pub note: String,
 }
@@ -163,6 +263,9 @@ pub struct DeviceExport {
     /// What the device was observed doing, independent of the single word its role
     /// collapses to.
     pub capabilities: Vec<String>,
+    /// Everyone who observed this device: the local machine, and each peer that reported
+    /// it, each with a complete identity.
+    pub observed_by: Vec<ObserverExport>,
     /// Why visibility stops here, when it does.
     pub opaque_reason: Option<String>,
     pub confidence: String,
@@ -288,12 +391,12 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             enumerated: !report.oversized_scopes.contains(&net.prefix),
             // The identity domain: two peers can each hold a 10.0.0.0/24, and a consumer
             // merging exports by prefix alone would fuse them.
-            identity_domain: net.realm.label(),
+            identity_domain: DomainExport::of(&net.realm),
             // Who actually saw it, taken from provenance rather than from the identity
             // domain. A public prefix reported only by a peer carries a shared identity
             // and is still not something this vantage observed; a corroborated network has
             // several observers and must not be reduced to one.
-            observed_by: node.map(|n| n.observations()).unwrap_or_default(),
+            observed_by: node.map(observers_of).unwrap_or_default(),
             locally_observed: node.is_some_and(|n| n.locally_observed()),
             evidence: node.map(|n| evidence_of(&n.provenance)).unwrap_or_default(),
         });
@@ -301,7 +404,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
     networks.sort_by(|a, b| {
         a.cidr
             .cmp(&b.cidr)
-            .then_with(|| a.identity_domain.cmp(&b.identity_domain))
+            .then_with(|| a.identity_domain.flat().cmp(&b.identity_domain.flat()))
     });
 
     let vlans: Vec<VlanExport> = graph
@@ -310,7 +413,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             id: vlan.id,
             // The switched domain the tag belongs to. Two peers' VLAN 20 are two VLANs, and
             // a consumer merging by number alone would fuse them.
-            observed_in: vlan.realm.label(),
+            observed_in: DomainExport::of(&vlan.realm),
             prefix: None,
             note: "observed on the wire; no prefix evidence".to_string(),
         })
@@ -340,6 +443,9 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             role_evidence: crate::output::safe::all(node.role_signals.iter()),
             capabilities: crate::output::safe::all(node.capabilities.iter()),
             opaque_reason: node.opaque_reason.as_deref().map(crate::output::safe::text),
+            // Full identities, so a consumer can tell two peers apart even when their
+            // display forms coincide.
+            observed_by: observers_of(node),
             confidence: node.confidence.label().to_string(),
             evidence: evidence_of(&node.provenance),
         });
@@ -507,23 +613,31 @@ pub fn export(
             .unwrap_or_else(|| default_filename(format)),
     );
 
-    let content =
-        match format {
-            OutputFormat::Json => serde_json::to_string_pretty(&data)
-                .map_err(|e| format!("JSON serialisation failed: {e}"))?,
-            OutputFormat::Yaml => serde_yaml::to_string(&data)
-                .map_err(|e| format!("YAML serialisation failed: {e}"))?,
-            OutputFormat::Xml => quick_xml::se::to_string(&data)
-                .map_err(|e| format!("XML serialisation failed: {e}"))?,
-            OutputFormat::Csv => render_csv(&data)?,
-            OutputFormat::Text => render_text(&data),
-        };
+    let content = render(&data, format)?;
 
     let mut file = File::create(&path).map_err(|e| format!("Cannot create {path:?}: {e}"))?;
     file.write_all(content.as_bytes())
         .map_err(|e| format!("Cannot write {path:?}: {e}"))?;
 
     Ok(path)
+}
+
+/// Serialises an export in one format.
+///
+/// Separate from writing it so the same bytes can be examined without touching a disk.
+pub fn render(data: &TopologyExport, format: OutputFormat) -> Result<String, String> {
+    Ok(match format {
+        OutputFormat::Json => serde_json::to_string_pretty(data)
+            .map_err(|e| format!("JSON serialisation failed: {e}"))?,
+        OutputFormat::Yaml => {
+            serde_yaml::to_string(data).map_err(|e| format!("YAML serialisation failed: {e}"))?
+        }
+        OutputFormat::Xml => {
+            quick_xml::se::to_string(data).map_err(|e| format!("XML serialisation failed: {e}"))?
+        }
+        OutputFormat::Csv => render_csv(data)?,
+        OutputFormat::Text => render_text(data),
+    })
 }
 
 /// CSV is one row per device, carrying the evidence that classified it.
@@ -539,6 +653,7 @@ fn render_csv(data: &TopologyExport) -> Result<String, String> {
         "Capabilities",
         "Role Evidence",
         "Evidence Sources",
+        "Observed By",
         "Opaque Reason",
     ])
     .map_err(|e| format!("CSV header error: {e}"))?;
@@ -555,6 +670,13 @@ fn render_csv(data: &TopologyExport) -> Result<String, String> {
             &d.capabilities.join("; "),
             &d.role_evidence.join("; "),
             &sources.join("; "),
+            // Flattened, with full peer identities: the tabular formats have no place for
+            // a structure, and a truncated identity would let two peers collide here.
+            &d.observed_by
+                .iter()
+                .map(|o| o.flat())
+                .collect::<Vec<_>>()
+                .join("; "),
             d.opaque_reason.as_deref().unwrap_or(""),
         ])
         .map_err(|e| format!("CSV write error: {e}"))?;

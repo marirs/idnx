@@ -1217,3 +1217,335 @@ mod domain_safety {
         }
     }
 }
+
+/// The remaining cross-realm leaks: identity merging, scheduling, and export identities.
+mod cross_realm_leaks {
+    use super::*;
+    use idnx::engine::enrich::queue_from_graph;
+    use idnx::federation::bundle::EvidenceBundle;
+    use idnx::federation::identity::{PeerId, PeerKey};
+    use idnx::federation::ledger::PeerLedger;
+    use idnx::providers::target::DeviceTier;
+    use idnx::topology::graph::Relationship;
+    use std::collections::HashSet;
+
+    const VANTAGE: &str = "en0";
+    const INDEX: u32 = 3;
+
+    /// Wraps a graph in the minimum report an export needs.
+    fn sample_report(graph: TopologyGraph) -> idnx::engine::orchestrator::DiscoveryReport {
+        use idnx::engine::orchestrator::{DiscoveryReport, VisibilityReport};
+        use idnx::providers::{Vantage, VantageKind};
+
+        DiscoveryReport {
+            graph,
+            scope_runs: Vec::new(),
+            pivot_runs: Vec::new(),
+            coverage: Vec::new(),
+            enrichment_elapsed: std::time::Duration::ZERO,
+            enrichment_sequential_equivalent: std::time::Duration::ZERO,
+            probes_attempted: 0,
+            visibility: VisibilityReport {
+                vantage: Vantage {
+                    interface: VANTAGE.to_string(),
+                    kind: VantageKind::Wired,
+                    index: INDEX,
+                    capture_available: false,
+                },
+                blind_to: Vec::new(),
+                unavailable: Vec::new(),
+                binding_mode: idnx::net::socket::BindingMode::Unbound,
+                observed_frames: None,
+                accepted_facts: None,
+            },
+            oversized_scopes: Vec::new(),
+            converged: true,
+        }
+    }
+
+    /// Absorbs one peer's bundle into a graph.
+    fn absorb_from(graph: &mut TopologyGraph, key: &PeerKey, records: &[TopologyEvidence]) {
+        let mut ledger = PeerLedger::new();
+        ledger.pair(key.id());
+        let bundle = EvidenceBundle::publish(key, "eth0", 1, records);
+        for record in ledger
+            .accept_immediately(&bundle)
+            .expect("accepted")
+            .evidence
+        {
+            graph.absorb(record);
+        }
+    }
+
+    #[test]
+    fn a_remote_route_address_merges_with_its_arp_mac() {
+        // A kernel route names its next hop by address; the ARP table names the same device
+        // by MAC. Remotely, the address identity is qualified into a zone while the
+        // ownership map keys the interface and the domain separately -- so the lookup
+        // missed, the two stayed apart, and the routed network hung off a node of its own.
+        let key = PeerKey::generate();
+        let gateway_address: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let routed: ipnet::IpNet = "10.9.0.0/24".parse().unwrap();
+        let mac = DeviceKey::Mac("aa:bb:cc:dd:ee:01".to_string());
+
+        let mut graph = TopologyGraph::new();
+
+        // Route evidence first: an address-keyed gateway, before any MAC is known.
+        absorb_from(
+            &mut graph,
+            &key,
+            &[
+                TopologyEvidence::new(
+                    Fact::Network { prefix: routed },
+                    EvidenceSource::KernelRoute,
+                    Confidence::Observed,
+                    "eth0",
+                ),
+                TopologyEvidence::new(
+                    Fact::RoutesTo {
+                        device: DeviceKey::Address(gateway_address),
+                        network: routed,
+                        next_hop: None,
+                    },
+                    EvidenceSource::KernelRoute,
+                    Confidence::Observed,
+                    "eth0",
+                ),
+            ],
+        );
+
+        // Then the ARP table names the same address by MAC.
+        let mut ledger = PeerLedger::new();
+        ledger.pair(key.id());
+        let bundle = EvidenceBundle::publish(
+            &key,
+            "eth0",
+            2,
+            &[TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: mac,
+                    address: gateway_address,
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                "eth0",
+            )],
+        );
+        for record in ledger
+            .accept_immediately(&bundle)
+            .expect("accepted")
+            .evidence
+        {
+            graph.absorb(record);
+        }
+        graph.finalize_roles();
+
+        // One device holding that address, not two.
+        let devices: Vec<_> = graph
+            .nodes()
+            .filter(|n| n.addresses.contains(&gateway_address))
+            .collect();
+        assert_eq!(
+            devices.len(),
+            1,
+            "{:?}",
+            devices.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+        );
+
+        // And the route edge is attached to it.
+        let routes: Vec<_> = graph
+            .edges()
+            .filter(|e| e.relationship == Relationship::RoutesTo && e.from == devices[0].id)
+            .collect();
+        assert_eq!(routes.len(), 1, "the route must hang off the merged device");
+    }
+
+    #[test]
+    fn a_remote_pivot_cannot_change_a_local_hosts_queue_tier() {
+        // Both networks use 10.0.0.1. The peer's is a router; ours is an ordinary host.
+        // Keyed by address, the peer's role signal promoted our host to pivot priority.
+        let shared: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let local_device = DeviceKey::Mac("02:00:5e:00:00:aa".to_string());
+        let mut graph = TopologyGraph::new();
+
+        graph.absorb(TopologyEvidence::new(
+            Fact::DeviceAddress {
+                device: local_device.clone(),
+                address: shared,
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+            VANTAGE,
+        ));
+
+        let key = PeerKey::generate();
+        absorb_from(
+            &mut graph,
+            &key,
+            &[
+                TopologyEvidence::new(
+                    Fact::DeviceAddress {
+                        device: DeviceKey::Mac("02:00:5e:00:00:bb".to_string()),
+                        address: shared,
+                    },
+                    EvidenceSource::ArpCache,
+                    Confidence::Observed,
+                    "eth0",
+                ),
+                TopologyEvidence::new(
+                    Fact::DeviceRoleSignal {
+                        device: DeviceKey::Mac("02:00:5e:00:00:bb".to_string()),
+                        signal: RoleSignal::DefaultGateway,
+                    },
+                    EvidenceSource::DefaultGateway,
+                    Confidence::Observed,
+                    "eth0",
+                ),
+            ],
+        );
+        graph.finalize_roles();
+
+        let queued = queue_from_graph(&graph, &HashSet::new(), VANTAGE, INDEX);
+        assert_eq!(queued.len(), 1, "only the local device is ours to probe");
+        assert_eq!(queued[0].device, local_device);
+        assert_eq!(
+            queued[0].tier,
+            DeviceTier::Host,
+            "a peer's router must not raise a local host's priority"
+        );
+
+        // Nothing remote reaches the scheduling sets either.
+        assert!(graph.pivot_addresses().is_empty());
+        assert!(graph.candidate_addresses().is_empty());
+    }
+
+    #[test]
+    fn device_for_address_ignores_a_peer_only_private_address() {
+        // Its contract is "the device this machine can reach at this address". Handing back
+        // a peer's device answers a different question.
+        let address: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let mut graph = TopologyGraph::new();
+
+        absorb_from(
+            &mut graph,
+            &PeerKey::generate(),
+            &[TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: DeviceKey::Mac("02:00:5e:00:00:cc".to_string()),
+                    address,
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                "eth0",
+            )],
+        );
+        graph.finalize_roles();
+
+        assert!(
+            graph.nodes().any(|n| n.addresses.contains(&address)),
+            "the peer's device is in the graph"
+        );
+        assert!(
+            graph.device_for_address(&address).is_none(),
+            "but it is not reachable from here"
+        );
+    }
+
+    #[test]
+    fn two_peers_sharing_a_display_prefix_stay_distinct_in_every_export() {
+        // The display form truncates to sixteen characters. Exports must not, or two peers
+        // whose identities share a prefix -- which can be ground out -- become one to any
+        // consumer.
+        let mut graph = TopologyGraph::new();
+        let mut peers: Vec<PeerId> = Vec::new();
+
+        for suffix in ['1', '2'] {
+            let key = PeerKey::generate();
+            peers.push(key.id());
+            absorb_from(
+                &mut graph,
+                &key,
+                &[
+                    TopologyEvidence::new(
+                        Fact::Network {
+                            prefix: "10.0.0.0/24".parse().unwrap(),
+                        },
+                        EvidenceSource::InterfaceAddress,
+                        Confidence::Observed,
+                        "eth0",
+                    ),
+                    TopologyEvidence::new(
+                        Fact::Vlan { id: 20 },
+                        EvidenceSource::Stp,
+                        Confidence::Observed,
+                        "eth0",
+                    ),
+                    TopologyEvidence::new(
+                        Fact::DeviceAddress {
+                            device: DeviceKey::Mac(format!("02:00:5e:00:00:{suffix}{suffix}")),
+                            address: "10.0.0.5".parse().unwrap(),
+                        },
+                        EvidenceSource::ArpCache,
+                        Confidence::Observed,
+                        "eth0",
+                    ),
+                ],
+            );
+        }
+        graph.finalize_roles();
+
+        let report = sample_report(graph);
+        let export = idnx::output::export::build_export(&report);
+
+        // Networks: two, each naming its own peer in full.
+        assert_eq!(export.networks.len(), 2);
+        let mut named: Vec<String> = export
+            .networks
+            .iter()
+            .filter_map(|n| n.identity_domain.peer.clone())
+            .collect();
+        named.sort();
+        assert_eq!(named.len(), 2);
+        assert_ne!(named[0], named[1]);
+        for peer in &named {
+            assert_eq!(peer.len(), 64, "a full identity, not a display form");
+            assert!(peers.iter().any(|p| p.to_hex() == *peer));
+        }
+
+        // VLANs: likewise.
+        let mut vlan_peers: Vec<String> = export
+            .vlans
+            .iter()
+            .filter_map(|v| v.observed_in.peer.clone())
+            .collect();
+        vlan_peers.sort();
+        assert_eq!(vlan_peers.len(), 2);
+        assert_ne!(vlan_peers[0], vlan_peers[1]);
+
+        // Devices: each observed by exactly one peer, identified in full.
+        let device_peers: Vec<String> = export
+            .devices
+            .iter()
+            .flat_map(|d| d.observed_by.iter())
+            .filter_map(|o| o.peer.clone())
+            .collect();
+        assert_eq!(device_peers.len(), 2, "{device_peers:?}");
+        assert_ne!(device_peers[0], device_peers[1]);
+
+        // And every tabular format keeps them apart too.
+        for format in [
+            idnx::output::export::OutputFormat::Json,
+            idnx::output::export::OutputFormat::Yaml,
+            idnx::output::export::OutputFormat::Xml,
+            idnx::output::export::OutputFormat::Csv,
+        ] {
+            let rendered = idnx::output::export::render(&export, format).expect("renders");
+            for peer in &named {
+                assert!(
+                    rendered.contains(peer.as_str()),
+                    "{format:?} lost the full identity {peer}"
+                );
+            }
+        }
+    }
+}

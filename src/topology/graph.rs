@@ -12,6 +12,7 @@ use ipnet::IpNet;
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
 use super::realm::{
     Realm, address_realm, network_realm, qualify_device, realm_of_key, scoped_realm,
+    split_qualified_zone,
 };
 use super::role::{DeviceRole, score_role};
 
@@ -778,13 +779,35 @@ impl TopologyGraph {
     /// behaviour only, so a device is never here because of who manufactured it.
     pub fn pivot_addresses(&self) -> Vec<IpAddr> {
         let mut out: Vec<IpAddr> = self
-            .role_weights
-            .keys()
-            .filter_map(|id| self.nodes.get(id))
-            .flat_map(|node| node.addresses.iter().copied())
+            .pivot_devices()
+            .into_iter()
+            .filter_map(|key| self.nodes.get(&NodeId::Device(key)))
+            .flat_map(|node| node.locally_observed_addresses())
             // A link-local or loopback address cannot be interrogated meaningfully, and
             // queueing one only produces a guaranteed timeout in the coverage report.
             .filter(is_interrogable)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Devices with established infrastructure behaviour, by identity.
+    ///
+    /// Keyed by device, not by address, and restricted to devices this machine observed. A
+    /// bare address crossed domains: a peer's router at 10.0.0.1 would raise an unrelated
+    /// local host at the same address to pivot priority, and a device nothing here has seen
+    /// cannot be interrogated from here in any case.
+    pub fn pivot_devices(&self) -> Vec<DeviceKey> {
+        let mut out: Vec<DeviceKey> = self
+            .role_weights
+            .keys()
+            .filter_map(|id| match id {
+                NodeId::Device(key) => self.nodes.get(id).map(|node| (key, node)),
+                _ => None,
+            })
+            .filter(|(_, node)| node.locally_observed())
+            .map(|(key, _)| key.clone())
             .collect();
         out.sort();
         out.dedup();
@@ -801,16 +824,37 @@ impl TopologyGraph {
     /// A candidate hint schedules work and nothing more. It never raises confidence and
     /// never appears as topology; only what the interrogation returns can do that.
     pub fn candidate_addresses(&self) -> Vec<IpAddr> {
-        let established: std::collections::HashSet<IpAddr> =
-            self.pivot_addresses().into_iter().collect();
+        let established: std::collections::HashSet<DeviceKey> =
+            self.pivot_devices().into_iter().collect();
 
         let mut out: Vec<IpAddr> = self
+            .candidate_devices()
+            .into_iter()
+            .filter(|key| !established.contains(key))
+            .filter_map(|key| self.nodes.get(&NodeId::Device(key)))
+            .flat_map(|node| node.locally_observed_addresses())
+            .filter(is_interrogable)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Devices worth interrogating on a hint, by identity.
+    ///
+    /// Same rule as [`TopologyGraph::pivot_devices`]: keyed by device and restricted to
+    /// what this machine observed, so a peer's appliance cannot schedule work against a
+    /// local host that merely shares its address.
+    pub fn candidate_devices(&self) -> Vec<DeviceKey> {
+        let mut out: Vec<DeviceKey> = self
             .nodes
             .values()
+            .filter(|node| node.locally_observed())
             .filter(|node| self.is_infrastructure_candidate(node))
-            .flat_map(|node| node.addresses.iter().copied())
-            .filter(is_interrogable)
-            .filter(|a| !established.contains(a))
+            .filter_map(|node| match &node.id {
+                NodeId::Device(key) => Some(key.clone()),
+                _ => None,
+            })
             .collect();
         out.sort();
         out.dedup();
@@ -853,23 +897,26 @@ impl TopologyGraph {
     /// Resolves the canonical device key for an address, if one is already known.
     /// Resolves the canonical device key for a locally observed address.
     ///
-    /// Local domain first, because a caller with only an address is asking about something
-    /// this machine can reach. A peer's device is reachable only through that peer.
+    /// Local only. A caller holding a bare address is asking about something this machine
+    /// can reach, and falling back to a remote domain answered a different question --
+    /// handing back a peer's device for an address that exists on both networks.
     pub fn device_for_address(&self, addr: &IpAddr) -> Option<&DeviceKey> {
-        self.address_owner
+        let owner = self
+            .address_owner
             .get(&(*addr, None, Realm::Local))
             .or_else(|| {
                 self.address_owner
                     .iter()
                     .find(|((a, _, realm), _)| a == addr && realm.is_local())
                     .map(|(_, owner)| owner)
-            })
-            .or_else(|| {
-                self.address_owner
-                    .iter()
-                    .find(|((a, _, _), _)| a == addr)
-                    .map(|(_, owner)| owner)
-            })
+            })?;
+
+        // A globally unique address shares the local identity domain, so being stored
+        // there is not proof this machine saw it. The node's own provenance is.
+        self.nodes
+            .get(&NodeId::Device(owner.clone()))
+            .filter(|node| node.locally_observed())
+            .map(|_| owner)
     }
 
     /// Folds one piece of evidence into the graph.
@@ -1176,9 +1223,12 @@ impl TopologyGraph {
             // address while the neighbour cache names the same device by MAC; without this
             // the route's relationship stays stranded on a node of its own and the routed
             // network appears unattached to any router.
+            // The zone is split back into its interface part and its domain: the ownership
+            // map keys them separately, so looking up the whole qualified string found
+            // nothing and the merge never happened.
             let lookup = match key {
                 DeviceKey::Address(addr) => Some((*addr, None)),
-                DeviceKey::ScopedAddress(addr, zone) => Some((*addr, Some(zone.clone()))),
+                DeviceKey::ScopedAddress(addr, zone) => Some((*addr, split_qualified_zone(zone).0)),
                 DeviceKey::Mac(_) => None,
             };
             let Some((address, zone)) = lookup else {
@@ -1325,9 +1375,15 @@ impl TopologyGraph {
         match key {
             DeviceKey::Mac(_) => key.clone(),
             DeviceKey::Address(_) | DeviceKey::ScopedAddress(_, _) => {
-                let zone = match key {
-                    DeviceKey::ScopedAddress(_, zone) => Some(zone.clone()),
-                    _ => None,
+                // The zone on a qualified identity carries the domain as well as the
+                // interface, but the ownership map is keyed by the interface alone with the
+                // domain in its own field. Looking up the whole qualified string never
+                // matched, so a remote route's address identity could not find the MAC the
+                // remote ARP table had already recorded -- and the routed network stayed
+                // stranded on a node of its own.
+                let (zone, _) = match key {
+                    DeviceKey::ScopedAddress(_, zone) => split_qualified_zone(zone),
+                    _ => (None, Realm::Local),
                 };
                 if let Some(addr) = key.address()
                     && let Some(owner) = self.owner_in_realm(&addr, zone.as_deref(), realm)

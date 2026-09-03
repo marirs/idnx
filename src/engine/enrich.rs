@@ -219,8 +219,10 @@ pub fn queue_from_graph(
     vantage: &str,
     index: u32,
 ) -> Vec<InterrogationTarget> {
-    let pivots: HashSet<IpAddr> = graph.pivot_addresses().into_iter().collect();
-    let candidates: HashSet<IpAddr> = graph.candidate_addresses().into_iter().collect();
+    // By device identity, not by address. A peer's router at 10.0.0.1 would otherwise
+    // raise an unrelated local host at the same address to pivot priority.
+    let pivots: HashSet<DeviceKey> = graph.pivot_devices().into_iter().collect();
+    let candidates: HashSet<DeviceKey> = graph.candidate_devices().into_iter().collect();
 
     let mut queue = Vec::new();
     for node in graph.nodes() {
@@ -244,9 +246,9 @@ pub fn queue_from_graph(
             continue;
         }
 
-        let tier = if node.addresses.iter().any(|a| pivots.contains(a)) {
+        let tier = if pivots.contains(key) {
             DeviceTier::EstablishedPivot
-        } else if node.addresses.iter().any(|a| candidates.contains(a)) {
+        } else if candidates.contains(key) {
             DeviceTier::Candidate
         } else {
             DeviceTier::Host
