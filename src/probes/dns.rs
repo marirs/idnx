@@ -47,18 +47,34 @@ pub struct DnsIdentity {
     pub transport: DnsTransport,
 }
 
+/// The CHAOS-class identification names a resolver may publish.
+///
+/// Three, because implementations differ: BIND answers `version.bind` and `hostname.bind`,
+/// while `id.server` is the RFC 5001 name and is what several others use. Asking all three
+/// costs three datagrams and is the difference between identifying a resolver and knowing
+/// only that something answered on port 53.
+pub const IDENTITY_NAMES: &[&str] = &["version.bind", "hostname.bind", "id.server"];
+
 /// Builds a `version.bind` CHAOS TXT query.
 ///
 /// Transaction id is supplied by the caller so the response can be matched to it; an
 /// unmatched id means something other than an answer to this question arrived.
 pub fn version_bind_query(transaction_id: u16) -> Vec<u8> {
-    let mut query = Vec::with_capacity(30);
+    chaos_txt_query(transaction_id, "version.bind")
+}
+
+/// Builds a CHAOS-class TXT query for one identification name.
+pub fn chaos_txt_query(transaction_id: u16, name: &str) -> Vec<u8> {
+    let mut query = Vec::with_capacity(32);
     query.extend_from_slice(&transaction_id.to_be_bytes());
     // Flags: standard query, recursion desired.
     query.extend_from_slice(&[0x01, 0x00]);
     // One question, no answer/authority/additional records.
     query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    for label in ["version", "bind"] {
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
         query.push(label.len() as u8);
         query.extend_from_slice(label.as_bytes());
     }
@@ -175,6 +191,28 @@ pub async fn confirm_dns_tcp(
         confirm_over_tcp(target, binding, &query, transaction_id, timeout_duration).await?;
     identity.transport = DnsTransport::Tcp;
     Some(identity)
+}
+
+/// Asks a resolver to identify itself under one CHAOS name.
+///
+/// `Some` only where the resolver published text. A resolver that answers the query without
+/// content has confirmed it speaks DNS and disclosed no identity, and an identity never
+/// creates a network -- it says what the software is, not what it routes.
+pub async fn identify(
+    target: &Endpoint,
+    name: &str,
+    binding: &SocketBinding,
+    timeout_duration: Duration,
+) -> Option<String> {
+    let transaction_id = transaction_id_for(target);
+    let query = chaos_txt_query(transaction_id, name);
+    let identity = match confirm_over_udp(target, binding, &query, transaction_id, timeout_duration)
+        .await
+    {
+        Some(identity) => identity,
+        None => confirm_over_tcp(target, binding, &query, transaction_id, timeout_duration).await?,
+    };
+    identity.version
 }
 
 /// Asks a device to answer a DNS query, over UDP first and then TCP.
@@ -361,6 +399,30 @@ mod tests {
         response.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x10]);
         let identity = parse_dns_response(&response, 0x0009).expect("a response");
         assert!(identity.version.is_none());
+    }
+
+    #[test]
+    fn every_identification_name_produces_a_well_formed_query() {
+        // Implementations differ over which of these they answer, and asking only one
+        // identified a resolver as anonymous when it was simply answering a different name.
+        for name in IDENTITY_NAMES {
+            let query = chaos_txt_query(0x1234, name);
+            assert_eq!(&query[0..2], &[0x12, 0x34]);
+            assert_eq!(u16::from_be_bytes([query[4], query[5]]), 1, "one question");
+            assert_eq!(
+                &query[query.len() - 4..],
+                &[0x00, 0x10, 0x00, 0x03],
+                "TXT in the CHAOS class"
+            );
+            for label in name.split('.') {
+                let mut encoded = vec![label.len() as u8];
+                encoded.extend_from_slice(label.as_bytes());
+                assert!(
+                    query.windows(encoded.len()).any(|w| w == encoded),
+                    "{name} is missing the label {label}"
+                );
+            }
+        }
     }
 
     #[test]

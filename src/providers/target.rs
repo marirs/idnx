@@ -557,6 +557,13 @@ async fn confirm_protocols(
     coverage: &mut DeviceCoverage,
 ) -> Vec<TopologyEvidence> {
     let address = target.address;
+    // Identification reads need a longer window than a port probe. A banner arrives after
+    // the server has finished negotiating and a web interface after it has built a page,
+    // and the per-port timeout that decides whether a socket opens is far too short for
+    // either -- a device that identifies itself perfectly well was being recorded as
+    // silent.
+    let identify_timeout = timeout.max(Duration::from_millis(2500));
+
     let mut out = Vec::new();
 
     // TLS: the certificate names the device far more reliably than any banner.
@@ -664,6 +671,32 @@ async fn confirm_protocols(
         }
     }
 
+    // The identification names a resolver may publish. Implementations differ over which
+    // they answer, and identity alone never creates a network.
+    if open_ports.contains(&53) {
+        for name in crate::probes::dns::IDENTITY_NAMES {
+            if let Some(text) =
+                crate::probes::dns::identify(target, name, binding, identify_timeout).await
+            {
+                coverage
+                    .protocols_confirmed
+                    .push(format!("dns/{name} identity"));
+                out.push(
+                    TopologyEvidence::new(
+                        Fact::DeviceDescription {
+                            device: device.clone(),
+                            text: format!("{name}: {text}"),
+                        },
+                        EvidenceSource::UnicastDns,
+                        Confidence::Advertised,
+                        vantage,
+                    )
+                    .with_detail(format!("CHAOS TXT {name}")),
+                );
+            }
+        }
+    }
+
     // DNS over TCP, for a resolver that answers only there. UDP was already attempted in
     // the control plane, so this runs only when that found nothing.
     if open_ports.contains(&53)
@@ -676,6 +709,43 @@ async fn confirm_protocols(
         out.extend(dns_evidence(target, device, &identity, vantage, coverage));
     }
 
+    // Telnet: an appliance often states its vendor and model in the greeting and nowhere
+    // else. Read-only by construction -- nothing is written to the socket, the option
+    // negotiation is not answered, no credentials are sent and no command is issued.
+    for &port in open_ports {
+        if port != 23 {
+            continue;
+        }
+        match crate::probes::telnet::read_banner(target, port, binding, identify_timeout).await {
+            Some(banner) if !banner.lines.is_empty() => {
+                coverage
+                    .protocols_confirmed
+                    .push(format!("telnet/{port} identity"));
+                out.push(
+                    TopologyEvidence::new(
+                        Fact::DeviceDescription {
+                            device: device.clone(),
+                            text: banner.text(),
+                        },
+                        EvidenceSource::TcpProbe,
+                        // The device's own claim about itself.
+                        Confidence::Advertised,
+                        vantage,
+                    )
+                    .with_detail(banner.evidence()),
+                );
+            }
+            // Negotiated but said nothing: telnet is there and offered no identity. Told
+            // apart from a port that answered nothing at all.
+            Some(_) => coverage
+                .protocols_confirmed
+                .push(format!("telnet/{port} negotiated, no greeting")),
+            None => coverage
+                .protocols_confirmed
+                .push(format!("telnet/{port} no greeting")),
+        }
+    }
+
     // HTTP: the status line, Server header and page title are the device describing
     // itself, and on consumer gear they are often the only identity available without
     // credentials. A challenge for credentials is recorded as a finding in its own right.
@@ -683,11 +753,61 @@ async fn confirm_protocols(
         if !crate::probes::http::HTTP_PORTS.contains(&port) {
             continue;
         }
-        let Some(identity) = crate::probes::http::probe_http(target, port, binding, timeout).await
+        let Some(identity) =
+            crate::probes::http::identify(target, port, binding, identify_timeout).await
         else {
+            coverage
+                .protocols_confirmed
+                .push(format!("http/{port} no response"));
             continue;
         };
-        coverage.protocols_confirmed.push(format!("http/{port}"));
+        coverage
+            .protocols_confirmed
+            .push(match &identity.redirected_to {
+                Some(_) => format!("http/{port} identity, followed a same-origin redirect"),
+                None => format!("http/{port} identity"),
+            });
+
+        // The only thing on this page that may create a network: an explicit prefix, or an
+        // address beside something the page itself calls a netmask. A bare address is never
+        // enough, however router-like the device looks.
+        for stated in &identity.prefixes {
+            coverage
+                .protocols_confirmed
+                .push(format!("http/{port} stated prefix {}", stated.prefix));
+            out.push(
+                TopologyEvidence::new(
+                    Fact::Network {
+                        prefix: stated.prefix,
+                    },
+                    EvidenceSource::TcpProbe,
+                    // The device said it. Nothing here observed the network.
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(format!(
+                    "stated on http://{}:{port} as {:?}",
+                    target.host_literal(),
+                    crate::text::clip(&stated.source_text, 120)
+                )),
+            );
+            out.push(
+                TopologyEvidence::new(
+                    Fact::RoutesTo {
+                        device: device.clone(),
+                        network: stated.prefix,
+                        next_hop: None,
+                    },
+                    EvidenceSource::TcpProbe,
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(format!(
+                    "stated on its own web interface as {:?}",
+                    crate::text::clip(&stated.source_text, 120)
+                )),
+            );
+        }
         if identity.requires_authentication() {
             coverage.auth_required.push(port);
         }

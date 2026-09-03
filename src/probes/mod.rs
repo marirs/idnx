@@ -11,5 +11,6 @@ pub mod path;
 pub mod rip;
 pub mod smb;
 pub mod snmp;
+pub mod telnet;
 pub mod tls;
 pub mod upnp;
