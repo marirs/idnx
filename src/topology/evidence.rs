@@ -386,6 +386,22 @@ pub enum Fact {
     /// A device is reachable only through another, which forwards for it.
     ObservedBehind { device: DeviceKey, via: DeviceKey },
 
+    /// An interface forwarded a probe toward a destination, at a measured distance.
+    ///
+    /// The complete finding, kept together because the parts are meaningless apart: an
+    /// interface forwards *toward something*, from *one vantage*, at *one distance*, and a
+    /// different destination may take a different path. It establishes that the interface
+    /// forwards IPv4 and nothing else -- not a prefix, not opacity, not ownership.
+    ForwardsToward {
+        device: DeviceKey,
+        /// Where the probe was headed.
+        toward: IpAddr,
+        /// Hop distance. 1 is this machine's default gateway.
+        distance: u8,
+        /// The previous responding hop, when one answered.
+        previous: Option<DeviceKey>,
+    },
+
     /// A device terminates visibility: it forwards, but nothing behind it is observable.
     OpaqueBoundary { device: DeviceKey, why: String },
 

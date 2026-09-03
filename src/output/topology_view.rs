@@ -22,6 +22,7 @@ pub fn render(report: &DiscoveryReport, start: &StartingScope) {
     let vantage = report.visibility.vantage.interface.as_str();
     render_infrastructure(&report.graph, vantage);
     render_hosts(&report.graph, vantage);
+    render_egress_path(&report.graph, vantage);
     render_boundaries(&report.graph, vantage);
     render_device_table(&report.graph, vantage);
     render_coverage(report);
@@ -331,6 +332,11 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
     );
 
     for node in all_hosts {
+        // Routers on the way out have their own section: they are not devices on this
+        // network, and repeating them here would imply they are.
+        if graph.is_egress_only(&node.id) {
+            continue;
+        }
         let addrs = display_addresses(node, vantage);
         let name = node
             .hostnames
@@ -372,6 +378,43 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
                 safe::all(node.capabilities.iter()).join(", ").green()
             );
         }
+    }
+}
+
+/// Routers on the way out, listed apart from the operator's own topology.
+///
+/// Separate on purpose. These interfaces answered a TTL-expired probe, which establishes
+/// that they forward and nothing more: they may belong to the operator, to a landlord, or
+/// to a carrier, and hop count cannot tell them apart. Listing them among discovered
+/// infrastructure would imply they are part of the network being mapped, and that they
+/// expose something of it.
+fn render_egress_path(graph: &TopologyGraph, vantage: &str) {
+    let hops = graph.egress_path();
+    if hops.is_empty() {
+        return;
+    }
+
+    println!("\n{}", "Egress path".bold());
+    println!(
+        "    {}",
+        "routers that forwarded a probe out of this vantage; ownership unknown, and none \
+         has disclosed a network"
+            .dimmed()
+    );
+    for (distance, node) in &hops {
+        let addresses = display_addresses(node, vantage).join(", ");
+        let services = services_for(graph, node);
+        let note = if services.is_empty() {
+            "no service answered".to_string()
+        } else {
+            services.join(", ")
+        };
+        println!(
+            "  ├── hop {} {} {}",
+            distance,
+            addresses.cyan().bold(),
+            format!("[{note}]").dimmed()
+        );
     }
 }
 

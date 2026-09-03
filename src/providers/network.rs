@@ -229,30 +229,33 @@ impl DiscoveryProvider for VendorDiscoveryProvider {
     }
 }
 
-/// Router interfaces beyond the first hop.
+/// Router interfaces on the default egress path.
 ///
-/// The kernel routing table names exactly one router: the default gateway. Every other
-/// router on the way out is invisible to every provider that reads local state -- and yet
-/// they are real, frequently reachable, and often the only devices that know the prefixes
-/// of the networks behind them. On the network this was written against, the second hop is
-/// a router with an open management interface that nothing else here ever saw.
+/// The kernel routing table names exactly one router: the default gateway. The routers
+/// beyond it are invisible to every provider that reads local state, and yet they are real
+/// and frequently reachable -- on the network this was written against, the second hop has
+/// telnet, DNS and HTTP open and nothing else here had ever seen it.
 ///
-/// A hop is a device, never a prefix. A router answering from one of its interfaces proves
-/// that it forwards; it says nothing about the size or shape of the network that address
-/// belongs to, and deriving one would be inventing topology. So each hop enters the graph
-/// as a device with observed forwarding behaviour, which makes it a pivot -- and the staged
-/// interrogation that follows is what may legitimately extract a prefix from it.
+/// What this establishes, and only this: an interface at that address forwarded one packet,
+/// at that distance, toward one destination, from this vantage. Not a prefix -- the address
+/// says nothing about the network it belongs to. Not opacity -- a router that forwards is
+/// not thereby hiding anything, and calling every hop a boundary asserted a NAT nobody had
+/// observed. Not ownership -- hop count is not an administrative boundary, and a router a
+/// few hops out is as likely to be a carrier's as the operator's.
+///
+/// The value is that each hop becomes a device with observed forwarding behaviour, which
+/// makes it a pivot. Interrogating it is what may legitimately produce a prefix, and a
+/// prefix is the only thing that creates a network.
 pub struct PathDiscoveryProvider;
 
 impl DiscoveryProvider for PathDiscoveryProvider {
     fn name(&self) -> &'static str {
-        "path-discovery"
+        "egress-path"
     }
 
     fn applies(&self, context: &DiscoveryContext) -> bool {
         // Not aimed at a single device. The path out belongs to the vantage rather than to
-        // any one scope, and absorbing the same hops twice is idempotent, so running it
-        // per scope costs a few packets and keeps the provider free of run-level state.
+        // any one scope, and absorbing the same hops twice is idempotent.
         context.target.is_none()
     }
 
@@ -281,8 +284,8 @@ impl DiscoveryProvider for PathDiscoveryProvider {
                     vantage,
                 ));
 
-                // Behaviour, not manufacture: this device decremented our packet's hop
-                // count and said so. That is what a router does.
+                // Behaviour, not manufacture: this interface decremented our packet's hop
+                // count and said so. That is what forwarding is.
                 out.push(
                     TopologyEvidence::new(
                         Fact::DeviceRoleSignal {
@@ -293,42 +296,40 @@ impl DiscoveryProvider for PathDiscoveryProvider {
                         Confidence::Observed,
                         vantage,
                     )
-                    .with_detail(format!("forwarded a probe at hop {}", hop.distance)),
+                    .with_detail(format!(
+                        "answered a TTL-expired probe at hop {} toward {}",
+                        hop.distance, hop.toward
+                    )),
                 );
 
                 out.push(TopologyEvidence::new(
                     Fact::DeviceCapability {
                         device: device.clone(),
                         capability: Capability::Ipv4Forwarding,
-                        detail: Some(format!("hop {} on the path out", hop.distance)),
+                        detail: Some(format!(
+                            "hop {} on the egress path toward {}",
+                            hop.distance, hop.toward
+                        )),
                     },
                     EvidenceSource::IcmpProbe,
                     Confidence::Observed,
                     vantage,
                 ));
 
-                // Beyond the first hop the router is upstream of this vantage's own
-                // gateway, so whatever it serves is not on any link reachable from here
-                // until the device itself discloses it. Recorded as an unresolved boundary
-                // rather than omitted, and never as a synthesised prefix.
-                if hop.distance > 1 {
-                    out.push(
-                        TopologyEvidence::new(
-                            Fact::OpaqueBoundary {
-                                device,
-                                why: format!(
-                                    "upstream router at hop {}; forwards traffic but has \
-                                     disclosed no prefix for what lies behind it",
-                                    hop.distance
-                                ),
-                            },
-                            EvidenceSource::IcmpProbe,
-                            Confidence::Observed,
-                            vantage,
-                        )
-                        .with_detail("interrogated for routing evidence; nothing yet disclosed"),
-                    );
-                }
+                // The path itself, with everything needed to reproduce the finding. No
+                // boundary is asserted: that would need separate evidence of a NAT, a
+                // firewall, or topology being withheld.
+                out.push(TopologyEvidence::new(
+                    Fact::ForwardsToward {
+                        device,
+                        toward: hop.toward,
+                        distance: hop.distance,
+                        previous: hop.previous.map(DeviceKey::Address),
+                    },
+                    EvidenceSource::IcmpProbe,
+                    Confidence::Observed,
+                    vantage,
+                ));
             }
 
             out

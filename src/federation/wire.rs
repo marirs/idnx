@@ -95,6 +95,13 @@ pub enum WireFact {
         device: WireDevice,
         via: WireDevice,
     },
+    ForwardsToward {
+        device: WireDevice,
+        toward: String,
+        distance: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<WireDevice>,
+    },
     OpaqueBoundary {
         device: WireDevice,
         why: String,
@@ -241,6 +248,17 @@ impl WireEvidence {
                 device: WireDevice::from_key(device),
                 via: WireDevice::from_key(via),
             },
+            Fact::ForwardsToward {
+                device,
+                toward,
+                distance,
+                previous,
+            } => WireFact::ForwardsToward {
+                device: WireDevice::from_key(device),
+                toward: toward.to_string(),
+                distance: *distance,
+                previous: previous.as_ref().map(WireDevice::from_key),
+            },
             Fact::OpaqueBoundary { device, why } => WireFact::OpaqueBoundary {
                 device: WireDevice::from_key(device),
                 why: why.clone(),
@@ -349,6 +367,17 @@ impl WireEvidence {
             WireFact::ObservedBehind { device, via } => Fact::ObservedBehind {
                 device: device.to_key()?,
                 via: via.to_key()?,
+            },
+            WireFact::ForwardsToward {
+                device,
+                toward,
+                distance,
+                previous,
+            } => Fact::ForwardsToward {
+                device: device.to_key()?,
+                toward: parse_address(toward)?,
+                distance: *distance,
+                previous: previous.as_ref().map(|p| p.to_key()).transpose()?,
             },
             WireFact::OpaqueBoundary { device, why } => Fact::OpaqueBoundary {
                 device: device.to_key()?,
@@ -479,6 +508,19 @@ impl WireFact {
             WireFact::ObservedBehind { device, via } => {
                 let mut out = device.text_fields();
                 out.extend(via.text_fields());
+                out
+            }
+            WireFact::ForwardsToward {
+                device,
+                toward,
+                previous,
+                ..
+            } => {
+                let mut out = device.text_fields();
+                out.push(("probe destination", toward));
+                if let Some(previous) = previous {
+                    out.extend(previous.text_fields());
+                }
                 out
             }
             WireFact::OpaqueBoundary { device, why } => {

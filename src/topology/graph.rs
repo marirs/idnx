@@ -282,6 +282,8 @@ pub enum Relationship {
     RoutesTo,
     GatewayFor,
     Advertises,
+    /// One interface forwards toward a destination, downstream of another.
+    ForwardsToward,
     ObservedBehind,
     PossibleUplink,
     NatBoundary,
@@ -295,6 +297,7 @@ impl Relationship {
             Relationship::RoutesTo => "routes to",
             Relationship::GatewayFor => "gateway for",
             Relationship::Advertises => "advertises",
+            Relationship::ForwardsToward => "forwards toward",
             Relationship::ObservedBehind => "observed behind",
             Relationship::PossibleUplink => "possible uplink",
             Relationship::NatBoundary => "NAT boundary",
@@ -318,6 +321,15 @@ impl Provenance {
     /// Whether this record came from another machine.
     pub fn is_remote(&self) -> bool {
         self.origin.is_some()
+    }
+
+    /// The same provenance with an added explanation.
+    fn with_note(mut self, note: String) -> Self {
+        self.detail = Some(match self.detail.take() {
+            Some(existing) => format!("{existing}; {note}"),
+            None => note,
+        });
+        self
     }
 }
 
@@ -575,6 +587,12 @@ pub struct TopologyGraph {
     /// A tag is unique inside one switched domain and nowhere else, so a bare `u16` set
     /// collapsed two peers' VLAN 20 into one -- and attaching a prefix to one removed both.
     vlans_without_prefix: BTreeSet<VlanRef>,
+    /// Routers that answered a TTL-expired probe, by distance.
+    ///
+    /// Kept apart from the rest of the topology because that is what the evidence supports:
+    /// these interfaces forward, and whether they belong to the operator, a landlord or a
+    /// carrier is not something a hop count can decide.
+    egress_path: BTreeMap<u8, NodeId>,
     /// Structured role signals per device. Kept separate from `Node::role_signals`, which
     /// holds only rendered strings, so scoring operates on typed values.
     role_weights: HashMap<NodeId, BTreeSet<RoleSignal>>,
@@ -689,6 +707,28 @@ impl TopologyGraph {
     }
 
     /// VLANs observed with no prefix evidence, reported as such rather than invented.
+    /// Routers on the egress path, nearest first.
+    pub fn egress_path(&self) -> Vec<(u8, &Node)> {
+        self.egress_path
+            .iter()
+            .filter_map(|(distance, id)| self.nodes.get(id).map(|node| (*distance, node)))
+            .collect()
+    }
+
+    /// Whether a node is only known as a router on the way out.
+    ///
+    /// Such a device is reported in its own section rather than among the operator's
+    /// devices, so listing it twice -- or implying it is part of the network being mapped
+    /// -- does not happen.
+    pub fn is_egress_only(&self, id: &NodeId) -> bool {
+        self.egress_path.values().any(|hop| hop == id)
+            && self.nodes.get(id).is_some_and(|node| {
+                node.provenance.iter().all(|p| {
+                    p.source == EvidenceSource::IcmpProbe || p.source == EvidenceSource::TcpProbe
+                })
+            })
+    }
+
     pub fn vlans_without_prefix(&self) -> impl Iterator<Item = &VlanRef> + '_ {
         self.vlans_without_prefix.iter()
     }
@@ -1126,6 +1166,37 @@ impl TopologyGraph {
                         });
                     }
                     self.link(bridge, root, Relationship::PossibleUplink, ev.confidence, p);
+                }
+            }
+            Fact::ForwardsToward {
+                device,
+                toward,
+                distance,
+                previous,
+            } => {
+                let key = self.canonical_key(&device, None, &realm);
+                let id = NodeId::Device(key);
+                self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov.clone());
+
+                // The path itself: this interface answered after the previous one. Recorded
+                // as a relationship rather than folded into either device, because it
+                // belongs to neither on its own.
+                self.egress_path.insert(distance, id.clone());
+
+                if let Some(previous) = previous {
+                    let from = NodeId::Device(self.canonical_key(&previous, None, &realm));
+                    if from != id {
+                        self.link(
+                            from,
+                            id,
+                            Relationship::ForwardsToward,
+                            ev.confidence,
+                            prov.with_note(format!(
+                                "hop {distance} toward {toward} from {}",
+                                ev.vantage
+                            )),
+                        );
+                    }
                 }
             }
             Fact::ObservedBehind { device, via } => {
