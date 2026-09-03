@@ -20,8 +20,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use super::bundle::EvidenceBundle;
 use super::identity::{PeerId, PeerKey, decode_hex, encode_hex};
 use super::limits::{
-    LimitError, MAX_ENVELOPE_BYTES, MAX_RECORDS, MAX_VANTAGE_BYTES, check_frame_length,
-    check_record_count, check_text,
+    LimitError, MAX_ENVELOPE_BYTES, MAX_RECORDS, MAX_TEXT_BYTES, MAX_VANTAGE_BYTES,
+    check_frame_length, check_record_count, check_text,
 };
 use super::session::{Handshake, Session, SessionError, SessionOffer};
 
@@ -203,10 +203,16 @@ where
 
 /// Bounds every peer-controlled field before the message is acted on.
 ///
-/// Deserialization has already happened by here -- serde must see the bytes to produce a
-/// value -- which is why the frame length is capped first. This second pass catches a
-/// bundle that fits in a megabyte but still declares more records or longer strings than
-/// are ever reasonable.
+/// To be precise about when: the *frame length* is the only limit enforced before
+/// allocation. Record counts and individual strings are checked here, after serde has
+/// produced a value, because serde must see the bytes to produce one. That is sound only
+/// because the frame cap already bounds the whole message at a megabyte -- so the worst a
+/// peer can make this allocate is a megabyte, and these checks then reject anything that
+/// fits inside it while still being unreasonable.
+///
+/// Every string in every fact is checked, not a chosen few. Hostnames, vendors,
+/// descriptions, interface names, bridge identifiers, capability details and service
+/// details are all peer-controlled and all end up in the graph.
 fn check_message(message: &Message) -> Result<(), TransportError> {
     let Message::Bundle { bundle } = message else {
         return Ok(());
@@ -214,12 +220,18 @@ fn check_message(message: &Message) -> Result<(), TransportError> {
 
     check_record_count(bundle.records.len()).map_err(TransportError::Limit)?;
     check_text("vantage", &bundle.vantage, MAX_VANTAGE_BYTES).map_err(TransportError::Limit)?;
+    check_text("peer", &bundle.peer, MAX_TEXT_BYTES).map_err(TransportError::Limit)?;
+    check_text("signature", &bundle.signature, MAX_TEXT_BYTES).map_err(TransportError::Limit)?;
+
     for record in &bundle.records {
-        check_text("record vantage", &record.vantage, MAX_VANTAGE_BYTES)
-            .map_err(TransportError::Limit)?;
-        if let Some(detail) = &record.detail {
-            check_text("detail", detail, super::limits::MAX_TEXT_BYTES)
-                .map_err(TransportError::Limit)?;
+        for (field, value) in record.text_fields() {
+            // The vantage has a tighter bound than free text: it names an interface.
+            let limit = if field.contains("vantage") {
+                MAX_VANTAGE_BYTES
+            } else {
+                MAX_TEXT_BYTES
+            };
+            check_text(field, value, limit).map_err(TransportError::Limit)?;
         }
     }
     Ok(())
@@ -464,6 +476,78 @@ mod tests {
             check_message(&Message::Bundle { bundle }),
             Err(TransportError::Limit(LimitError::TextTooLong { .. }))
         ));
+    }
+
+    #[test]
+    fn every_string_inside_a_fact_is_bounded_not_just_the_obvious_ones() {
+        // Hostnames, vendors, descriptions, interface names, bridge identifiers and
+        // capability details are all peer-controlled and all reach the graph. Checking
+        // only the vantage and the detail left every one of them unbounded.
+        use crate::topology::evidence::{Capability, DeviceKey};
+
+        let device = DeviceKey::mac("02:00:5e:00:00:01");
+        let overlong = "x".repeat(MAX_TEXT_BYTES + 1);
+        let key = PeerKey::generate();
+
+        let facts = [
+            Fact::DeviceHostname {
+                device: device.clone(),
+                hostname: overlong.clone(),
+            },
+            Fact::DeviceVendor {
+                device: device.clone(),
+                vendor: overlong.clone(),
+            },
+            Fact::DeviceDescription {
+                device: device.clone(),
+                text: overlong.clone(),
+            },
+            Fact::InterfaceNetwork {
+                interface: overlong.clone(),
+                prefix: "10.0.0.0/8".parse().unwrap(),
+            },
+            Fact::BridgeLink {
+                bridge_id: overlong.clone(),
+                root_id: "root".to_string(),
+                port: None,
+            },
+            Fact::DeviceCapability {
+                device: device.clone(),
+                capability: Capability::NatGateway,
+                detail: Some(overlong.clone()),
+            },
+            Fact::Service {
+                address: "10.0.0.1".parse().unwrap(),
+                port: 80,
+                protocol: "tcp",
+                detail: Some(overlong.clone()),
+            },
+            Fact::OpaqueBoundary {
+                device,
+                why: overlong.clone(),
+            },
+            Fact::ResolvedAs {
+                name: overlong,
+                address: "10.0.0.1".parse().unwrap(),
+            },
+        ];
+
+        for fact in facts {
+            let record = TopologyEvidence::new(
+                fact.clone(),
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                "br0",
+            );
+            let bundle = EvidenceBundle::publish(&key, "br0", 1, &[record]);
+            assert!(
+                matches!(
+                    check_message(&Message::Bundle { bundle }),
+                    Err(TransportError::Limit(LimitError::TextTooLong { .. }))
+                ),
+                "unbounded string in {fact:?}"
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ use ipnet::IpNet;
 
 use crate::engine::orchestrator::{DiscoveryReport, is_virtual_network};
 use crate::net::vantage::StartingScope;
+use crate::output::safe;
 use crate::topology::evidence::DeviceKey;
 use crate::topology::graph::DeviceCategory;
 use crate::topology::graph::{NodeKind, Relationship};
@@ -331,7 +332,7 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
             .hostnames
             .iter()
             .next()
-            .cloned()
+            .map(|h| safe::text(h))
             .unwrap_or_else(|| "-".to_string());
         println!(
             "  |-- {:<24} {:<22} {}",
@@ -364,12 +365,7 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
         if !node.capabilities.is_empty() {
             println!(
                 "  |     {}",
-                node.capabilities
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-                    .green()
+                safe::all(node.capabilities.iter()).join(", ").green()
             );
         }
     }

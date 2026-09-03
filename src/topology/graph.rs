@@ -415,8 +415,14 @@ impl Node {
 
     /// Best display name available, preferring what the device called itself.
     pub fn display_name(&self) -> String {
+        // A hostname is chosen by the device, or by a peer reporting one. This method
+        // exists only to be rendered, so it neutralises what it returns rather than
+        // relying on every call site to remember.
         if let Some(name) = self.hostnames.iter().next() {
-            return name.clone();
+            return crate::federation::limits::clip(
+                &crate::federation::limits::sanitize(name),
+                crate::federation::limits::MAX_TEXT_BYTES,
+            );
         }
         if let Some(addr) = self.addresses.iter().next() {
             return addr.to_string();

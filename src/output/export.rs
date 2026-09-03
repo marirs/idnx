@@ -300,12 +300,15 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
                 .map(|c| c.label().to_string())
                 .unwrap_or_default(),
             addresses: node.addresses.iter().map(|a| a.to_string()).collect(),
-            hostnames: node.hostnames.iter().cloned().collect(),
-            vendor: node.vendor.clone(),
-            descriptions: node.descriptions.iter().cloned().collect(),
-            role_evidence: node.role_signals.iter().cloned().collect(),
-            capabilities: node.capabilities.iter().cloned().collect(),
-            opaque_reason: node.opaque_reason.clone(),
+            // Device- and peer-chosen text. Neutralised on the way out: an export is read
+            // by a terminal, a spreadsheet or a browser, and none of them should receive
+            // control characters a device put in its own name.
+            hostnames: crate::output::safe::all(node.hostnames.iter()),
+            vendor: node.vendor.as_deref().map(crate::output::safe::text),
+            descriptions: crate::output::safe::all(node.descriptions.iter()),
+            role_evidence: crate::output::safe::all(node.role_signals.iter()),
+            capabilities: crate::output::safe::all(node.capabilities.iter()),
+            opaque_reason: node.opaque_reason.as_deref().map(crate::output::safe::text),
             confidence: node.confidence.label().to_string(),
             evidence: evidence_of(&node.provenance),
         });

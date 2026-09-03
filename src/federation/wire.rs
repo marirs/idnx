@@ -383,6 +383,158 @@ impl WireEvidence {
     }
 }
 
+impl WireFact {
+    /// Every peer-controlled string in this fact, with the field it came from.
+    ///
+    /// Enumerated exhaustively so that adding a variant without listing its strings is a
+    /// compile error rather than a silent gap: an unchecked field is one a peer can make
+    /// arbitrarily long, or fill with terminal escapes that reach the display.
+    pub fn text_fields(&self) -> Vec<(&'static str, &str)> {
+        match self {
+            WireFact::Network { prefix } => vec![("prefix", prefix)],
+            WireFact::Vlan { .. } => Vec::new(),
+            WireFact::InterfaceNetwork { interface, prefix } => {
+                vec![("interface", interface), ("prefix", prefix)]
+            }
+            WireFact::DeviceAddress { device, address } => {
+                let mut out = device.text_fields();
+                out.push(("address", address));
+                out
+            }
+            WireFact::DeviceHostname { device, hostname } => {
+                let mut out = device.text_fields();
+                out.push(("hostname", hostname));
+                out
+            }
+            WireFact::DeviceVendor { device, vendor } => {
+                let mut out = device.text_fields();
+                out.push(("vendor", vendor));
+                out
+            }
+            WireFact::DeviceDescription { device, text } => {
+                let mut out = device.text_fields();
+                out.push(("description", text));
+                out
+            }
+            WireFact::DeviceRoleSignal {
+                device,
+                signal,
+                label,
+            } => {
+                let mut out = device.text_fields();
+                out.push(("role signal", signal));
+                if let Some(label) = label {
+                    out.push(("role signal label", label));
+                }
+                out
+            }
+            WireFact::DeviceCapability {
+                device,
+                capability,
+                detail,
+            } => {
+                let mut out = device.text_fields();
+                out.push(("capability", capability));
+                if let Some(detail) = detail {
+                    out.push(("capability detail", detail));
+                }
+                out
+            }
+            WireFact::GatewayFor { device, network } => {
+                let mut out = device.text_fields();
+                out.push(("network", network));
+                out
+            }
+            WireFact::RoutesTo {
+                device,
+                network,
+                next_hop,
+            } => {
+                let mut out = device.text_fields();
+                out.push(("network", network));
+                if let Some(next_hop) = next_hop {
+                    out.push(("next hop", next_hop));
+                }
+                out
+            }
+            WireFact::AttachedTo { device, network } => {
+                let mut out = device.text_fields();
+                out.push(("network", network));
+                out
+            }
+            WireFact::BridgeLink {
+                bridge_id,
+                root_id,
+                port,
+            } => {
+                let mut out = vec![
+                    ("bridge id", bridge_id.as_str()),
+                    ("root id", root_id.as_str()),
+                ];
+                if let Some(port) = port {
+                    out.push(("bridge port", port));
+                }
+                out
+            }
+            WireFact::ObservedBehind { device, via } => {
+                let mut out = device.text_fields();
+                out.extend(via.text_fields());
+                out
+            }
+            WireFact::OpaqueBoundary { device, why } => {
+                let mut out = device.text_fields();
+                out.push(("boundary reason", why));
+                out
+            }
+            WireFact::Service {
+                address,
+                protocol,
+                detail,
+                ..
+            } => {
+                let mut out = vec![
+                    ("address", address.as_str()),
+                    ("protocol", protocol.as_str()),
+                ];
+                if let Some(detail) = detail {
+                    out.push(("service detail", detail));
+                }
+                out
+            }
+            WireFact::ResolvedAs { name, address } => {
+                vec![("resolved name", name), ("address", address)]
+            }
+        }
+    }
+}
+
+impl WireDevice {
+    /// The peer-controlled strings in a device identity.
+    fn text_fields(&self) -> Vec<(&'static str, &str)> {
+        match self {
+            WireDevice::Mac { mac } => vec![("mac", mac)],
+            WireDevice::Address { address } => vec![("device address", address)],
+            WireDevice::ScopedAddress { address, zone } => {
+                vec![("device address", address), ("device zone", zone)]
+            }
+        }
+    }
+}
+
+impl WireEvidence {
+    /// Every peer-controlled string in this record.
+    pub fn text_fields(&self) -> Vec<(&'static str, &str)> {
+        let mut out = self.fact.text_fields();
+        out.push(("source", &self.source));
+        out.push(("confidence", &self.confidence));
+        out.push(("vantage", &self.vantage));
+        if let Some(detail) = &self.detail {
+            out.push(("detail", detail));
+        }
+        out
+    }
+}
+
 /// What went wrong converting a wire record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -766,6 +918,101 @@ mod tests {
             role_signal_from_wire("link_layer_capability", None),
             Err(WireError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn every_peer_controlled_string_is_enumerated() {
+        // The list drives the length checks. A fact whose strings are not listed is a
+        // field a peer can make arbitrarily long, or fill with terminal escapes.
+        let device = DeviceKey::ScopedAddress("fe80::1".parse().unwrap(), "eth0".to_string());
+
+        let cases: Vec<(Fact, &[&str])> = vec![
+            (
+                Fact::DeviceHostname {
+                    device: device.clone(),
+                    hostname: "HOSTNAME".to_string(),
+                },
+                &["HOSTNAME", "fe80::1", "eth0"],
+            ),
+            (
+                Fact::DeviceVendor {
+                    device: device.clone(),
+                    vendor: "VENDOR".to_string(),
+                },
+                &["VENDOR"],
+            ),
+            (
+                Fact::DeviceDescription {
+                    device: device.clone(),
+                    text: "DESCRIPTION".to_string(),
+                },
+                &["DESCRIPTION"],
+            ),
+            (
+                Fact::InterfaceNetwork {
+                    interface: "INTERFACE".to_string(),
+                    prefix: "10.0.0.0/8".parse().unwrap(),
+                },
+                &["INTERFACE", "10.0.0.0/8"],
+            ),
+            (
+                Fact::BridgeLink {
+                    bridge_id: "BRIDGE".to_string(),
+                    root_id: "ROOT".to_string(),
+                    port: Some("PORT".to_string()),
+                },
+                &["BRIDGE", "ROOT", "PORT"],
+            ),
+            (
+                Fact::DeviceCapability {
+                    device: device.clone(),
+                    capability: Capability::NatGateway,
+                    detail: Some("CAPDETAIL".to_string()),
+                },
+                &["CAPDETAIL", "nat_gateway"],
+            ),
+            (
+                Fact::Service {
+                    address: "10.0.0.1".parse().unwrap(),
+                    port: 80,
+                    protocol: "tcp",
+                    detail: Some("SERVICEDETAIL".to_string()),
+                },
+                &["SERVICEDETAIL", "tcp", "10.0.0.1"],
+            ),
+            (
+                Fact::OpaqueBoundary {
+                    device: device.clone(),
+                    why: "WHY".to_string(),
+                },
+                &["WHY"],
+            ),
+            (
+                Fact::ResolvedAs {
+                    name: "NAME".to_string(),
+                    address: "10.0.0.1".parse().unwrap(),
+                },
+                &["NAME"],
+            ),
+            (
+                Fact::DeviceRoleSignal {
+                    device,
+                    signal: RoleSignal::LinkLayerCapability("Router"),
+                },
+                &["Router", "link_layer_capability"],
+            ),
+        ];
+
+        for (fact, expected) in cases {
+            let wire = WireEvidence::from_evidence(&evidence(fact));
+            let found: Vec<&str> = wire.text_fields().iter().map(|(_, v)| *v).collect();
+            for needle in expected {
+                assert!(
+                    found.contains(needle),
+                    "{needle} is not enumerated among {found:?}"
+                );
+            }
+        }
     }
 
     #[test]

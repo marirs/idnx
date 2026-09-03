@@ -18,7 +18,7 @@ use idnx::federation::identity::PeerKey;
 use idnx::federation::ledger::{PeerLedger, RejectReason};
 use idnx::federation::relay::{RelayQueue, mailbox};
 use idnx::federation::session::{Session, SessionOffer};
-use idnx::federation::source::FederationSource;
+use idnx::federation::source::{Delivery, FederationSource};
 use idnx::federation::store::FederationStore;
 use idnx::federation::transport::{Message, bundle_digest};
 use idnx::providers::ContinuousSource;
@@ -206,8 +206,14 @@ fn collect_at_a(
         match ledger.accept(&bundle) {
             Ok(accepted) => {
                 let sequence = accepted.sequence;
-                source.deliver(accepted);
-                outcomes.push(Ok(sequence));
+                // Acknowledged only if the engine took it. Acknowledging evidence the run
+                // declined would tell the peer it landed and stop it ever resending.
+                match source.deliver(accepted) {
+                    Delivery::Queued => outcomes.push(Ok(sequence)),
+                    Delivery::Declined => outcomes.push(Err(RejectReason::Undecodable(vec![
+                        "the run had already concluded".to_string(),
+                    ]))),
+                }
             }
             Err(reason) => {
                 source.reject(bundle.verify().ok(), &bundle.vantage, &reason);

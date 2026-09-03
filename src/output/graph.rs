@@ -88,24 +88,28 @@ fn build_data(report: &DiscoveryReport) -> GraphData {
             continue;
         }
 
+        // Every value here is chosen by the device it describes, or by a peer. It is
+        // neutralised on the way into the page, not trusted because it reached the graph.
+        use crate::output::safe::text as safe;
+
         let mut detail: Vec<String> = Vec::new();
         if let Some(vendor) = &node.vendor {
-            detail.push(format!("vendor: {vendor}"));
+            detail.push(format!("vendor: {}", safe(vendor)));
         }
         for addr in &node.addresses {
             detail.push(addr.to_string());
         }
         for capability in &node.capabilities {
-            detail.push(format!("capability: {capability}"));
+            detail.push(format!("capability: {}", safe(capability)));
         }
         for signal in &node.role_signals {
-            detail.push(format!("role: {signal}"));
+            detail.push(format!("role: {}", safe(signal)));
         }
-        for text in &node.descriptions {
-            detail.push(text.clone());
+        for description in &node.descriptions {
+            detail.push(safe(description));
         }
         if let Some(reason) = &node.opaque_reason {
-            detail.push(format!("boundary: {reason}"));
+            detail.push(format!("boundary: {}", safe(reason)));
         }
         if let NodeId::Network(net) = &node.id {
             let ifaces = graph.interfaces_for_network(net);
@@ -195,8 +199,10 @@ pub fn export_interactive_topology_html(
         format!("{observed} observed &middot; {advertised} advertised &middot; {inferred} inferred")
     };
 
+    // Embedded in a <script> block, so JSON quoting is not sufficient on its own: a device
+    // named "</script>..." would close the block and have the rest parsed as markup.
     let html = PAGE_TEMPLATE
-        .replace("{{DATA}}", &json)
+        .replace("{{DATA}}", &crate::output::safe::embeddable_json(&json))
         .replace("{{SUMMARY}}", &summary)
         .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
 

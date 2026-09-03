@@ -13,7 +13,7 @@
 //! finished, which is precisely what draining here guarantees.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::identity::PeerId;
 use super::ledger::{Accepted, RejectReason};
@@ -34,15 +34,40 @@ pub struct PeerOutcome {
     pub rejected: Vec<String>,
 }
 
+/// Whether the engine took responsibility for a bundle's evidence.
+///
+/// Returned to the caller so that an acknowledgement is only sent for evidence that was
+/// actually queued. Acknowledging a bundle the engine declined would tell the peer its
+/// evidence had landed when it had been dropped, and the peer would never resend it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Queued for the graph.
+    Queued,
+    /// The run has already concluded. The peer must not be told this was applied.
+    Declined,
+}
+
+/// The queue and the stopped flag, behind one lock.
+///
+/// They were separate before, and `finish` took the pending evidence and only then marked
+/// itself stopped -- so a bundle arriving in between was enqueued into a queue nothing
+/// would ever drain, counted as accepted, and acknowledged to the peer. One lock makes
+/// draining and stopping a single decision, and makes delivery either succeed or be told
+/// no.
+#[derive(Debug, Default)]
+struct Queue {
+    pending: Vec<TopologyEvidence>,
+    stopped: bool,
+}
+
 /// Evidence accepted from peers, waiting to enter the graph.
 ///
 /// Shared between the transport tasks that fill it and the engine that drains it.
 #[derive(Debug, Default)]
 pub struct FederationSource {
-    pending: Mutex<Vec<TopologyEvidence>>,
+    queue: Mutex<Queue>,
     outcomes: Mutex<Vec<PeerOutcome>>,
     accepted_records: AtomicU64,
-    stopped: AtomicBool,
 }
 
 impl FederationSource {
@@ -55,11 +80,29 @@ impl FederationSource {
     /// Called from whichever task is talking to that peer. Nothing is absorbed here: the
     /// engine owns the graph, and it takes this at a point where it can act on what
     /// arrives.
-    pub fn deliver(&self, accepted: Accepted) {
+    ///
+    /// Returns whether the evidence was queued. The caller must acknowledge the bundle only
+    /// on [`Delivery::Queued`]: telling a peer its evidence landed when the run had already
+    /// concluded would stop it ever resending, and the evidence would be lost for good.
+    #[must_use]
+    pub fn deliver(&self, accepted: Accepted) -> Delivery {
         let records = accepted.evidence.len();
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.extend(accepted.evidence);
+
+        // Enqueueing and the stopped check are one decision under one lock. Split, a
+        // bundle could be accepted into a queue that had just been drained for the last
+        // time.
+        let queued = match self.queue.lock() {
+            Ok(mut queue) if !queue.stopped => {
+                queue.pending.extend(accepted.evidence);
+                true
+            }
+            _ => false,
+        };
+
+        if !queued {
+            return Delivery::Declined;
         }
+
         self.accepted_records
             .fetch_add(records as u64, Ordering::Relaxed);
 
@@ -81,6 +124,8 @@ impl FederationSource {
                 }),
             }
         }
+
+        Delivery::Queued
     }
 
     /// Records a bundle that was refused, and why.
@@ -124,28 +169,27 @@ impl FederationSource {
 
 impl ContinuousSource for FederationSource {
     fn drain(&self) -> Vec<TopologyEvidence> {
-        if self.stopped.load(Ordering::Relaxed) {
-            return Vec::new();
-        }
-        self.pending
+        self.queue
             .lock()
-            .map(|mut pending| std::mem::take(&mut *pending))
+            .map(|mut queue| std::mem::take(&mut queue.pending))
             .unwrap_or_default()
     }
 
-    /// Takes whatever is still queued and stops accepting.
+    /// Takes whatever is still queued and stops accepting, in one step.
     ///
     /// Called once, at candidate convergence. A bundle that arrived while the last pass was
     /// running is still in here, and it may name a network or a router the engine has not
-    /// traversed — which is exactly the case the final drain exists for.
+    /// traversed -- which is exactly the case the final drain exists for. Taking and
+    /// stopping under one lock is what guarantees nothing is queued after the last drain
+    /// and then silently dropped.
     fn finish(&self) -> Vec<TopologyEvidence> {
-        let remaining = self
-            .pending
+        self.queue
             .lock()
-            .map(|mut pending| std::mem::take(&mut *pending))
-            .unwrap_or_default();
-        self.stopped.store(true, Ordering::Relaxed);
-        remaining
+            .map(|mut queue| {
+                queue.stopped = true;
+                std::mem::take(&mut queue.pending)
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -185,7 +229,7 @@ mod tests {
     fn delivered_evidence_is_drained_exactly_once() {
         let source = FederationSource::new();
         let peer = PeerKey::generate().id();
-        source.deliver(accepted(peer, 3));
+        assert_eq!(source.deliver(accepted(peer, 3)), Delivery::Queued);
 
         assert_eq!(source.drain().len(), 3);
         assert!(source.drain().is_empty(), "draining consumes");
@@ -200,30 +244,66 @@ mod tests {
         let peer = PeerKey::generate().id();
 
         assert!(source.drain().is_empty());
-        source.deliver(accepted(peer, 2));
+        assert_eq!(source.deliver(accepted(peer, 2)), Delivery::Queued);
 
         assert_eq!(source.finish().len(), 2);
     }
 
     #[test]
-    fn nothing_is_delivered_after_the_source_is_finished() {
+    fn a_bundle_arriving_after_the_final_drain_is_declined_not_swallowed() {
+        // The race this closes: evidence enqueued between the final drain and the stop was
+        // counted as accepted, acknowledged to the peer, and never seen by the engine --
+        // so the peer would never resend it and it was lost for good.
         let source = FederationSource::new();
         let peer = PeerKey::generate().id();
         source.finish();
 
-        source.deliver(accepted(peer, 5));
-        assert!(
-            source.drain().is_empty(),
-            "a stopped source must not extend a run that has already concluded"
+        assert_eq!(
+            source.deliver(accepted(peer, 5)),
+            Delivery::Declined,
+            "the caller must be told, so it does not acknowledge the bundle"
         );
+        assert!(source.drain().is_empty());
+        assert_eq!(
+            source.accepted_records(),
+            0,
+            "declined evidence must not be counted as accepted"
+        );
+        assert!(!source.had_peers());
+    }
+
+    #[test]
+    fn concurrent_delivery_during_finish_is_either_taken_or_declined() {
+        // Whichever order the two land in, nothing may be both accepted and dropped.
+        use std::sync::Arc;
+
+        for _ in 0..64 {
+            let source = Arc::new(FederationSource::new());
+            let peer = PeerKey::generate().id();
+
+            let deliverer = {
+                let source = Arc::clone(&source);
+                let peer = peer.clone();
+                std::thread::spawn(move || source.deliver(accepted(peer, 4)))
+            };
+            let taken = source.finish().len();
+            let outcome = deliverer.join().expect("delivery thread");
+
+            let total = taken + source.drain().len();
+            match outcome {
+                Delivery::Queued => assert_eq!(total, 4, "queued evidence must be drained"),
+                Delivery::Declined => assert_eq!(total, 0, "declined evidence must not appear"),
+            }
+            assert_eq!(source.accepted_records() as usize, total);
+        }
     }
 
     #[test]
     fn peer_outcomes_accumulate_across_bundles() {
         let source = FederationSource::new();
         let peer = PeerKey::generate().id();
-        source.deliver(accepted(peer.clone(), 2));
-        source.deliver(accepted(peer.clone(), 3));
+        assert_eq!(source.deliver(accepted(peer.clone(), 2)), Delivery::Queued);
+        assert_eq!(source.deliver(accepted(peer.clone(), 3)), Delivery::Queued);
 
         let outcomes = source.outcomes();
         assert_eq!(outcomes.len(), 1);
