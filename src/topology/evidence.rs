@@ -82,6 +82,8 @@ pub enum EvidenceSource {
     Stp,
     RouterAdvertisement,
     Snmp,
+    /// A RIP routing update, heard on the link or returned to a direct request.
+    Rip,
     VendorDiscovery,
     /// NAT-PMP / PCP gateway response.
     NatPmp,
@@ -115,6 +117,7 @@ impl EvidenceSource {
             EvidenceSource::Stp => "STP/BPDU",
             EvidenceSource::RouterAdvertisement => "IPv6 router advertisement",
             EvidenceSource::Snmp => "SNMP",
+            EvidenceSource::Rip => "RIP",
             EvidenceSource::VendorDiscovery => "vendor discovery",
             EvidenceSource::NatPmp => "NAT-PMP",
             EvidenceSource::AiProtocol => "AI runtime protocol",

@@ -8,6 +8,7 @@ pub mod mndp;
 pub mod natpmp;
 pub mod passive;
 pub mod path;
+pub mod rip;
 pub mod smb;
 pub mod snmp;
 pub mod tls;

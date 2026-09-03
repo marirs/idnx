@@ -786,6 +786,64 @@ async fn probe_control_plane(
         ));
     }
 
+    // RIP: the one routing protocol a router will describe its tables to without
+    // credentials. A response carries real prefixes with real netmasks, which is
+    // prefix-bearing evidence in the strict sense -- the network exists because a router
+    // said so in a protocol field, not because anything was inferred from an address.
+    //
+    // Unicast and read-only. A request carries no routes and cannot install anything, and
+    // no authentication is attempted. RIPng is not sent here: it is IPv6 and link-scoped,
+    // and addressing it to an IPv4 router found on a path would be sending a protocol to
+    // something that cannot speak it.
+    coverage.udp_attempted.push(crate::probes::rip::RIP_PORT);
+    if let Some(routes) = crate::probes::rip::request_table(v4, binding, timeout).await {
+        coverage.protocols_confirmed.push("rip/520".to_string());
+        for route in routes {
+            // A metric of 16 is RIP announcing that a route is gone. Recording it would
+            // add a network the router just said it cannot reach.
+            if !route.is_reachable() {
+                continue;
+            }
+
+            out.push(
+                TopologyEvidence::new(
+                    Fact::Network {
+                        prefix: route.prefix,
+                    },
+                    EvidenceSource::Rip,
+                    // The router asserted this. It is not something this vantage saw.
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(route.evidence()),
+            );
+
+            out.push(
+                TopologyEvidence::new(
+                    Fact::RoutesTo {
+                        device: device.clone(),
+                        network: route.prefix,
+                        next_hop: route.next_hop,
+                    },
+                    EvidenceSource::Rip,
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(route.evidence()),
+            );
+        }
+
+        out.push(TopologyEvidence::new(
+            Fact::DeviceRoleSignal {
+                device: device.clone(),
+                signal: RoleSignal::SnmpForwarding,
+            },
+            EvidenceSource::Rip,
+            Confidence::Observed,
+            vantage,
+        ));
+    }
+
     // DNS over UDP, attempted regardless of whether TCP 53 answered. Gating confirmation
     // on an open TCP port missed every UDP-only resolver and every device with TCP 53
     // filtered -- between them, most resolvers on a home or office network. An open port

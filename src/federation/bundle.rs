@@ -44,7 +44,12 @@ impl EvidenceBundle {
         sequence: u64,
         evidence: &[TopologyEvidence],
     ) -> Self {
-        let records: Vec<WireEvidence> = evidence.iter().map(WireEvidence::from_evidence).collect();
+        // Facts this format version cannot express are left out rather than approximated.
+        // A receiver is told what it did get and nothing it did not.
+        let records: Vec<WireEvidence> = evidence
+            .iter()
+            .filter_map(WireEvidence::from_evidence)
+            .collect();
         let peer = key.id().to_hex();
         let published_at = unix_seconds(SystemTime::now());
         let signature = key.sign(&signing_payload(
@@ -179,7 +184,8 @@ mod tests {
             EvidenceSource::InterfaceAddress,
             Confidence::Observed,
             "br0",
-        ));
+        ))
+        .expect("representable");
         assert!(edited.verify().is_err(), "records");
 
         let mut edited = original.clone();
