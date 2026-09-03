@@ -5,6 +5,7 @@ pub mod endpoint;
 pub mod interface;
 pub mod ipv6;
 pub mod link_speed;
+pub mod linklayer;
 pub mod mdns;
 pub mod routes;
 pub mod socket;
