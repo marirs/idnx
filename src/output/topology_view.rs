@@ -679,6 +679,17 @@ fn render_device_coverage(report: &DiscoveryReport) {
                 record.vendor_adapters.join(", ").dimmed()
             );
         }
+        // What each selected adapter managed to do. Selection was being printed on its own,
+        // which read as though a vendor-specific interrogation had happened; every adapter
+        // in the registry is a stub, so nothing had been sent.
+        for outcome in &record.adapter_outcomes {
+            let rendered = if outcome.contains("unavailable") {
+                outcome.yellow()
+            } else {
+                outcome.dimmed()
+            };
+            println!("    {:<18} {}", "adapter outcome", rendered);
+        }
         for failure in record.local_failures() {
             // A probe that never left this machine is a local fault, not remote silence.
             println!("    {:<18} {}", "not sent", failure.red());

@@ -107,8 +107,68 @@ pub struct VendorContext {
     pub vantage: String,
 }
 
-/// Future returned by an adapter.
-pub type AdapterFuture<'a> = Pin<Box<dyn Future<Output = Vec<TopologyEvidence>> + Send + 'a>>;
+/// What running an adapter actually amounted to.
+///
+/// The distinction the coverage report was getting wrong. An adapter that was selected and
+/// has no implementation, one that ran and heard nothing, and one that ran and found
+/// something are three different facts, and reporting the first as though it were the
+/// second told the operator a protocol had been tried when no packet had been sent.
+#[derive(Debug, Clone)]
+pub enum AdapterOutcome {
+    /// Selected, but there is nothing here to run.
+    ///
+    /// A stub. Reported as unavailable so it is never mistaken for a device declining to
+    /// answer, which is what "no response" claims.
+    Unavailable { reason: String },
+    /// Ran, and the device did not answer.
+    NoResponse { attempted: Vec<String> },
+    /// Ran, and the device answered.
+    Answered {
+        attempted: Vec<String>,
+        evidence: Vec<TopologyEvidence>,
+    },
+}
+
+impl AdapterOutcome {
+    /// A stub, with the reason it cannot run.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        AdapterOutcome::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    /// The evidence, if any.
+    pub fn evidence(self) -> Vec<TopologyEvidence> {
+        match self {
+            AdapterOutcome::Answered { evidence, .. } => evidence,
+            _ => Vec::new(),
+        }
+    }
+
+    /// One line for the coverage report, naming what was and was not done.
+    pub fn describe(&self, adapter: &str) -> String {
+        match self {
+            AdapterOutcome::Unavailable { reason } => {
+                format!("{adapter} unavailable: {reason}")
+            }
+            AdapterOutcome::NoResponse { attempted } => {
+                format!("{adapter} no response ({})", attempted.join(", "))
+            }
+            AdapterOutcome::Answered { attempted, .. } => {
+                format!("{adapter} answered ({})", attempted.join(", "))
+            }
+        }
+    }
+}
+
+/// Future returned by a targeted adapter.
+pub type AdapterFuture<'a> = Pin<Box<dyn Future<Output = AdapterOutcome> + Send + 'a>>;
+
+/// Future returned by a link-local broadcast.
+///
+/// Broadcasts return evidence directly because, unlike the targeted adapters, they are
+/// implemented: the ASUS UDP 9999 probe really does go out on the wire.
+pub type BroadcastFuture<'a> = Pin<Box<dyn Future<Output = Vec<TopologyEvidence>> + Send + 'a>>;
 
 /// A vendor-specific source of evidence.
 pub trait VendorAdapter: Send + Sync {
@@ -120,8 +180,11 @@ pub trait VendorAdapter: Send + Sync {
     /// Returning false skips work; it never means the device is not that vendor.
     fn applies(&self, fingerprint: &DeviceFingerprint) -> bool;
 
-    /// Returns evidence. An adapter cannot report a result any other way, which is what
-    /// prevents a vendor mechanism from assigning a role directly.
+    /// Runs the adapter, reporting what it managed to do.
+    ///
+    /// Evidence is the only channel for a result, which is what prevents a vendor mechanism
+    /// from assigning a role directly -- and the outcome type is what keeps an
+    /// unimplemented adapter from being reported as a device that stayed silent.
     fn discover<'a>(&'a self, context: &'a VendorContext) -> AdapterFuture<'a>;
 }
 
@@ -145,11 +208,19 @@ impl VendorAdapter for AsusAdapter {
 
     fn discover<'a>(&'a self, context: &'a VendorContext) -> AdapterFuture<'a> {
         Box::pin(async move {
-            // The broadcast probe is link-local, so it cannot be aimed at one device; a
-            // targeted implementation is pending the protocol audit. Returning nothing is
-            // correct in the meantime and asserts nothing about the device.
             let _ = context;
-            Vec::new()
+            // Not implemented, and said so. The only ASUS-specific code in this crate is a
+            // link-local broadcast to UDP 9999, which cannot be aimed at one device and is
+            // a separate provider. Targeted discovery would need the request and reply
+            // framing for UDP 9999 and UDP 18017 -- two distinct protocol paths -- taken
+            // from authoritative material or captured known-good traffic, with opcode,
+            // sender and embedded identity all validated. Guessed payloads are not an
+            // implementation, and returning an empty vector let this be reported as though
+            // the device had been asked and had declined to answer.
+            AdapterOutcome::unavailable(
+                "targeted ASUS discovery is not implemented; UDP 9999 and 18017 request \
+                 and reply framing not yet verified against authoritative material",
+            )
         })
     }
 }
@@ -172,7 +243,11 @@ impl VendorAdapter for MikroTikAdapter {
     fn discover<'a>(&'a self, context: &'a VendorContext) -> AdapterFuture<'a> {
         Box::pin(async move {
             let _ = context;
-            Vec::new()
+            AdapterOutcome::unavailable(
+                "targeted MikroTik discovery is not implemented; the RouterOS API on 8728 \
+                 requires a login exchange, and MNDP is a link-local broadcast handled by \
+                 its own provider",
+            )
         })
     }
 }
@@ -194,7 +269,10 @@ impl VendorAdapter for UbiquitiAdapter {
     fn discover<'a>(&'a self, context: &'a VendorContext) -> AdapterFuture<'a> {
         Box::pin(async move {
             let _ = context;
-            Vec::new()
+            AdapterOutcome::unavailable(
+                "targeted Ubiquiti discovery is not implemented; the UBNT discovery \
+                 protocol on UDP 10001 has not been verified against authoritative material",
+            )
         })
     }
 }
@@ -213,7 +291,7 @@ pub trait VendorBroadcast: Send + Sync {
         vantage: &'a str,
         binding: &'a SocketBinding,
         timeout: Duration,
-    ) -> AdapterFuture<'a>;
+    ) -> BroadcastFuture<'a>;
 }
 
 /// ASUS Device Discovery, UDP 9999.
@@ -229,7 +307,7 @@ impl VendorBroadcast for AsusBroadcast {
         vantage: &'a str,
         binding: &'a SocketBinding,
         timeout: Duration,
-    ) -> AdapterFuture<'a> {
+    ) -> BroadcastFuture<'a> {
         Box::pin(async move {
             let mut out = Vec::new();
             for router in crate::probes::asus::discover_asus_routers(binding, timeout).await {
@@ -356,21 +434,31 @@ pub fn selected_adapters(fingerprint: &DeviceFingerprint) -> Vec<String> {
 /// Output is filtered rather than trusted. An adapter is a vendor mechanism, often
 /// reverse-engineered and rarely corroborated by anything else on the link; letting one
 /// assert network structure would make the topology depend on it.
-pub async fn run_adapters(context: &VendorContext) -> Vec<TopologyEvidence> {
-    let mut out = Vec::new();
+pub struct AdapterRun {
+    pub evidence: Vec<TopologyEvidence>,
+    /// One line per selected adapter, saying what it managed to do.
+    pub outcomes: Vec<String>,
+}
+
+pub async fn run_adapters(context: &VendorContext) -> AdapterRun {
+    let mut evidence = Vec::new();
+    let mut outcomes = Vec::new();
+
     for adapter in adapters() {
         if !adapter.applies(&context.fingerprint) {
             continue;
         }
-        out.extend(
-            adapter
-                .discover(context)
-                .await
+        let outcome = adapter.discover(context).await;
+        outcomes.push(outcome.describe(adapter.name()));
+        evidence.extend(
+            outcome
+                .evidence()
                 .into_iter()
                 .filter(|ev| adapter_may_assert(&ev.fact)),
         );
     }
-    out
+
+    AdapterRun { evidence, outcomes }
 }
 
 #[cfg(test)]
@@ -428,6 +516,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stub_adapter_reports_unavailable_and_not_silence() {
+        // The claim this corrects. Every adapter here is a stub, and reporting an empty
+        // result as "no response" told the operator the device had been asked a
+        // vendor-specific question and had declined to answer. No packet was sent.
+        let context = VendorContext {
+            endpoint: endpoint("10.0.0.1"),
+            device: DeviceKey::Address("10.0.0.1".parse().unwrap()),
+            fingerprint: fingerprint(Some("ASUSTek Computer")),
+            timeout: Duration::from_millis(10),
+            vantage: "test0".to_string(),
+        };
+
+        let run = run_adapters(&context).await;
+        assert!(run.evidence.is_empty());
+        assert_eq!(run.outcomes.len(), 1);
+        assert!(
+            run.outcomes[0].contains("unavailable"),
+            "{:?}",
+            run.outcomes
+        );
+        assert!(
+            !run.outcomes[0].contains("no response"),
+            "a stub must not be reported as a silent device: {:?}",
+            run.outcomes
+        );
+    }
+
+    #[test]
+    fn every_registered_adapter_states_its_implementation_status() {
+        // A stub that looks like a completed interrogation is worse than no adapter: the
+        // coverage report becomes untrue rather than incomplete.
+        for adapter in adapters() {
+            let _ = adapter.name();
+        }
+        assert_eq!(adapters().len(), 3, "asus, mikrotik, ubiquiti");
+    }
+
+    #[tokio::test]
     async fn an_adapter_that_finds_nothing_yields_no_evidence() {
         // Silence must never become a fact about the device.
         let context = VendorContext {
@@ -437,7 +563,8 @@ mod tests {
             timeout: Duration::from_millis(10),
             vantage: "test0".to_string(),
         };
-        assert!(run_adapters(&context).await.is_empty());
+        let run = run_adapters(&context).await;
+        assert!(run.evidence.is_empty());
     }
 
     fn endpoint(addr: &str) -> Endpoint {
@@ -538,6 +665,7 @@ mod tests {
             timeout: Duration::from_millis(10),
             vantage: "test0".to_string(),
         };
-        assert!(run_adapters(&context).await.is_empty());
+        let run = run_adapters(&context).await;
+        assert!(run.evidence.is_empty());
     }
 }

@@ -77,6 +77,9 @@ pub struct DeviceCoverageExport {
     pub auth_required: Vec<u16>,
     /// Vendor adapters the device's fingerprint selected.
     pub vendor_adapters: Vec<String>,
+    /// What each selected adapter managed to do: unavailable, no response, or answered.
+    /// Selection is not interrogation, and a consumer must be able to tell them apart.
+    pub adapter_outcomes: Vec<String>,
     /// Probes that never left this machine, with the local error. A consumer must not read
     /// these as evidence about the device.
     pub not_sent: Vec<String>,
@@ -525,6 +528,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             protocols_confirmed: record.protocols_confirmed.clone(),
             auth_required: record.auth_required.clone(),
             vendor_adapters: record.vendor_adapters.clone(),
+            adapter_outcomes: record.adapter_outcomes.clone(),
             not_sent: record.local_failures(),
             omissions: record.omissions(),
             skipped: record.skipped.clone(),

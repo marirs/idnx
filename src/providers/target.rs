@@ -162,6 +162,12 @@ pub struct DeviceCoverage {
     /// Vendor adapters this device's fingerprint selected. An adapter never chosen and one
     /// chosen that found nothing are different outcomes, so selection is reported.
     pub vendor_adapters: Vec<String>,
+    /// What each selected adapter managed to do: unavailable, no response, or answered.
+    ///
+    /// Selection alone was being rendered as though the adapter had run. Every adapter in
+    /// the registry is currently a stub, so "vendor:asus selected" described a
+    /// vendor-specific interrogation that never sent a packet.
+    pub adapter_outcomes: Vec<String>,
     /// Set when the device was not interrogated at all, saying why.
     pub skipped: Option<String>,
     pub elapsed: Duration,
@@ -179,6 +185,7 @@ impl DeviceCoverage {
             protocols_confirmed: Vec::new(),
             auth_required: Vec::new(),
             vendor_adapters: Vec::new(),
+            adapter_outcomes: Vec::new(),
             skipped: Some(reason.into()),
             elapsed: Duration::ZERO,
         }
@@ -315,6 +322,7 @@ pub async fn interrogate_device(
         protocols_confirmed: Vec::new(),
         auth_required: Vec::new(),
         vendor_adapters: Vec::new(),
+        adapter_outcomes: Vec::new(),
         skipped: None,
         elapsed: Duration::ZERO,
     };
@@ -468,7 +476,7 @@ pub async fn interrogate_device(
     fingerprint.absorb_evidence(&out);
     fingerprint.open_ports = open_ports.clone();
     coverage.vendor_adapters = crate::providers::vendor::selected_adapters(&fingerprint);
-    out.extend(
+    let adapter_run =
         crate::providers::vendor::run_adapters(&crate::providers::vendor::VendorContext {
             endpoint: primary.clone(),
             device,
@@ -476,8 +484,12 @@ pub async fn interrogate_device(
             timeout,
             vantage: vantage.to_string(),
         })
-        .await,
-    );
+        .await;
+    // What each selected adapter actually managed to do. A stub reports "unavailable"
+    // rather than being folded into the protocol list as though it had probed and been
+    // ignored.
+    coverage.adapter_outcomes = adapter_run.outcomes;
+    out.extend(adapter_run.evidence);
 
     coverage.elapsed = started.elapsed();
     (out, coverage)
