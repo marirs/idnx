@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod asus;
+pub mod attempt;
 pub mod cdp;
 pub mod dns;
 pub mod http;

@@ -26,6 +26,7 @@ use std::time::Duration;
 use crate::net::endpoint::Endpoint;
 use crate::net::socket::SocketBinding;
 
+use crate::probes::attempt::AttemptOutcome;
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{DeviceKey, Fact};
 
@@ -111,128 +112,20 @@ pub struct VendorContext {
 /// has no implementation, one that ran and heard nothing, and one that ran and found
 /// something are three different facts, and reporting the first as though it were the
 /// second told the operator a protocol had been tried when no packet had been sent.
-#[derive(Debug, Clone)]
-pub enum AdapterOutcome {
-    /// Selected, but there is nothing here to run.
-    ///
-    /// A stub. Reported as unavailable so it is never mistaken for a device declining to
-    /// answer, which is what "no response" claims.
-    Unavailable { reason: String },
-    /// Ran, and the device did not answer.
-    NoResponse { attempted: Vec<String> },
-    /// Ran, and the device answered.
-    Answered {
-        attempted: Vec<String>,
-        evidence: Vec<TopologyEvidence>,
-    },
-}
-
-impl AdapterOutcome {
-    /// A stub, with the reason it cannot run.
-    pub fn unavailable(reason: impl Into<String>) -> Self {
-        AdapterOutcome::Unavailable {
-            reason: reason.into(),
-        }
-    }
-
-    /// The evidence, if any.
-    pub fn evidence(self) -> Vec<TopologyEvidence> {
-        match self {
-            AdapterOutcome::Answered { evidence, .. } => evidence,
-            _ => Vec::new(),
-        }
-    }
-
-    /// One line for the coverage report, naming what was and was not done.
-    pub fn describe(&self, adapter: &str) -> String {
-        match self {
-            AdapterOutcome::Unavailable { reason } => {
-                format!("{adapter} unavailable: {reason}")
-            }
-            AdapterOutcome::NoResponse { attempted } => {
-                format!("{adapter} no response ({})", attempted.join(", "))
-            }
-            AdapterOutcome::Answered { attempted, .. } => {
-                format!("{adapter} answered ({})", attempted.join(", "))
-            }
-        }
-    }
-}
+///
+/// The same five states every other probe reports, so "unavailable" cannot decay into
+/// "no response" as evidence moves through the run.
+pub type AdapterOutcome = AttemptOutcome<Vec<TopologyEvidence>>;
 
 /// Future returned by a targeted adapter.
 pub type AdapterFuture<'a> = Pin<Box<dyn Future<Output = AdapterOutcome> + Send + 'a>>;
 
 /// What running a link-local broadcast amounted to.
 ///
-/// Five states, because collapsing them loses the distinctions that matter. A protocol
-/// whose framing has never been verified is not the same as one that was sent and ignored;
-/// a socket that could not be opened is not the same as a device that stayed quiet; and
-/// bytes that arrived but failed validation are a finding in their own right.
-#[derive(Debug, Clone)]
-pub enum BroadcastOutcome {
-    /// The protocol's framing has not been established, so nothing is sent.
-    Unavailable { reason: String },
-    /// Transmission failed locally: no socket, no binding, no packet on the wire.
-    NotSent { reason: String },
-    /// A verified request went out and nothing came back.
-    NoResponse { sent: String },
-    /// Bytes arrived and did not survive protocol validation.
-    InvalidResponse { sent: String, rejected: usize },
-    /// A correlated, structurally valid reply produced evidence.
-    Answered {
-        sent: String,
-        evidence: Vec<TopologyEvidence>,
-    },
-}
-
-impl BroadcastOutcome {
-    pub fn unavailable(reason: impl Into<String>) -> Self {
-        BroadcastOutcome::Unavailable {
-            reason: reason.into(),
-        }
-    }
-
-    pub fn not_sent(reason: impl Into<String>) -> Self {
-        BroadcastOutcome::NotSent {
-            reason: reason.into(),
-        }
-    }
-
-    pub fn evidence(self) -> Vec<TopologyEvidence> {
-        match self {
-            BroadcastOutcome::Answered { evidence, .. } => evidence,
-            _ => Vec::new(),
-        }
-    }
-
-    /// Whether a request actually reached the wire.
-    ///
-    /// This is what separates "the link was quiet" from "nothing was ever asked". Only the
-    /// former is a fact about the network; reporting the latter as silence is the same
-    /// overclaim as reporting an unanswered device as offline.
-    pub fn transmitted(&self) -> bool {
-        matches!(
-            self,
-            BroadcastOutcome::NoResponse { .. }
-                | BroadcastOutcome::InvalidResponse { .. }
-                | BroadcastOutcome::Answered { .. }
-        )
-    }
-
-    pub fn describe(&self, broadcast: &str) -> String {
-        match self {
-            BroadcastOutcome::Unavailable { reason } => {
-                format!("{broadcast} unavailable: {reason}")
-            }
-            BroadcastOutcome::NotSent { reason } => format!("{broadcast} not sent: {reason}"),
-            BroadcastOutcome::NoResponse { sent } => format!("{broadcast} no response ({sent})"),
-            BroadcastOutcome::InvalidResponse { sent, rejected } => {
-                format!("{broadcast} {rejected} reply/replies failed validation ({sent})")
-            }
-            BroadcastOutcome::Answered { sent, .. } => format!("{broadcast} answered ({sent})"),
-        }
-    }
-}
+/// The same five-state accounting the targeted adapters use, so a broadcast whose framing
+/// is unverified is never confused with a link that stayed quiet. Evidence rides only in
+/// `Answered`, which is what keeps an unvalidated reply from reaching the graph.
+pub type BroadcastOutcome = AttemptOutcome<Vec<TopologyEvidence>>;
 
 /// Future returned by a link-local broadcast.
 ///
@@ -432,7 +325,8 @@ pub async fn run_broadcasts(
         transmitted |= outcome.transmitted();
         evidence.extend(
             outcome
-                .evidence()
+                .result()
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|ev| adapter_may_assert(&ev.fact)),
         );
@@ -515,7 +409,8 @@ pub async fn run_adapters(context: &VendorContext) -> AdapterRun {
         outcomes.push(outcome.describe(adapter.name()));
         evidence.extend(
             outcome
-                .evidence()
+                .result()
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|ev| adapter_may_assert(&ev.fact)),
         );
@@ -749,41 +644,23 @@ mod tests {
     }
 
     #[test]
-    fn a_broadcast_outcome_distinguishes_every_failure_mode() {
-        // Collapsing these loses what an operator needs: an unverified protocol, a socket
-        // that could not be opened, a link that stayed quiet and bytes that failed
-        // validation are four different findings.
-        let sent = "UDP 9999".to_string();
+    fn only_a_validated_broadcast_answer_can_carry_evidence() {
+        // The five states themselves are exercised in probes::attempt; what matters here is
+        // that no state other than Answered has a place to put evidence, so an unvalidated
+        // reply has no route into the graph.
         let cases = [
             BroadcastOutcome::unavailable("framing unverified"),
             BroadcastOutcome::not_sent("no IPv4 source address"),
-            BroadcastOutcome::NoResponse { sent: sent.clone() },
+            BroadcastOutcome::NoResponse {
+                sent: "UDP 9999".to_string(),
+            },
             BroadcastOutcome::InvalidResponse {
-                sent: sent.clone(),
+                sent: "UDP 9999".to_string(),
                 rejected: 2,
             },
-            BroadcastOutcome::Answered {
-                sent,
-                evidence: Vec::new(),
-            },
         ];
-
-        let described: Vec<String> = cases.iter().map(|c| c.describe("broadcast:test")).collect();
-        for (index, text) in described.iter().enumerate() {
-            for (other, previous) in described.iter().enumerate() {
-                assert!(index == other || text != previous, "{text} is ambiguous");
-            }
-        }
-        assert!(described[0].contains("unavailable"));
-        assert!(described[1].contains("not sent"));
-        assert!(described[2].contains("no response"));
-        assert!(described[3].contains("failed validation"));
-        assert!(described[4].contains("answered"));
-
-        // Only a validated answer may carry evidence.
         for case in cases {
-            let answered = matches!(case, BroadcastOutcome::Answered { .. });
-            assert!(case.evidence().is_empty() || answered);
+            assert!(case.result().is_none());
         }
     }
 
