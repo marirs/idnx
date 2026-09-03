@@ -69,11 +69,11 @@ fn radius_for(kind: NodeKind) -> f32 {
 
 fn node_key(id: &NodeId) -> String {
     match id {
-        NodeId::Interface(n) => format!("iface:{n}"),
+        NodeId::Interface(n, realm) => format!("iface:{n}{}", realm.suffix()),
         NodeId::Network(n, realm) => format!("net:{n}{}", realm.suffix()),
-        NodeId::Vlan(v) => format!("vlan:{v}"),
+        NodeId::Vlan(v, realm) => format!("vlan:{v}{}", realm.suffix()),
         NodeId::Device(d) => format!("dev:{d}"),
-        NodeId::Service(a, p) => format!("svc:{a}:{p}"),
+        NodeId::Service(a, p, realm) => format!("svc:{a}:{p}{}", realm.suffix()),
     }
 }
 
@@ -111,13 +111,33 @@ fn build_data(report: &DiscoveryReport) -> GraphData {
         if let Some(reason) = &node.opaque_reason {
             detail.push(format!("boundary: {}", safe(reason)));
         }
-        if let NodeId::Network(net, _) = &node.id {
+        if let NodeId::Network(net, realm) = &node.id {
             let ifaces = graph.interfaces_for_network(net);
             if is_virtual_network(&ifaces) {
                 detail.push("virtual / VPN network".to_string());
             }
             if report.oversized_scopes.contains(net) {
                 detail.push("too large to enumerate address by address".to_string());
+            }
+            // The observation domain is part of this network's identity: two peers can
+            // each hold a 10.0.0.0/24, and the page must show them as two.
+            if !realm.is_local() {
+                detail.push(format!("observed in {}", realm.label()));
+            }
+        }
+
+        // Same for every other node whose identity is domain-scoped, so a viewer can tell
+        // two identical-looking nodes apart.
+        for realm in [match &node.id {
+            NodeId::Interface(_, realm) | NodeId::Vlan(_, realm) => Some(realm),
+            NodeId::Service(_, _, realm) => Some(realm),
+            _ => None,
+        }]
+        .into_iter()
+        .flatten()
+        {
+            if !realm.is_local() {
+                detail.push(format!("observed in {}", realm.label()));
             }
         }
 

@@ -28,6 +28,13 @@ pub enum RejectReason {
     /// A sequence number at or below one already accepted from this peer -- a replay, or a
     /// bundle arriving out of order behind a newer one.
     Stale { seen: u64, offered: u64 },
+    /// Another connection is already midway through applying this peer's bundle.
+    ///
+    /// Two connections from one peer -- a direct link and a relay, or a reconnect racing a
+    /// stale socket -- can otherwise both prepare the same sequence before either commits,
+    /// and the evidence is applied twice. The second is told to wait rather than refused
+    /// for good.
+    Busy { peer: String },
     /// The bundle contains vocabulary this build does not understand.
     ///
     /// Refused whole, and the sequence is not advanced. Taking the readable half would
@@ -52,6 +59,10 @@ impl std::fmt::Display for RejectReason {
                     f,
                     "stale: sequence {offered} at or below {seen} already accepted"
                 )
+            }
+            RejectReason::Busy { peer } => {
+                let short: String = peer.chars().take(16).collect();
+                write!(f, "another transaction for peer {short} is still in flight")
             }
             RejectReason::Undecodable(reasons) => {
                 write!(
@@ -125,6 +136,12 @@ pub struct PeerLedger {
     trusted: HashMap<String, PeerId>,
     /// Highest sequence accepted per peer, so a replay cannot re-apply old evidence.
     highest_sequence: HashMap<String, u64>,
+    /// Sequences currently being applied, per peer.
+    ///
+    /// The whole transaction -- prepare, hand to the engine, persist the cursor, commit,
+    /// acknowledge -- must be serial per peer. Holding the reservation here makes a second
+    /// concurrent prepare for the same peer fail rather than duplicate the work.
+    in_flight: HashMap<String, u64>,
 }
 
 impl PeerLedger {
@@ -155,7 +172,7 @@ impl PeerLedger {
     ///
     /// Nothing here changes the ledger. The caller commits only once the evidence has an
     /// owner and the cursor is durable; until then the bundle may be offered again.
-    pub fn prepare(&self, bundle: &EvidenceBundle) -> Result<Prepared, RejectReason> {
+    pub fn prepare(&mut self, bundle: &EvidenceBundle) -> Result<Prepared, RejectReason> {
         let peer = bundle.verify().map_err(RejectReason::Unverifiable)?;
 
         if !self.is_paired(&peer) {
@@ -196,6 +213,13 @@ impl PeerLedger {
             return Err(RejectReason::Undecodable(undecodable));
         }
 
+        // Reserved for the duration of the transaction. Released by `commit` or `abandon`.
+        if let Some(&held) = self.in_flight.get(&key) {
+            let _ = held;
+            return Err(RejectReason::Busy { peer: key });
+        }
+        self.in_flight.insert(key, bundle.sequence);
+
         Ok(Prepared {
             peer,
             vantage: bundle.vantage.clone(),
@@ -210,10 +234,26 @@ impl PeerLedger {
     /// cursor has been written to disk. Anything earlier risks a sequence marked consumed
     /// by work that did not happen.
     pub fn commit(&mut self, peer: &PeerId, sequence: u64) {
-        let entry = self.highest_sequence.entry(peer.to_hex()).or_default();
+        let key = peer.to_hex();
+        let entry = self.highest_sequence.entry(key.clone()).or_default();
         if sequence > *entry {
             *entry = sequence;
         }
+        self.in_flight.remove(&key);
+    }
+
+    /// Releases a reservation without recording the bundle as seen.
+    ///
+    /// For a transaction that could not finish -- the engine declined the evidence, or the
+    /// cursor could not be persisted. The sequence stays offerable, and the peer's next
+    /// attempt is not blocked by a reservation nothing is going to release.
+    pub fn abandon(&mut self, peer: &PeerId) {
+        self.in_flight.remove(&peer.to_hex());
+    }
+
+    /// Whether a transaction for this peer is in flight.
+    pub fn is_busy(&self, peer: &PeerId) -> bool {
+        self.in_flight.contains_key(&peer.to_hex())
     }
 
     /// Seeds the replay cursor from durable state at startup.
@@ -226,9 +266,17 @@ impl PeerLedger {
 
     /// Verifies, converts and commits in one step.
     ///
-    /// For callers with no separate delivery step -- tests, and single-threaded merges
-    /// where the evidence cannot be declined after the fact.
-    pub fn accept(&mut self, bundle: &EvidenceBundle) -> Result<Accepted, RejectReason> {
+    /// **Not for runtime use.** It advances the replay cursor before the evidence has an
+    /// owner or the cursor is durable, which is exactly the sequence of events that made a
+    /// declined bundle unresendable. Runtime code uses `prepare`, hands the evidence over,
+    /// persists the cursor, and only then commits.
+    ///
+    /// Kept public because integration tests are separate crates and cannot reach a
+    /// `cfg(test)` item; a guard test fails if anything under `src/` calls it.
+    pub fn accept_immediately(
+        &mut self,
+        bundle: &EvidenceBundle,
+    ) -> Result<Accepted, RejectReason> {
         let prepared = self.prepare(bundle)?;
         self.commit(&prepared.peer, prepared.sequence);
         Ok(prepared.into_accepted())
@@ -266,7 +314,7 @@ mod tests {
         let (mut ledger, key) = paired();
         let bundle = EvidenceBundle::publish(&key, "br0", 1, &evidence());
 
-        let accepted = ledger.accept(&bundle).expect("accepted");
+        let accepted = ledger.accept_immediately(&bundle).expect("accepted");
         assert_eq!(accepted.peer, key.id());
         assert_eq!(accepted.evidence.len(), 1);
 
@@ -288,7 +336,7 @@ mod tests {
 
         assert!(bundle.verify().is_ok(), "the bundle itself is genuine");
         assert_eq!(
-            ledger.accept(&bundle).unwrap_err(),
+            ledger.accept_immediately(&bundle).unwrap_err(),
             RejectReason::NotPaired(stranger.id().to_hex())
         );
     }
@@ -298,9 +346,9 @@ mod tests {
         let (mut ledger, key) = paired();
         let bundle = EvidenceBundle::publish(&key, "br0", 4, &evidence());
 
-        assert!(ledger.accept(&bundle).is_ok());
+        assert!(ledger.accept_immediately(&bundle).is_ok());
         assert_eq!(
-            ledger.accept(&bundle).unwrap_err(),
+            ledger.accept_immediately(&bundle).unwrap_err(),
             RejectReason::Stale {
                 seen: 4,
                 offered: 4
@@ -313,12 +361,12 @@ mod tests {
         let (mut ledger, key) = paired();
         assert!(
             ledger
-                .accept(&EvidenceBundle::publish(&key, "br0", 9, &evidence()))
+                .accept_immediately(&EvidenceBundle::publish(&key, "br0", 9, &evidence()))
                 .is_ok()
         );
         assert_eq!(
             ledger
-                .accept(&EvidenceBundle::publish(&key, "br0", 8, &evidence()))
+                .accept_immediately(&EvidenceBundle::publish(&key, "br0", 8, &evidence()))
                 .unwrap_err(),
             RejectReason::Stale {
                 seen: 9,
@@ -334,10 +382,10 @@ mod tests {
         let mut forged = EvidenceBundle::publish(&key, "br0", 1000, &evidence());
         forged.vantage = "tampered".to_string();
 
-        assert!(ledger.accept(&forged).is_err());
+        assert!(ledger.accept_immediately(&forged).is_err());
         assert!(
             ledger
-                .accept(&EvidenceBundle::publish(&key, "br0", 1, &evidence()))
+                .accept_immediately(&EvidenceBundle::publish(&key, "br0", 1, &evidence()))
                 .is_ok(),
             "the peer's genuine bundle must still be accepted"
         );
@@ -377,7 +425,7 @@ mod tests {
         // the remainder afterwards does not undo that.
         let (mut ledger, key) = paired();
 
-        let reasons = match ledger.accept(&bundle_with_unknown_vocabulary(&key, 1)) {
+        let reasons = match ledger.accept_immediately(&bundle_with_unknown_vocabulary(&key, 1)) {
             Err(RejectReason::Undecodable(reasons)) => reasons,
             other => panic!("expected an undecodable rejection, got {other:?}"),
         };
@@ -392,14 +440,14 @@ mod tests {
         let (mut ledger, key) = paired();
         assert!(
             ledger
-                .accept(&bundle_with_unknown_vocabulary(&key, 7))
+                .accept_immediately(&bundle_with_unknown_vocabulary(&key, 7))
                 .is_err()
         );
 
         // Standing in for the upgraded build: the same sequence, now fully readable.
         let readable = EvidenceBundle::publish(&key, "br0", 7, &evidence());
         assert!(
-            ledger.accept(&readable).is_ok(),
+            ledger.accept_immediately(&readable).is_ok(),
             "a resend at the same sequence must still be accepted"
         );
     }
@@ -416,6 +464,7 @@ mod tests {
         assert_eq!(prepared.sequence(), 1);
         // The delivery is declined, so the bundle is dropped without committing.
         drop(prepared);
+        ledger.abandon(&key.id());
 
         let second = ledger
             .prepare(&bundle)
@@ -435,10 +484,12 @@ mod tests {
 
     #[test]
     fn preparing_a_bundle_changes_nothing_until_it_is_committed() {
-        let (ledger, key) = paired();
+        let (mut ledger, key) = paired();
         for sequence in [5u64, 5, 5] {
             let bundle = EvidenceBundle::publish(&key, "br0", sequence, &evidence());
-            assert!(ledger.prepare(&bundle).is_ok(), "no state advanced");
+            assert!(ledger.prepare(&bundle).is_ok(), "no cursor advanced");
+            // Release the reservation without committing, as a declined delivery would.
+            ledger.abandon(&key.id());
         }
     }
 
@@ -465,6 +516,44 @@ mod tests {
     }
 
     #[test]
+    fn two_connections_from_one_peer_cannot_apply_the_same_bundle_twice() {
+        // A direct link and a relay, or a reconnect racing a stale socket, both offering
+        // the same bundle: without a reservation both prepare it before either commits and
+        // the evidence lands twice.
+        let (mut ledger, key) = paired();
+        let bundle = EvidenceBundle::publish(&key, "br0", 1, &evidence());
+
+        let first = ledger.prepare(&bundle).expect("prepared");
+        assert!(ledger.is_busy(&key.id()));
+        assert_eq!(
+            ledger.prepare(&bundle).unwrap_err(),
+            RejectReason::Busy {
+                peer: key.id().to_hex()
+            }
+        );
+
+        ledger.commit(first.peer(), first.sequence());
+        assert!(!ledger.is_busy(&key.id()));
+    }
+
+    #[test]
+    fn abandoning_a_transaction_frees_the_peer_for_its_next_attempt() {
+        // A reservation nothing releases would block the peer for the life of the process.
+        let (mut ledger, key) = paired();
+        let bundle = EvidenceBundle::publish(&key, "br0", 1, &evidence());
+
+        let prepared = ledger.prepare(&bundle).expect("prepared");
+        drop(prepared);
+        ledger.abandon(&key.id());
+
+        assert!(!ledger.is_busy(&key.id()));
+        assert!(
+            ledger.prepare(&bundle).is_ok(),
+            "the same sequence is offerable again"
+        );
+    }
+
+    #[test]
     fn a_forged_bundle_is_reported_as_unverifiable_not_as_unknown() {
         // "we ignored a peer" and "someone sent us something forged" are different
         // operational events and must not read alike.
@@ -473,7 +562,7 @@ mod tests {
         bundle.sequence = 2;
 
         assert!(matches!(
-            ledger.accept(&bundle),
+            ledger.accept_immediately(&bundle),
             Err(RejectReason::Unverifiable(_))
         ));
     }

@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use ipnet::IpNet;
 
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
-use super::realm::{Realm, network_realm, qualify_device};
+use super::realm::{Realm, address_realm, network_realm, qualify_device, scoped_realm};
 use super::role::{DeviceRole, score_role};
 
 /// How a device is presented to an operator.
@@ -221,17 +221,24 @@ fn is_v6_link_local(addr: &std::net::Ipv6Addr) -> bool {
 /// Stable identity for a graph node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
-    Interface(String),
+    /// A local interface, in the domain that named it. Every peer has an `eth0`.
+    Interface(String, Realm),
     /// A network, in the domain it was observed in.
     ///
     /// The realm is part of the identity because a prefix is not: two peers both running
     /// 10.0.0.0/24 have two networks, and keying them by prefix alone merged them into one
     /// that neither has. Locally observed and publicly routable networks carry
     /// [`Realm::Local`], so nothing about a single-machine run changes.
-    Network(IpNet, crate::topology::realm::Realm),
-    Vlan(u16),
+    Network(IpNet, Realm),
+    /// A VLAN, in the switched domain that uses the tag. VLAN 20 at two sites is two VLANs.
+    Vlan(u16, Realm),
     Device(DeviceKey),
-    Service(IpAddr, u16),
+    /// A service, in the domain of the address it is exposed on.
+    ///
+    /// A public address carries one identity, so two peers reporting a service on it are
+    /// reporting one service. A private one does not: `10.0.0.9:443` exists on countless
+    /// networks.
+    Service(IpAddr, u16, Realm),
 }
 
 /// What a node represents.
@@ -435,12 +442,28 @@ impl Node {
             return addr.to_string();
         }
         match &self.id {
-            NodeId::Interface(n) => n.clone(),
+            NodeId::Interface(n, _) => n.clone(),
             NodeId::Network(n, _) => n.to_string(),
-            NodeId::Vlan(v) => format!("VLAN {}", v),
+            NodeId::Vlan(v, _) => format!("VLAN {}", v),
             NodeId::Device(d) => d.to_string(),
-            NodeId::Service(a, p) => format!("{}:{}", a, p),
+            NodeId::Service(a, p, _) => format!("{}:{}", a, p),
         }
+    }
+}
+
+/// A network together with the domain it was observed in.
+///
+/// Both halves are needed to name one: two peers can each hold a 10.0.0.0/24, and they are
+/// different networks. Displays as the prefix, because that is what an operator reads.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NetworkRef {
+    pub prefix: IpNet,
+    pub realm: Realm,
+}
+
+impl std::fmt::Display for NetworkRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.prefix)
     }
 }
 
@@ -463,7 +486,13 @@ pub struct TopologyGraph {
     /// merges into the same device rather than creating a second one.
     /// Keyed by address *and* zone: a link-local address is only unique within its link,
     /// so a global key would merge unrelated devices that share one.
-    address_owner: HashMap<(IpAddr, Option<String>), DeviceKey>,
+    /// Who holds an address, within one observation domain.
+    ///
+    /// The realm is part of the key because an address is not a global name. Two peers both
+    /// reporting 10.0.0.9 overwrote each other here, so the second peer's hostnames and
+    /// services attached to the first peer's device. Globally unique addresses resolve to
+    /// the local domain, so a host two peers both see still has one owner.
+    address_owner: HashMap<(IpAddr, Option<String>, Realm), DeviceKey>,
     /// VLAN IDs seen without any prefix-bearing evidence.
     vlans_without_prefix: BTreeSet<u16>,
     /// Structured role signals per device. Kept separate from `Node::role_signals`, which
@@ -497,6 +526,11 @@ impl TopologyGraph {
     }
 
     /// Networks currently known, each backed by prefix-bearing evidence.
+    /// A network, named by prefix and by the domain that observed it.
+    ///
+    /// Output needs both. A prefix alone cannot distinguish two peers' 10.0.0.0/24, so
+    /// rendering by prefix showed one of them twice with the other's provenance.
+    ///
     /// The node for a prefix, in whichever domain holds it.
     ///
     /// Callers that only have a prefix -- display, mostly -- cannot know the realm. Where
@@ -514,21 +548,54 @@ impl TopologyGraph {
 
     /// Networks this machine observed itself, which are the only ones it can traverse.
     ///
-    /// A peer's network cannot be swept from here: the addresses are not reachable and the
-    /// prefix may well belong to a different network of the same shape. Sweeping one would
-    /// probe this vantage's own address space while attributing the result elsewhere.
+    /// Decided from provenance, not from the identity namespace. A globally unique prefix
+    /// shares one identity so that peers can corroborate each other about it -- that is a
+    /// statement about naming, and reading it as reachability would have this machine sweep
+    /// a peer's uplink. A network is traversable here only if something on this machine
+    /// observed it.
     pub fn local_networks(&self) -> Vec<IpNet> {
         let mut nets: Vec<IpNet> = self
             .nodes
             .values()
             .filter_map(|n| match &n.id {
-                NodeId::Network(net, Realm::Local) => Some(*net),
+                NodeId::Network(net, _) if n.provenance.iter().any(|p| !p.is_remote()) => {
+                    Some(*net)
+                }
                 _ => None,
             })
             .collect();
         nets.sort_by_key(|n| n.to_string());
         nets.dedup();
         nets
+    }
+
+    /// Every network, each carrying the domain that observed it.
+    pub fn network_refs(&self) -> Vec<NetworkRef> {
+        let mut refs: Vec<NetworkRef> = self
+            .nodes
+            .values()
+            .filter_map(|n| match &n.id {
+                NodeId::Network(prefix, realm) => Some(NetworkRef {
+                    prefix: *prefix,
+                    realm: realm.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        refs.sort_by(|a, b| {
+            a.prefix
+                .to_string()
+                .cmp(&b.prefix.to_string())
+                .then_with(|| a.realm.cmp(&b.realm))
+        });
+        refs.dedup();
+        refs
+    }
+
+    /// The node for one specific network.
+    pub fn network_ref_node(&self, reference: &NetworkRef) -> Option<&Node> {
+        self.nodes
+            .get(&NodeId::Network(reference.prefix, reference.realm.clone()))
     }
 
     pub fn networks(&self) -> Vec<IpNet> {
@@ -594,7 +661,7 @@ impl TopologyGraph {
             .values()
             .filter(|e| e.relationship == Relationship::AttachedTo && e.to == target)
             .filter_map(|e| match &e.from {
-                NodeId::Interface(name) => Some(name.as_str()),
+                NodeId::Interface(name, _) => Some(name.as_str()),
                 _ => None,
             })
             .collect()
@@ -679,14 +746,25 @@ impl TopologyGraph {
     }
 
     /// Resolves the canonical device key for an address, if one is already known.
+    /// Resolves the canonical device key for a locally observed address.
+    ///
+    /// Local domain first, because a caller with only an address is asking about something
+    /// this machine can reach. A peer's device is reachable only through that peer.
     pub fn device_for_address(&self, addr: &IpAddr) -> Option<&DeviceKey> {
-        self.address_owner.get(&(*addr, None)).or_else(|| {
-            // Fall back to any zone when the caller did not supply one.
-            self.address_owner
-                .iter()
-                .find(|((a, _), _)| a == addr)
-                .map(|(_, owner)| owner)
-        })
+        self.address_owner
+            .get(&(*addr, None, Realm::Local))
+            .or_else(|| {
+                self.address_owner
+                    .iter()
+                    .find(|((a, _, realm), _)| a == addr && realm.is_local())
+                    .map(|(_, owner)| owner)
+            })
+            .or_else(|| {
+                self.address_owner
+                    .iter()
+                    .find(|((a, _, _), _)| a == addr)
+                    .map(|(_, owner)| owner)
+            })
     }
 
     /// Folds one piece of evidence into the graph.
@@ -711,7 +789,7 @@ impl TopologyGraph {
                 if !self.upsert_network(prefix, &realm, ev.confidence, prov.clone()) {
                     return;
                 }
-                let iface_id = NodeId::Interface(interface);
+                let iface_id = NodeId::Interface(interface, scoped_realm(&realm));
                 self.upsert(
                     iface_id.clone(),
                     NodeKind::Interface,
@@ -727,7 +805,7 @@ impl TopologyGraph {
                 );
             }
             Fact::Vlan { id } => {
-                let node_id = NodeId::Vlan(id);
+                let node_id = NodeId::Vlan(id, scoped_realm(&realm));
                 self.upsert(node_id, NodeKind::Vlan, ev.confidence, prov);
                 self.vlans_without_prefix.insert(id);
             }
@@ -742,7 +820,8 @@ impl TopologyGraph {
                 } else {
                     None
                 };
-                self.address_owner.insert((address, zone), key);
+                self.address_owner
+                    .insert((address, zone, address_realm(&address, &realm)), key);
                 if let Some(node) = self.nodes.get_mut(&id) {
                     node.addresses.insert(address);
                 }
@@ -929,7 +1008,7 @@ impl TopologyGraph {
                 protocol,
                 detail,
             } => {
-                let id = NodeId::Service(address, port);
+                let id = NodeId::Service(address, port, address_realm(&address, &realm));
                 self.upsert(id.clone(), NodeKind::Service, ev.confidence, prov.clone());
                 if let Some(node) = self.nodes.get_mut(&id) {
                     node.descriptions.insert(match detail {
@@ -997,7 +1076,11 @@ impl TopologyGraph {
                 continue;
             };
 
-            if let Some(owner) = self.address_owner.get(&lookup)
+            if let Some(owner) = self
+                .address_owner
+                .iter()
+                .find(|((a, z, _), _)| (*a, z.clone()) == lookup)
+                .map(|(_, owner)| owner)
                 && matches!(owner, DeviceKey::Mac(_))
             {
                 merges.push((id.clone(), NodeId::Device(owner.clone())));
@@ -1127,14 +1210,14 @@ impl TopologyGraph {
                     _ => None,
                 };
                 if let Some(addr) = key.address()
-                    && let Some(owner) = self.address_owner.get(&(addr, zone.clone()))
+                    && let Some(owner) = self.owner_in_any_realm(&addr, zone.as_deref())
                 {
-                    return owner.clone();
+                    return owner;
                 }
                 if let Some(addr) = address
-                    && let Some(owner) = self.address_owner.get(&(addr, zone))
+                    && let Some(owner) = self.owner_in_any_realm(&addr, zone.as_deref())
                 {
-                    return owner.clone();
+                    return owner;
                 }
                 key.clone()
             }
@@ -1148,7 +1231,25 @@ impl TopologyGraph {
         } else {
             None
         };
-        self.address_owner.get(&(*address, zone)).cloned()
+        self.owner_in_any_realm(address, zone.as_deref())
+    }
+
+    /// Owner of an address with a given zone, in whichever domain holds it.
+    ///
+    /// Identities have already been qualified by the time they reach the map, so an
+    /// address and zone pair can appear in at most one remote domain -- plus the local one,
+    /// which is preferred because it is the one this machine can act on.
+    fn owner_in_any_realm(&self, address: &IpAddr, zone: Option<&str>) -> Option<DeviceKey> {
+        let zone = zone.map(|z| z.to_string());
+        self.address_owner
+            .get(&(*address, zone.clone(), Realm::Local))
+            .or_else(|| {
+                self.address_owner
+                    .iter()
+                    .find(|((a, z, _), _)| a == address && *z == zone)
+                    .map(|(_, owner)| owner)
+            })
+            .cloned()
     }
 
     fn upsert_network(

@@ -118,6 +118,12 @@ pub struct NetworkExport {
     pub confidence: String,
     /// False when the network was too large to enumerate address by address.
     pub enumerated: bool,
+    /// The observation domain this network belongs to: `local`, or the peer and vantage
+    /// that reported it. Part of its identity, not decoration -- two peers can each hold a
+    /// 10.0.0.0/24, and merging by prefix alone would fuse two different networks.
+    pub observed_in: String,
+    /// True when no local observation supports this network.
+    pub observed_by_peer: bool,
     pub evidence: Vec<EvidenceExport>,
 }
 
@@ -217,11 +223,11 @@ fn node_label(graph: &TopologyGraph, id: &NodeId) -> String {
     match graph.node(id) {
         Some(node) => node.display_name(),
         None => match id {
-            NodeId::Interface(n) => n.clone(),
+            NodeId::Interface(n, _) => n.clone(),
             NodeId::Network(n, _) => n.to_string(),
-            NodeId::Vlan(v) => format!("VLAN {}", v),
+            NodeId::Vlan(v, _) => format!("VLAN {}", v),
             NodeId::Device(d) => d.to_string(),
-            NodeId::Service(a, p) => format!("{}:{}", a, p),
+            NodeId::Service(a, p, _) => format!("{}:{}", a, p),
         },
     }
 }
@@ -251,14 +257,14 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
     let graph = &report.graph;
 
     let mut networks = Vec::new();
-    for net in graph.networks() {
+    for net in graph.network_refs() {
         let interfaces: Vec<String> = graph
-            .interfaces_for_network(&net)
+            .interfaces_for_network(&net.prefix)
             .into_iter()
             .map(|s| s.to_string())
             .collect();
         let iface_refs: Vec<&str> = interfaces.iter().map(|s| s.as_str()).collect();
-        let node = graph.network_node(&net);
+        let node = graph.network_ref_node(&net);
         networks.push(NetworkExport {
             cidr: net.to_string(),
             kind: if is_virtual_network(&iface_refs) {
@@ -270,11 +276,19 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             confidence: node
                 .map(|n| n.confidence.label().to_string())
                 .unwrap_or_else(|| Confidence::Observed.label().to_string()),
-            enumerated: !report.oversized_scopes.contains(&net),
+            enumerated: !report.oversized_scopes.contains(&net.prefix),
+            // Which observation domain this network belongs to. Two peers can each hold a
+            // 10.0.0.0/24, and a consumer merging exports by prefix alone would fuse them.
+            observed_in: net.realm.label(),
+            observed_by_peer: !net.realm.is_local(),
             evidence: node.map(|n| evidence_of(&n.provenance)).unwrap_or_default(),
         });
     }
-    networks.sort_by(|a, b| a.cidr.cmp(&b.cidr));
+    networks.sort_by(|a, b| {
+        a.cidr
+            .cmp(&b.cidr)
+            .then_with(|| a.observed_in.cmp(&b.observed_in))
+    });
 
     let vlans: Vec<VlanExport> = graph
         .vlans_without_prefix()

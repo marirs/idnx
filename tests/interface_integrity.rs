@@ -268,3 +268,41 @@ fn rust_sources(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
     out.sort();
     out
 }
+
+/// Runtime code must never use the immediate-accept shortcut.
+///
+/// It advances the replay cursor before the evidence has an owner or the cursor is durable
+/// -- the exact sequence that made a declined bundle unresendable. It stays public only
+/// because integration tests are separate crates and cannot reach a `cfg(test)` item.
+#[test]
+fn no_runtime_code_commits_a_bundle_before_delivery() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offences = Vec::new();
+
+    for path in rust_sources(&root) {
+        let relative = path
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // The definition and its own tests live here.
+        if relative == "src/federation/ledger.rs" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (number, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if !code.starts_with("//") && code.contains("accept_immediately") {
+                offences.push(format!("{relative}:{}: {}", number + 1, code.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offences.is_empty(),
+        "runtime code must prepare, deliver, persist the cursor, then commit:\n{}",
+        offences.join("\n")
+    );
+}

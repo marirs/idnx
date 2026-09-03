@@ -6,13 +6,12 @@
 
 use colored::*;
 use comfy_table::{Cell, Color as TableColor, ContentArrangement, Table, presets::UTF8_FULL};
-use ipnet::IpNet;
 
 use crate::engine::orchestrator::{DiscoveryReport, is_virtual_network};
 use crate::net::vantage::StartingScope;
 use crate::output::safe;
 use crate::topology::evidence::DeviceKey;
-use crate::topology::graph::DeviceCategory;
+use crate::topology::graph::{DeviceCategory, NetworkRef};
 use crate::topology::graph::{NodeKind, Relationship};
 use crate::topology::{NodeId, TopologyGraph};
 
@@ -73,8 +72,12 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
 }
 
 /// A network's peer attribution, where it has one.
-fn network_origin(graph: &TopologyGraph, net: &IpNet) -> Option<String> {
-    let node = graph.network_node(net)?;
+///
+/// Takes the realm-aware reference, not a bare prefix: two peers can each hold a
+/// 10.0.0.0/24, and looking one up by prefix returned whichever was found first -- so the
+/// second rendered with the first's provenance.
+fn network_origin(graph: &TopologyGraph, net: &NetworkRef) -> Option<String> {
+    let node = graph.network_ref_node(net)?;
     let origins = node.peer_origins();
     if origins.is_empty() {
         return None;
@@ -92,25 +95,25 @@ fn network_origin(graph: &TopologyGraph, net: &IpNet) -> Option<String> {
 
 fn render_networks(report: &DiscoveryReport) {
     let graph = &report.graph;
-    let mut physical: Vec<IpNet> = Vec::new();
-    let mut virtual_nets: Vec<IpNet> = Vec::new();
+    let mut physical: Vec<NetworkRef> = Vec::new();
+    let mut virtual_nets: Vec<NetworkRef> = Vec::new();
 
-    for net in graph.networks() {
-        let ifaces = graph.interfaces_for_network(&net);
+    for net in graph.network_refs() {
+        let ifaces = graph.interfaces_for_network(&net.prefix);
         if is_virtual_network(&ifaces) {
             virtual_nets.push(net);
         } else {
             physical.push(net);
         }
     }
-    physical.sort_by_key(|n| n.to_string());
-    virtual_nets.sort_by_key(|n| n.to_string());
+    physical.sort();
+    virtual_nets.sort();
 
     if !physical.is_empty() {
         println!("\n{}", "Networks".bold().green());
         for net in &physical {
-            let oversized = report.oversized_scopes.contains(net);
-            let note = if net.addr().is_ipv6() {
+            let oversized = report.oversized_scopes.contains(&net.prefix);
+            let note = if net.prefix.addr().is_ipv6() {
                 // IPv6 host space is never swept: it is not a size limit but a design
                 // choice, since devices arrive from neighbour and advertisement evidence.
                 " (devices from neighbour evidence; IPv6 host space is not swept)".to_string()
@@ -120,7 +123,7 @@ fn render_networks(report: &DiscoveryReport) {
                 String::new()
             };
             println!("  ├── {}{}", net.to_string().cyan().bold(), note.dimmed());
-            for iface in graph.interfaces_for_network(net) {
+            for iface in graph.interfaces_for_network(&net.prefix) {
                 println!("  │     via {}", iface.dimmed());
             }
             // A network this machine cannot reach, reported by a peer that can, must not
@@ -138,7 +141,7 @@ fn render_networks(report: &DiscoveryReport) {
             "Virtual & VPN networks (local to this machine)".bold()
         );
         for net in &virtual_nets {
-            let ifaces = graph.interfaces_for_network(net).join(", ");
+            let ifaces = graph.interfaces_for_network(&net.prefix).join(", ");
             println!(
                 "  ├── {} {}",
                 net.to_string().yellow(),
@@ -498,7 +501,7 @@ fn services_for(graph: &TopologyGraph, node: &crate::topology::Node) -> Vec<Stri
     let mut best: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
 
     for service in graph.nodes_of_kind(NodeKind::Service) {
-        let NodeId::Service(addr, port) = &service.id else {
+        let NodeId::Service(addr, port, _) = &service.id else {
             continue;
         };
         if !node.addresses.contains(addr) {

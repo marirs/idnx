@@ -154,16 +154,42 @@ pub fn qualify_device(key: DeviceKey, realm: &Realm) -> DeviceKey {
     }
 }
 
-/// The domain a network belongs to.
+/// The domain a network's *identity* belongs to.
 ///
-/// A public prefix is the same network wherever it is seen, so it stays local-domain and
-/// merges. A private one does not.
+/// A public prefix names the same network wherever it is seen, so it shares one identity
+/// and peers can corroborate each other about it. A private one does not.
+///
+/// This is a statement about naming and nothing else. It does not mean the network is
+/// reachable from here: a public prefix reported only by a peer is globally identified and
+/// still unreachable, and traversal must decide from evidence of local observation, never
+/// from this. Conflating the two would have this machine sweep a peer's uplink.
 pub fn network_realm(prefix: &IpNet, realm: &Realm) -> Realm {
     if is_globally_unique_prefix(prefix) {
         Realm::Local
     } else {
         realm.clone()
     }
+}
+
+/// The domain an address's identity belongs to.
+///
+/// Same rule and same caveat as [`network_realm`]: globally unique addresses share one
+/// identity so two peers seeing one host produce one node.
+pub fn address_realm(address: &IpAddr, realm: &Realm) -> Realm {
+    if is_globally_unique_address(address) {
+        Realm::Local
+    } else {
+        realm.clone()
+    }
+}
+
+/// The domain a purely local name belongs to.
+///
+/// Interface names and VLAN identifiers are unique only within the machine or the switched
+/// domain that uses them. Every peer has an `eth0`, and VLAN 20 on two unrelated sites is
+/// two VLANs. There is no globally unique case to exempt.
+pub fn scoped_realm(realm: &Realm) -> Realm {
+    realm.clone()
 }
 
 #[cfg(test)]
@@ -274,6 +300,34 @@ mod tests {
             network_realm(&prefix, &peer_realm("aaaa1111", "eth0")),
             Realm::Local
         );
+    }
+
+    #[test]
+    fn a_globally_identified_network_can_still_be_remotely_observed() {
+        // Identity and reachability are different questions. A public prefix a peer
+        // reported shares an identity with one this machine might also see -- that is what
+        // lets them corroborate -- but it says nothing about whether this vantage can reach
+        // it, and traversal must not read it that way.
+        let prefix: IpNet = "203.0.113.0/24".parse().unwrap();
+        let remote = peer_realm("aaaa1111", "eth0");
+
+        assert_eq!(
+            network_realm(&prefix, &remote),
+            Realm::Local,
+            "one identity, so two peers can corroborate"
+        );
+        assert!(
+            !remote.is_local(),
+            "the observation is still remote; only the name is shared"
+        );
+    }
+
+    #[test]
+    fn interface_and_vlan_names_are_never_globally_unique() {
+        // Every peer has an eth0, and VLAN 20 at two sites is two VLANs.
+        let remote = peer_realm("aaaa1111", "eth0");
+        assert_eq!(scoped_realm(&remote), remote);
+        assert_eq!(scoped_realm(&Realm::Local), Realm::Local);
     }
 
     #[test]

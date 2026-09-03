@@ -203,7 +203,7 @@ fn collect_at_a(
         let Message::Bundle { bundle } = serde_json::from_slice(&plaintext).expect("parses") else {
             continue;
         };
-        match ledger.accept(&bundle) {
+        match ledger.accept_immediately(&bundle) {
             Ok(accepted) => {
                 let sequence = accepted.sequence;
                 // Acknowledged only if the engine took it. Acknowledging evidence the run
