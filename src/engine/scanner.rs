@@ -12,6 +12,12 @@ pub enum PortStatus {
     Open,
     Closed,
     Filtered,
+    /// The probe never left this machine: the socket could not be created or bound.
+    ///
+    /// Distinct from `Filtered`, which means the packet went out and nothing came back.
+    /// Conflating the two reported a local misconfiguration as remote silence, which is
+    /// how an interface with no usable source address came to look like a quiet network.
+    NotSent,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +26,23 @@ pub struct PortInfo {
     pub status: PortStatus,
     pub latency: Option<Duration>,
     pub service: &'static str,
+    /// Why the probe never left this machine, when it did not.
+    pub local_error: Option<String>,
+}
+
+/// Whether a connect error means the probe never left this machine.
+///
+/// These are all failures of socket creation or binding. Anything else -- a timeout, a
+/// refusal, an unreachable network -- involved the packet actually going out.
+fn is_local_failure(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::AddrInUse
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -228,21 +251,32 @@ pub async fn probe_tcp_socket(
                 status: PortStatus::Open,
                 latency: Some(elapsed),
                 service,
+                local_error: None,
             }
         }
-        // A refusal proves the host is alive; a timeout, or an interface with no source
-        // address for this family, proves nothing about it.
+        // A refusal proves the host is alive.
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => PortInfo {
             port,
             status: PortStatus::Closed,
             latency: Some(start.elapsed()),
             service: lookup_service(port),
+            local_error: None,
+        },
+        // The socket could not be created or bound, so nothing was ever sent. Reporting
+        // this as a timeout would attribute a local failure to the remote device.
+        Err(e) if is_local_failure(&e) => PortInfo {
+            port,
+            status: PortStatus::NotSent,
+            latency: None,
+            service: lookup_service(port),
+            local_error: Some(e.to_string()),
         },
         Err(_) => PortInfo {
             port,
             status: PortStatus::Filtered,
             latency: None,
             service: lookup_service(port),
+            local_error: None,
         },
     }
 }

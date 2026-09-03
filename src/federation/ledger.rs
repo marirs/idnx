@@ -28,6 +28,13 @@ pub enum RejectReason {
     /// A sequence number at or below one already accepted from this peer -- a replay, or a
     /// bundle arriving out of order behind a newer one.
     Stale { seen: u64, offered: u64 },
+    /// The bundle contains vocabulary this build does not understand.
+    ///
+    /// Refused whole, and the sequence is not advanced. Taking the readable half would
+    /// record a partial view of what the peer said while marking the bundle as consumed,
+    /// so a later upgraded build could never make sense of the rest. The peer resends;
+    /// resends are idempotent by sequence number.
+    Undecodable(Vec<String>),
 }
 
 impl std::fmt::Display for RejectReason {
@@ -35,13 +42,22 @@ impl std::fmt::Display for RejectReason {
         match self {
             RejectReason::Unverifiable(e) => write!(f, "unverifiable: {e}"),
             RejectReason::NotPaired(peer) => {
-                let short = if peer.len() > 16 { &peer[..16] } else { peer };
+                // Truncated by characters, not bytes: this string came off the wire and
+                // slicing it at a byte offset would panic inside a multi-byte character.
+                let short: String = peer.chars().take(16).collect();
                 write!(f, "not paired with peer {short}")
             }
             RejectReason::Stale { seen, offered } => {
                 write!(
                     f,
                     "stale: sequence {offered} at or below {seen} already accepted"
+                )
+            }
+            RejectReason::Undecodable(reasons) => {
+                write!(
+                    f,
+                    "undecodable: {} (this build is older than the peer's)",
+                    reasons.join("; ")
                 )
             }
         }
@@ -56,9 +72,6 @@ pub struct Accepted {
     pub sequence: u64,
     /// Evidence ready to absorb, each record carrying its peer origin.
     pub evidence: Vec<TopologyEvidence>,
-    /// Records this build could not interpret, with the reason. Reported, not hidden: a
-    /// newer peer's vocabulary arriving here is a fact about the deployment.
-    pub undecodable: Vec<String>,
 }
 
 /// Peers this machine will accept evidence from, and what it has already seen from them.
@@ -119,6 +132,9 @@ impl PeerLedger {
             published_at: bundle.published_at,
         };
 
+        // All or nothing. Accepting the readable records and reporting the rest would take
+        // a partial view of what the peer said while marking the bundle consumed, so an
+        // upgraded build could never recover the remainder.
         let mut evidence = Vec::with_capacity(bundle.records.len());
         let mut undecodable = Vec::new();
         for record in &bundle.records {
@@ -127,9 +143,15 @@ impl PeerLedger {
                 Err(error) => undecodable.push(error.to_string()),
             }
         }
+        if !undecodable.is_empty() {
+            undecodable.sort();
+            undecodable.dedup();
+            return Err(RejectReason::Undecodable(undecodable));
+        }
 
-        // Recorded only once the bundle is otherwise sound, so a rejected bundle cannot
-        // advance the sequence and lock out the peer's later ones.
+        // Recorded only once the bundle is accepted in full, so a rejected bundle cannot
+        // advance the sequence and lock out the peer's later ones -- nor its own resend
+        // once this build understands it.
         self.highest_sequence.insert(key, bundle.sequence);
 
         Ok(Accepted {
@@ -137,7 +159,6 @@ impl PeerLedger {
             vantage: bundle.vantage.clone(),
             sequence: bundle.sequence,
             evidence,
-            undecodable,
         })
     }
 }
@@ -176,7 +197,6 @@ mod tests {
         let accepted = ledger.accept(&bundle).expect("accepted");
         assert_eq!(accepted.peer, key.id());
         assert_eq!(accepted.evidence.len(), 1);
-        assert!(accepted.undecodable.is_empty());
 
         // Attribution survives conversion: the record knows it is not a local observation.
         let origin = accepted.evidence[0].origin.as_ref().expect("attributed");
@@ -251,12 +271,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_record_this_build_cannot_read_is_reported_not_dropped() {
-        // A peer running a newer build sends a vocabulary this one lacks. Losing those
-        // records silently would make an incomplete merge look complete.
-        let (mut ledger, key) = paired();
-        let mut bundle = EvidenceBundle::publish(&key, "br0", 1, &evidence());
+    /// Builds a bundle containing one record this build cannot interpret.
+    fn bundle_with_unknown_vocabulary(key: &PeerKey, sequence: u64) -> EvidenceBundle {
+        let mut bundle = EvidenceBundle::publish(key, "br0", sequence, &evidence());
         bundle.records.push(WireEvidence {
             fact: super::super::wire::WireFact::Vlan { id: 1 },
             source: "quantum_entanglement".to_string(),
@@ -266,7 +283,7 @@ mod tests {
             detail: None,
         });
         // Re-sign, since editing the records invalidates the original signature.
-        let bundle = EvidenceBundle {
+        EvidenceBundle {
             signature: super::super::identity::encode_hex(&key.sign(
                 &super::super::wire::signing_payload(
                     SCHEMA_VERSION,
@@ -278,16 +295,41 @@ mod tests {
                 ),
             )),
             ..bundle
-        };
+        }
+    }
 
-        let accepted = ledger.accept(&bundle).expect("accepted");
-        assert_eq!(
-            accepted.evidence.len(),
-            1,
-            "the readable record still lands"
+    #[test]
+    fn a_bundle_this_build_cannot_fully_read_is_refused_whole() {
+        // A peer running a newer build sends vocabulary this one lacks. Taking the
+        // readable half would record a partial view of what the peer said, and reporting
+        // the remainder afterwards does not undo that.
+        let (mut ledger, key) = paired();
+
+        let reasons = match ledger.accept(&bundle_with_unknown_vocabulary(&key, 1)) {
+            Err(RejectReason::Undecodable(reasons)) => reasons,
+            other => panic!("expected an undecodable rejection, got {other:?}"),
+        };
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("quantum_entanglement"), "{reasons:?}");
+    }
+
+    #[test]
+    fn an_undecodable_bundle_can_still_be_accepted_by_a_later_build() {
+        // The sequence must not advance, or the same bundle resent to an upgraded build
+        // would be rejected as stale and its evidence lost permanently.
+        let (mut ledger, key) = paired();
+        assert!(
+            ledger
+                .accept(&bundle_with_unknown_vocabulary(&key, 7))
+                .is_err()
         );
-        assert_eq!(accepted.undecodable.len(), 1);
-        assert!(accepted.undecodable[0].contains("quantum_entanglement"));
+
+        // Standing in for the upgraded build: the same sequence, now fully readable.
+        let readable = EvidenceBundle::publish(&key, "br0", 7, &evidence());
+        assert!(
+            ledger.accept(&readable).is_ok(),
+            "a resend at the same sequence must still be accepted"
+        );
     }
 
     #[test]

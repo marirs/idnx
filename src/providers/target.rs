@@ -131,6 +131,10 @@ pub struct EndpointCoverage {
     pub stages_run: u8,
     pub tcp_attempted: usize,
     pub tcp_responsive: Vec<u16>,
+    /// Probes that never left this machine, with the local error and how many ports it
+    /// affected. Kept apart from responsiveness: a socket that could not be bound says
+    /// nothing whatever about the device on the other end.
+    pub not_sent: Vec<(String, usize)>,
     /// Set when fewer than all stages ran here, saying which were omitted and why.
     pub omitted: Option<String>,
 }
@@ -196,6 +200,27 @@ impl DeviceCoverage {
         self.endpoints.iter().map(|e| e.tcp_responsive.len()).sum()
     }
 
+    /// Probes that never left this machine.
+    pub fn not_sent(&self) -> usize {
+        self.endpoints
+            .iter()
+            .flat_map(|e| e.not_sent.iter())
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    /// Local failures, one line each, for reporting.
+    pub fn local_failures(&self) -> Vec<String> {
+        self.endpoints
+            .iter()
+            .flat_map(|e| {
+                e.not_sent.iter().map(move |(reason, count)| {
+                    format!("{}: {count} probe(s) not sent: {reason}", e.endpoint)
+                })
+            })
+            .collect()
+    }
+
     /// Highest stage reached at any address.
     pub fn stages_run(&self) -> u8 {
         self.endpoints
@@ -223,7 +248,12 @@ impl DeviceCoverage {
     /// Distinct from being skipped: this device was reachable enough to probe and stayed
     /// silent, which is a fact about it rather than a gap in coverage.
     pub fn silent(&self) -> bool {
-        self.skipped.is_none() && self.tcp_responsive() == 0 && self.auth_required.is_empty()
+        self.skipped.is_none()
+            && self.tcp_responsive() == 0
+            && self.auth_required.is_empty()
+            // A device whose probes never left this machine was not asked anything, so it
+            // cannot have been silent.
+            && self.not_sent() == 0
     }
 
     /// One-line summary for the coverage report.
@@ -236,6 +266,9 @@ impl DeviceCoverage {
             self.tcp_responsive(),
             self.tcp_attempted()
         )];
+        if self.not_sent() > 0 {
+            parts.push(format!("{} not sent locally", self.not_sent()));
+        }
         if !self.udp_attempted.is_empty() {
             parts.push(format!("{} udp attempted", self.udp_attempted.len()));
         }
@@ -292,13 +325,15 @@ pub async fn interrogate_device(
     let mut out = Vec::new();
 
     // Stage 1 on the preferred address.
-    let mut open_ports = sweep_ports(&primary, STAGE_ONE_PORTS, context, timeout).await;
+    let stage_one = sweep_ports(&primary, STAGE_ONE_PORTS, context, timeout).await;
+    let mut open_ports = stage_one.open;
     let mut primary_coverage = EndpointCoverage {
         endpoint: primary.to_string(),
         primary: true,
         stages_run: 1,
         tcp_attempted: STAGE_ONE_PORTS.len(),
         tcp_responsive: Vec::new(),
+        not_sent: stage_one.not_sent,
         omitted: None,
     };
 
@@ -326,7 +361,9 @@ pub async fn interrogate_device(
     if broaden {
         primary_coverage.stages_run = 2;
         primary_coverage.tcp_attempted += STAGE_TWO_PORTS.len();
-        open_ports.extend(sweep_ports(&primary, STAGE_TWO_PORTS, context, timeout).await);
+        let stage_two = sweep_ports(&primary, STAGE_TWO_PORTS, context, timeout).await;
+        open_ports.extend(stage_two.open);
+        merge_failures(&mut primary_coverage.not_sent, stage_two.not_sent);
     } else {
         primary_coverage.omitted = Some(format!(
             "stage 2 ({} ports) not run: liveness never confirmed and no stage 1 port answered",
@@ -389,7 +426,8 @@ pub async fn interrogate_device(
     // and repeating the full set at every address would probe the same machine several
     // times over. What it does catch is a service bound to one family alone.
     for endpoint in target.endpoints.iter().skip(1) {
-        let responsive = sweep_ports(endpoint, STAGE_ONE_PORTS, context, timeout).await;
+        let secondary = sweep_ports(endpoint, STAGE_ONE_PORTS, context, timeout).await;
+        let responsive = secondary.open;
         for &port in &responsive {
             out.push(
                 TopologyEvidence::new(
@@ -412,6 +450,7 @@ pub async fn interrogate_device(
             stages_run: 1,
             tcp_attempted: STAGE_ONE_PORTS.len(),
             tcp_responsive: responsive,
+            not_sent: secondary.not_sent,
             omitted: Some(format!(
                 "stages 2-3 ({} ports) run only at {primary}, the preferred address for this device",
                 STAGE_TWO_PORTS.len()
@@ -444,13 +483,31 @@ pub async fn interrogate_device(
     (out, coverage)
 }
 
+/// Folds one sweep's local failures into another's.
+fn merge_failures(into: &mut Vec<(String, usize)>, more: Vec<(String, usize)>) {
+    for (reason, count) in more {
+        match into.iter_mut().find(|(existing, _)| *existing == reason) {
+            Some((_, total)) => *total += count,
+            None => into.push((reason, count)),
+        }
+    }
+}
+
 /// Probes a port set concurrently, drawing on the run-wide probe budget.
+/// Result of probing a port set: what answered, and what never left this machine.
+struct SweepResult {
+    open: Vec<u16>,
+    /// Distinct local failures, with how many ports each affected. A source address that
+    /// does not exist fails every port identically; reporting it once is enough.
+    not_sent: Vec<(String, usize)>,
+}
+
 async fn sweep_ports(
     target: &Endpoint,
     ports: &[u16],
     context: &DiscoveryContext,
     timeout: Duration,
-) -> Vec<u16> {
+) -> SweepResult {
     let mut tasks = Vec::with_capacity(ports.len());
     for &port in ports {
         let permits = Arc::clone(&context.probe_permits);
@@ -459,17 +516,33 @@ async fn sweep_ports(
         tasks.push(tokio::spawn(async move {
             let _hold = permits.acquire().await.ok()?;
             let probe = crate::engine::scanner::probe_tcp_socket(socket, &binding, timeout).await;
-            (probe.status == crate::engine::scanner::PortStatus::Open).then_some(port)
+            Some((port, probe.status, probe.local_error))
         }));
     }
 
     let mut open = Vec::new();
+    let mut failures: std::collections::BTreeMap<String, usize> = Default::default();
     for task in tasks {
-        if let Ok(Some(port)) = task.await {
-            open.push(port);
+        let Ok(Some((port, status, local_error))) = task.await else {
+            continue;
+        };
+        match status {
+            crate::engine::scanner::PortStatus::Open => open.push(port),
+            // A probe that never left this machine says nothing about the device. Counting
+            // it as silence reported a local misconfiguration as a quiet host.
+            crate::engine::scanner::PortStatus::NotSent => {
+                *failures
+                    .entry(local_error.unwrap_or_else(|| "socket unavailable".to_string()))
+                    .or_default() += 1;
+            }
+            _ => {}
         }
     }
-    open
+
+    SweepResult {
+        open,
+        not_sent: failures.into_iter().collect(),
+    }
 }
 
 /// Confirms protocols on ports that answered.
@@ -872,6 +945,7 @@ mod tests {
             stages_run: 2,
             tcp_attempted: 62,
             tcp_responsive: Vec::new(),
+            not_sent: Vec::new(),
             omitted: None,
         });
         assert!(asked.silent());
@@ -881,6 +955,39 @@ mod tests {
         asked.auth_required.push(80);
         assert!(!asked.silent());
         assert!(asked.summary().contains("auth required on 80"));
+    }
+
+    #[test]
+    fn a_probe_that_never_left_this_machine_is_not_remote_silence() {
+        // The regression this guards: an interface with no source address in the
+        // destination's family failed every probe locally in microseconds, and the device
+        // was reported as "asked, no response on any probed port".
+        let mut coverage =
+            DeviceCoverage::skipped(DeviceKey::mac("02:00:5e:00:00:03"), DeviceTier::Host, "x");
+        coverage.skipped = None;
+        coverage.endpoints.push(EndpointCoverage {
+            endpoint: "fe80::1%en0".to_string(),
+            primary: true,
+            stages_run: 2,
+            tcp_attempted: 62,
+            tcp_responsive: Vec::new(),
+            not_sent: vec![("no IPv6 source address".to_string(), 62)],
+            omitted: None,
+        });
+
+        assert_eq!(coverage.not_sent(), 62);
+        assert!(
+            !coverage.silent(),
+            "nothing was asked, so nothing was silent"
+        );
+        assert!(coverage.summary().contains("62 not sent locally"));
+
+        let failures = coverage.local_failures();
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("no IPv6 source address"),
+            "{failures:?}"
+        );
     }
 
     #[test]
@@ -897,6 +1004,7 @@ mod tests {
             stages_run: 3,
             tcp_attempted: 62,
             tcp_responsive: vec![80],
+            not_sent: Vec::new(),
             omitted: None,
         });
         coverage.endpoints.push(EndpointCoverage {
@@ -905,6 +1013,7 @@ mod tests {
             stages_run: 1,
             tcp_attempted: 17,
             tcp_responsive: vec![],
+            not_sent: Vec::new(),
             omitted: Some("stages 2-3 run only at 10.0.0.2".to_string()),
         });
 

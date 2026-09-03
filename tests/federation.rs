@@ -228,11 +228,8 @@ fn peer_a_topology(with_peer_b: bool) -> (TopologyGraph, Option<PeerKey>) {
         let accepted = ledger
             .accept(&bundle)
             .expect("B is paired and signs correctly");
-        assert!(
-            accepted.undecodable.is_empty(),
-            "both peers run this build: {:?}",
-            accepted.undecodable
-        );
+        // Both peers run this build, so the bundle is accepted whole. One carrying
+        // vocabulary this build lacks would be refused entirely, not partially applied.
 
         for record in accepted.evidence {
             graph.absorb(record);

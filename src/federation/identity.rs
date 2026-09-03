@@ -119,14 +119,31 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Decodes hex, over bytes rather than string slices.
+///
+/// Slicing a `&str` at arbitrary offsets panics when an offset lands inside a multi-byte
+/// character, and this parses peer identities and signatures straight off the wire. A peer
+/// sending an emoji where a key belongs must be rejected, not terminate the process.
 pub fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
         .collect()
+}
+
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +202,43 @@ mod tests {
             PeerId::from_hex(&"ab".repeat(16)),
             Err(IdentityError::Malformed)
         );
+    }
+
+    #[test]
+    fn untrusted_identity_text_is_rejected_rather_than_panicking() {
+        // These arrive straight off the wire. Slicing a &str at byte offsets panics when an
+        // offset lands inside a multi-byte character, so a peer field of the right byte
+        // length but the wrong content would have terminated the process.
+        let hostile = [
+            "🔑",                // 4 bytes, one character
+            "🔑🔑🔑🔑🔑🔑🔑🔑",  // 32 bytes of emoji
+            &"é".repeat(32),     // 64 bytes, 32 characters
+            &"\u{0}".repeat(64), // NULs
+            "café",
+            &"🔒".repeat(16),
+            "\u{200b}\u{200b}", // zero-width spaces
+            &"ff".repeat(31),   // valid hex, wrong length
+            &format!("{}{}", "ff".repeat(31), "🔑"),
+        ];
+
+        for text in hostile {
+            // Neither may panic; both must simply refuse.
+            assert!(decode_hex(text).is_none() || PeerId::from_hex(text).is_err());
+            assert!(PeerId::from_hex(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hex_decoding_accepts_only_hex() {
+        assert_eq!(decode_hex("00ff"), Some(vec![0x00, 0xff]));
+        assert_eq!(decode_hex("00FF"), Some(vec![0x00, 0xff]));
+        assert_eq!(decode_hex(""), Some(Vec::new()));
+        assert_eq!(decode_hex("0"), None, "odd length");
+        assert_eq!(decode_hex("0g"), None);
+        assert_eq!(decode_hex("-1"), None);
+        // Round trip over every byte value.
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(decode_hex(&encode_hex(&all)), Some(all));
     }
 
     #[test]

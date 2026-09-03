@@ -76,13 +76,18 @@ pub struct SocketBinding {
     pub v6_source: Option<Ipv6Addr>,
     /// Source address for link-local IPv6 probes, which need a source on the same link.
     pub v6_link_local_source: Option<Ipv6Addr>,
-    /// Whether asking the kernel to pin this interface actually succeeded.
+    /// Whether pinning this interface succeeded, per address family.
     ///
-    /// Established by trying it, not by asking whether the platform has the option.
+    /// Established by trying it, not by asking whether the platform has the option:
     /// `SO_BINDTODEVICE` needs `CAP_NET_RAW`, so on an unprivileged Linux run the call is
-    /// refused -- and reporting "interface bound" on the strength of the platform alone
+    /// refused, and reporting "interface bound" on the strength of the platform alone
     /// claimed a guarantee that was never obtained.
-    native_binding: bool,
+    ///
+    /// Per family, because the two use different socket options at different protocol
+    /// levels and can succeed independently. One boolean probed over IPv4 and then assumed
+    /// for IPv6 asserted something about a family that had never been tested.
+    native_binding_v4: bool,
+    native_binding_v6: bool,
 }
 
 impl SocketBinding {
@@ -96,6 +101,15 @@ impl SocketBinding {
         self.selected
     }
 
+    /// Whether the kernel accepted an interface pin for this family.
+    pub fn native_binding_for(&self, ipv4: bool) -> bool {
+        if ipv4 {
+            self.native_binding_v4
+        } else {
+            self.native_binding_v6
+        }
+    }
+
     /// The strongest guarantee this binding can make for a destination.
     ///
     /// Reports what was achieved, not what the platform advertises.
@@ -103,7 +117,7 @@ impl SocketBinding {
         if !self.selected {
             return BindingMode::Unbound;
         }
-        if self.native_binding {
+        if self.native_binding_for(destination.is_ipv4()) {
             return BindingMode::NativeInterface;
         }
         if self.local_address_for(destination).is_some() {
@@ -152,9 +166,13 @@ impl SocketBinding {
             }
         }
 
-        // Establish the guarantee by attempting it once, rather than inferring it from the
-        // target platform. The scratch socket is discarded; only the outcome is kept.
-        binding.native_binding = binding.index != 0 && probe_native_binding(&binding);
+        // Establish the guarantee by attempting it once per family, rather than inferring it
+        // from the target platform. The scratch sockets are discarded; only the outcome is
+        // kept.
+        if binding.index != 0 {
+            binding.native_binding_v4 = probe_native_binding(&binding, true);
+            binding.native_binding_v6 = probe_native_binding(&binding, false);
+        }
 
         binding
     }
@@ -398,21 +416,32 @@ pub fn native_binding_supported() -> bool {
 
 /// Tries the native interface bind once and reports whether the kernel accepted it.
 #[cfg(unix)]
-fn probe_native_binding(binding: &SocketBinding) -> bool {
+fn probe_native_binding(binding: &SocketBinding, ipv4: bool) -> bool {
     if !native_binding_supported() {
         return false;
     }
-    // A scratch socket, never sent on. Binding to port 0 on the wildcard address always
-    // succeeds, so a failure below is the interface option being refused and nothing else.
-    let Ok(scratch) = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+    // A scratch socket of the right family, never sent on. Binding to port 0 on the
+    // wildcard address always succeeds, so a failure below is the interface option being
+    // refused and nothing else.
+    let scratch = if ipv4 {
+        std::net::UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+    } else {
+        std::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            0,
+            0,
+            0,
+        )))
+    };
+    let Ok(scratch) = scratch else {
         return false;
     };
-    bind_socket_to_interface(&scratch, &binding.interface, binding.index, true).is_ok()
+    bind_socket_to_interface(&scratch, &binding.interface, binding.index, ipv4).is_ok()
 }
 
 /// Windows exposes no libc equivalent, so the native bind is never attempted there.
 #[cfg(not(unix))]
-fn probe_native_binding(_binding: &SocketBinding) -> bool {
+fn probe_native_binding(_binding: &SocketBinding, _ipv4: bool) -> bool {
     false
 }
 
@@ -686,7 +715,8 @@ mod tests {
             // An index no interface has.
             0x7fff_ffff,
         );
-        assert!(!unbindable.native_binding);
+        assert!(!unbindable.native_binding_for(true));
+        assert!(!unbindable.native_binding_for(false));
         assert_eq!(
             unbindable.mode(&"10.0.0.1:80".parse().unwrap()),
             BindingMode::SourceAddress

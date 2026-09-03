@@ -24,7 +24,10 @@ tokio = { version = "1.43", features = ["full"] }
 colored = "3.0"
 ipnet = "2.11"
 indicatif = "0.17"
-if-addrs = "0.15"
+# `link-local` is not a default feature, and without it fe80::/10 addresses are omitted
+# entirely -- which silently left every interface with no IPv6 source to bind to, so every
+# IPv6 probe failed locally before a packet was sent.
+if-addrs = { version = "0.15", features = ["link-local"] }
 comfy-table = "7.1"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }

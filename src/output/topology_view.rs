@@ -295,6 +295,24 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
         for extra in addrs.iter().skip(1) {
             println!("  |     {}", extra.dimmed());
         }
+        // A shared hostname across two MACs is usually one computer with two interfaces,
+        // but a hostname is self-reported and reused, so it is offered as a possibility
+        // rather than acted on by merging the devices.
+        let related = node.possible_same_machine(graph);
+        if !related.is_empty() {
+            let names: Vec<String> = related
+                .iter()
+                .flat_map(|n| display_addresses(n, vantage))
+                .collect();
+            println!(
+                "  |     {}",
+                format!(
+                    "possibly the same machine as {} (shared hostname; unconfirmed)",
+                    names.join(", ")
+                )
+                .dimmed()
+            );
+        }
         if !node.capabilities.is_empty() {
             println!(
                 "  |     {}",
@@ -571,6 +589,10 @@ fn render_device_coverage(report: &DiscoveryReport) {
                 "vendor adapters",
                 record.vendor_adapters.join(", ").dimmed()
             );
+        }
+        for failure in record.local_failures() {
+            // A probe that never left this machine is a local fault, not remote silence.
+            println!("    {:<18} {}", "not sent", failure.red());
         }
         for omission in record.omissions() {
             // Stated rather than glossed: a pass that left work out must not read as

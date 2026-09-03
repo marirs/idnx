@@ -353,6 +353,30 @@ impl Node {
         }
     }
 
+    /// Devices that may be other interfaces of the same machine.
+    ///
+    /// Two nodes sharing a hostname are frequently one computer with a wired and a wireless
+    /// interface, each with its own MAC. That is a possibility, not a finding: a hostname is
+    /// self-reported, DHCP hands the same name to a replaced device, and appliances ship
+    /// with identical defaults. Merging on it would fabricate a device.
+    ///
+    /// Recorded as a suggestion so the operator can see the relationship, and left unmerged
+    /// until something stronger corroborates it -- an LLDP chassis ID, a management address
+    /// naming both, or a peer that observes them on one machine.
+    pub fn possible_same_machine<'a>(&'a self, graph: &'a TopologyGraph) -> Vec<&'a Node> {
+        if self.hostnames.is_empty() {
+            return Vec::new();
+        }
+        let mut related: Vec<&Node> = graph
+            .nodes()
+            .filter(|other| other.id != self.id)
+            .filter(|other| matches!(other.id, NodeId::Device(_)))
+            .filter(|other| other.hostnames.iter().any(|h| self.hostnames.contains(h)))
+            .collect();
+        related.sort_by_key(|n| n.display_name());
+        related
+    }
+
     /// Distinct evidence sources that contributed to this node.
     ///
     /// Reported per device so that "discovered by ARP alone" is distinguishable from

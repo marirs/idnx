@@ -214,6 +214,43 @@ mod tests {
     }
 
     #[test]
+    fn hostile_identity_and_signature_text_is_rejected_rather_than_panicking() {
+        // Both fields are parsed straight off the wire, before anything is verified. A
+        // peer sending multi-byte characters where hex belongs must be refused, not crash
+        // the receiver -- which is a denial of service on every peer it can reach.
+        let key = PeerKey::generate();
+        let base = EvidenceBundle::publish(&key, "br0", 1, &sample());
+
+        let hostile = [
+            "🔑".to_string(),
+            "🔑".repeat(32),
+            "é".repeat(64),
+            "\u{0}".repeat(128),
+            "ff".repeat(31) + "🔑",
+            "ff".repeat(63) + "é",
+            "\u{200b}".to_string(),
+            String::new(),
+            "not hex at all".to_string(),
+        ];
+
+        for text in &hostile {
+            let mut bundle = base.clone();
+            bundle.peer = text.clone();
+            assert!(bundle.verify().is_err(), "peer {text:?}");
+
+            let mut bundle = base.clone();
+            bundle.signature = text.clone();
+            assert!(bundle.verify().is_err(), "signature {text:?}");
+
+            // And a vantage of arbitrary bytes must simply fail verification, since it is
+            // covered by the signature.
+            let mut bundle = base.clone();
+            bundle.vantage = text.clone();
+            assert!(bundle.verify().is_err(), "vantage {text:?}");
+        }
+    }
+
+    #[test]
     fn a_malformed_signature_is_rejected() {
         let key = PeerKey::generate();
         let mut bundle = EvidenceBundle::publish(&key, "br0", 1, &sample());
