@@ -229,6 +229,113 @@ impl DiscoveryProvider for VendorDiscoveryProvider {
     }
 }
 
+/// Router interfaces beyond the first hop.
+///
+/// The kernel routing table names exactly one router: the default gateway. Every other
+/// router on the way out is invisible to every provider that reads local state -- and yet
+/// they are real, frequently reachable, and often the only devices that know the prefixes
+/// of the networks behind them. On the network this was written against, the second hop is
+/// a router with an open management interface that nothing else here ever saw.
+///
+/// A hop is a device, never a prefix. A router answering from one of its interfaces proves
+/// that it forwards; it says nothing about the size or shape of the network that address
+/// belongs to, and deriving one would be inventing topology. So each hop enters the graph
+/// as a device with observed forwarding behaviour, which makes it a pivot -- and the staged
+/// interrogation that follows is what may legitimately extract a prefix from it.
+pub struct PathDiscoveryProvider;
+
+impl DiscoveryProvider for PathDiscoveryProvider {
+    fn name(&self) -> &'static str {
+        "path-discovery"
+    }
+
+    fn applies(&self, context: &DiscoveryContext) -> bool {
+        // Not aimed at a single device. The path out belongs to the vantage rather than to
+        // any one scope, and absorbing the same hops twice is idempotent, so running it
+        // per scope costs a few packets and keeps the provider free of run-level state.
+        context.target.is_none()
+    }
+
+    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            let vantage = &context.vantage.interface;
+
+            let hops = crate::probes::path::discover_path(
+                &context.binding,
+                context.timeout.max(Duration::from_millis(600)),
+                crate::probes::path::MAX_HOPS,
+            )
+            .await;
+
+            for hop in hops {
+                let device = DeviceKey::Address(hop.address);
+
+                out.push(TopologyEvidence::new(
+                    Fact::DeviceAddress {
+                        device: device.clone(),
+                        address: hop.address,
+                    },
+                    EvidenceSource::IcmpProbe,
+                    Confidence::Observed,
+                    vantage,
+                ));
+
+                // Behaviour, not manufacture: this device decremented our packet's hop
+                // count and said so. That is what a router does.
+                out.push(
+                    TopologyEvidence::new(
+                        Fact::DeviceRoleSignal {
+                            device: device.clone(),
+                            signal: RoleSignal::ObservedForwarding,
+                        },
+                        EvidenceSource::IcmpProbe,
+                        Confidence::Observed,
+                        vantage,
+                    )
+                    .with_detail(format!("forwarded a probe at hop {}", hop.distance)),
+                );
+
+                out.push(TopologyEvidence::new(
+                    Fact::DeviceCapability {
+                        device: device.clone(),
+                        capability: Capability::Ipv4Forwarding,
+                        detail: Some(format!("hop {} on the path out", hop.distance)),
+                    },
+                    EvidenceSource::IcmpProbe,
+                    Confidence::Observed,
+                    vantage,
+                ));
+
+                // Beyond the first hop the router is upstream of this vantage's own
+                // gateway, so whatever it serves is not on any link reachable from here
+                // until the device itself discloses it. Recorded as an unresolved boundary
+                // rather than omitted, and never as a synthesised prefix.
+                if hop.distance > 1 {
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::OpaqueBoundary {
+                                device,
+                                why: format!(
+                                    "upstream router at hop {}; forwards traffic but has \
+                                     disclosed no prefix for what lies behind it",
+                                    hop.distance
+                                ),
+                            },
+                            EvidenceSource::IcmpProbe,
+                            Confidence::Observed,
+                            vantage,
+                        )
+                        .with_detail("interrogated for routing evidence; nothing yet disclosed"),
+                    );
+                }
+            }
+
+            out
+        })
+    }
+}
+
 /// SNMP, as one amplifier among many rather than the gatekeeper of topology.
 ///
 /// When available it is the richest single source, contributing routing tables, interface
@@ -549,6 +656,7 @@ pub fn network_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         Box::new(SsdpProvider),
         Box::new(MndpProvider),
         Box::new(VendorDiscoveryProvider),
+        Box::new(PathDiscoveryProvider),
         Box::new(SnmpProvider),
         Box::new(HostEnrichmentProvider::default()),
     ]

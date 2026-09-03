@@ -355,6 +355,15 @@ impl SocketBinding {
         Ok(socket)
     }
 
+    /// Binds an already-open ICMP socket to the selected interface.
+    ///
+    /// Separate because an ICMP socket is created directly rather than through the
+    /// constructors here: it needs a protocol the ordinary UDP path cannot ask for.
+    #[cfg(unix)]
+    pub fn bind_icmp(&self, socket: &tokio::net::UdpSocket) -> io::Result<()> {
+        self.bind_to_interface(socket, true)
+    }
+
     /// Asks the kernel to send this socket's traffic out of the selected interface.
     ///
     /// Non-fatal where the call is refused: on Linux `SO_BINDTODEVICE` needs `CAP_NET_RAW`,
