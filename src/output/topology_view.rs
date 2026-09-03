@@ -71,6 +71,26 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
     }
 }
 
+/// A network's peer attribution, where it has one.
+fn network_origin(graph: &TopologyGraph, net: &IpNet) -> Option<String> {
+    let node = graph
+        .nodes()
+        .find(|n| matches!(&n.id, NodeId::Network(existing) if existing == net))?;
+    let origins = node.peer_origins();
+    if origins.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} {}",
+        if node.only_remote() {
+            "observed by"
+        } else {
+            "also reported by"
+        },
+        origins.join(", ")
+    ))
+}
+
 fn render_networks(report: &DiscoveryReport) {
     let graph = &report.graph;
     let mut physical: Vec<IpNet> = Vec::new();
@@ -103,6 +123,11 @@ fn render_networks(report: &DiscoveryReport) {
             println!("  ├── {}{}", net.to_string().cyan().bold(), note.dimmed());
             for iface in graph.interfaces_for_network(net) {
                 println!("  │     via {}", iface.dimmed());
+            }
+            // A network this machine cannot reach, reported by a peer that can, must not
+            // be presented as though this vantage had seen it.
+            if let Some(origin) = network_origin(graph, net) {
+                println!("  │     {}", origin.magenta());
             }
         }
     }
@@ -204,6 +229,7 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
                 .green()
         );
     }
+    render_peer_origin(node, "  │     ");
     for signal in &node.role_signals {
         println!("  │     • {}", signal.dimmed());
     }
@@ -260,6 +286,27 @@ fn display_addresses(node: &crate::topology::graph::Node, vantage: &str) -> Vec<
     routable
 }
 
+/// States which peer reported a node, where one did.
+///
+/// Never blended into the surrounding output. A fact observed on this link and a fact a
+/// peer asserted about a network this machine cannot reach are different kinds of claim,
+/// and presenting them identically would make the second look verified by this vantage.
+fn render_peer_origin(node: &crate::topology::graph::Node, indent: &str) {
+    let origins = node.peer_origins();
+    if origins.is_empty() {
+        return;
+    }
+    let label = if node.only_remote() {
+        "observed by"
+    } else {
+        "also reported by"
+    };
+    println!(
+        "{indent}{}",
+        format!("{label} {}", origins.join(", ")).magenta()
+    );
+}
+
 fn render_hosts(graph: &TopologyGraph, vantage: &str) {
     use crate::topology::graph::DeviceCategory;
 
@@ -295,6 +342,7 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
         for extra in addrs.iter().skip(1) {
             println!("  |     {}", extra.dimmed());
         }
+        render_peer_origin(node, "  |     ");
         // A shared hostname across two MACs is usually one computer with two interfaces,
         // but a hostname is self-reported and reused, so it is offered as a possibility
         // rather than acted on by merging the devices.

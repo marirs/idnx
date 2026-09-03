@@ -102,8 +102,13 @@ pub struct DiscoveryEngine {
     /// Shared rather than owned outright: the device queue hands these to concurrent
     /// per-device tasks, which must each hold their own reference.
     scope_providers: Arc<Vec<Box<dyn DiscoveryProvider>>>,
-    /// Observed continuously and drained by the engine, which also owns its shutdown.
-    continuous: Option<Arc<dyn ContinuousSource>>,
+    /// Observed continuously and drained by the engine, which also owns their shutdown.
+    ///
+    /// More than one, because packet capture and federation both deliver on their own
+    /// schedule and both must be polled before the engine decides it has converged. A
+    /// bundle arriving from a peer as the last pass finishes can name a whole network, and
+    /// treating one of the two as the only such source would lose it.
+    continuous: Vec<Arc<dyn ContinuousSource>>,
     budget: Budget,
 }
 
@@ -124,14 +129,14 @@ impl DiscoveryEngine {
         Self {
             seed_providers,
             scope_providers: Arc::new(scope_providers),
-            continuous: None,
+            continuous: Vec::new(),
             budget: Budget::default(),
         }
     }
 
     /// Attaches a continuously observing source whose lifecycle the engine then owns.
     pub fn with_continuous_source(mut self, source: Arc<dyn ContinuousSource>) -> Self {
-        self.continuous = Some(source);
+        self.continuous.push(source);
         self
     }
 
@@ -198,13 +203,13 @@ impl DiscoveryEngine {
         let mut converged = false;
         // Finishing the continuous source is a one-time transition, tracked so that the
         // final drain happens exactly once and never after the source is already stopped.
-        let mut continuous_finished = self.continuous.is_none();
+        let mut continuous_finished = self.continuous.is_empty();
 
         for _ in 0..self.budget.max_iterations {
             // Poll before anything is decided. Frames that arrived while the previous pass
             // was running would otherwise sit in the buffer until after the convergence
             // check had already concluded there was nothing left to do.
-            if let Some(source) = &self.continuous {
+            for source in &self.continuous {
                 for ev in source.drain() {
                     graph.absorb(ev);
                 }
@@ -245,14 +250,16 @@ impl DiscoveryEngine {
                     // buffered, and only then decide: a frame captured moments ago may
                     // name a network or a router that still needs traversing.
                     continuous_finished = true;
-                    if let Some(source) = &self.continuous {
+                    {
                         let networks_before: HashSet<IpNet> =
                             graph.networks().into_iter().collect();
                         let pivots_before: HashSet<std::net::IpAddr> =
                             graph.pivot_addresses().into_iter().collect();
 
-                        for ev in source.finish() {
-                            graph.absorb(ev);
+                        for source in &self.continuous {
+                            for ev in source.finish() {
+                                graph.absorb(ev);
+                            }
                         }
 
                         let gained_network = graph
@@ -379,9 +386,11 @@ impl DiscoveryEngine {
 
         // Reaching the iteration ceiling must still stop observation; otherwise the capture
         // thread outlives the run and the frame count is never final.
-        if !continuous_finished && let Some(source) = &self.continuous {
-            for ev in source.finish() {
-                graph.absorb(ev);
+        if !continuous_finished {
+            for source in &self.continuous {
+                for ev in source.finish() {
+                    graph.absorb(ev);
+                }
             }
         }
 

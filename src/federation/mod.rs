@@ -1,7 +1,11 @@
 pub mod bundle;
+pub mod discovery;
 pub mod identity;
 pub mod ledger;
 pub mod limits;
+pub mod relay;
 pub mod session;
+pub mod source;
 pub mod store;
+pub mod transport;
 pub mod wire;

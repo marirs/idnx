@@ -353,6 +353,27 @@ impl Node {
         }
     }
 
+    /// Peers that asserted something about this node, most-cited first.
+    ///
+    /// A node can carry both local and remote evidence, so this is not the same question as
+    /// "did a peer report it". Rendering uses it to say which peer, from which of its
+    /// vantages -- a fact observed elsewhere must not be presented as one seen here.
+    pub fn peer_origins(&self) -> Vec<String> {
+        let mut origins: Vec<String> = self
+            .provenance
+            .iter()
+            .filter_map(|p| p.origin.as_ref().map(|o| o.short()))
+            .collect();
+        origins.sort();
+        origins.dedup();
+        origins
+    }
+
+    /// True when nothing about this node was seen from this machine.
+    pub fn only_remote(&self) -> bool {
+        !self.provenance.is_empty() && self.provenance.iter().all(|p| p.is_remote())
+    }
+
     /// Devices that may be other interfaces of the same machine.
     ///
     /// Two nodes sharing a hostname are frequently one computer with a wired and a wireless
