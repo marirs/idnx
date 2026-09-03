@@ -166,22 +166,55 @@ const MASK_LABELS: &[&str] = &[
     "prefixlen",
 ];
 
-/// Words a page uses in a routing table.
+/// The field that names what a route is *for*.
 ///
-/// Deliberately narrow. "network" and "prefix" appear in prose, form labels and help text
-/// everywhere -- "Enter a network in the form 192.168.51.0/24" was promoting a
-/// documentation literal to a routing-table entry.
-const ROUTE_LABELS: &[&str] = &[
-    "destination",
-    "dest network",
+/// Necessary and nowhere near sufficient. An access list, a firewall rule and a NAT policy
+/// all have a destination, and a row reading "Destination 10.0.0.0/8 -- Deny" describes
+/// traffic being dropped rather than a network being routed to.
+const DESTINATION_LABELS: &[&str] = &["destination", "dest network", "dest addr", "dest ip"];
+
+/// Words that place a destination in a routing table specifically.
+///
+/// A routing table names where traffic goes next. A filter table names what happens to it.
+/// Both have destinations, and only the first is topology.
+const ROUTE_CONTEXT: &[&str] = &[
     "routing table",
+    "route table",
     "route entry",
+    "static route",
+    "next hop",
+    "nexthop",
+    "gateway",
+    "metric",
+];
+
+/// Contexts in which a destination is a rule about traffic, not a route to a network.
+///
+/// Promotion is refused outright here, even where routing words also appear: a firewall
+/// page mentioning a gateway does not turn its deny list into a routing table, and the cost
+/// of being wrong is a fabricated network.
+const POLICY_CONTEXT: &[&str] = &[
+    "acl",
+    "access list",
+    "access-list",
+    "firewall",
+    "policy",
+    "filter",
+    "nat",
+    "port forward",
+    "vpn",
+    "tunnel",
+    "deny",
+    "permit",
+    "allow",
+    "block",
+    "rule",
 ];
 
 /// Words that mark text as illustrative rather than a statement about this device.
 const EXAMPLE_MARKERS: &[&str] = &[
     "example",
-    "e.g",
+    "e g",
     "for instance",
     "such as",
     "placeholder",
@@ -190,7 +223,7 @@ const EXAMPLE_MARKERS: &[&str] = &[
     "sample",
     "must be in the form",
     "in the form",
-    "format:",
+    "format",
     "enter a",
     "enter the",
 ];
@@ -333,9 +366,88 @@ fn balanced_units(content: &str, open: char, close: char) -> Vec<(usize, usize, 
     units
 }
 
+/// Whether a sequence of whole words appears in order.
+///
+/// A phrase matches only at word boundaries. Substring matching is wrong here in both
+/// directions: "destination" contains "nat", and "netmasks" should still match "netmask".
+/// The second is handled by comparing word stems rather than by widening the match.
+fn contains_phrase(words: &[&str], phrase: &str) -> bool {
+    let needle: Vec<&str> = phrase.split_whitespace().collect();
+    if needle.is_empty() {
+        return false;
+    }
+    words.windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.iter())
+            .all(|(word, target)| word_matches(word, target))
+    })
+}
+
+/// Whether one word is the label, allowing for a trailing plural.
+///
+/// The text has already been reduced to words of letters and digits, so no trimming is
+/// needed here -- only "netmasks" matching "netmask".
+fn word_matches(word: &str, target: &str) -> bool {
+    word == target || word.strip_suffix('s') == Some(target)
+}
+
+/// Normalises a unit for label matching.
+///
+/// Field names arrive as `lan_ip`, `lan-ip`, `LanIP` and `LAN IP` and all mean the same
+/// thing, so separators become spaces and camel case is split. Matching the raw text missed
+/// every form but one, which meant a JSON body naming its own LAN address went unrecognised.
+fn label_form(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut previous_alnum = false;
+    // Whether the previous character was lowercase *before* being folded. Deciding this
+    // from the folded output split every acronym: `IP` became `i p`, so "ip address" could
+    // never match.
+    let mut previous_lower = false;
+    let mut in_tag = false;
+
+    for ch in text.chars() {
+        // Markup separates fields; it does not join them.
+        if ch == '<' {
+            in_tag = true;
+        }
+        if in_tag {
+            if ch == '>' {
+                in_tag = false;
+            }
+            if previous_alnum {
+                out.push(' ');
+            }
+            previous_alnum = false;
+            previous_lower = false;
+            continue;
+        }
+
+        // Everything that is not a letter or a digit is a separator: quotes, colons,
+        // underscores and dots all divide fields, and leaving any of them attached meant no
+        // whole-word label could match.
+        if !ch.is_ascii_alphanumeric() {
+            if previous_alnum {
+                out.push(' ');
+            }
+            previous_alnum = false;
+            previous_lower = false;
+            continue;
+        }
+
+        // camelCase is two words: `lanIp` names the same field as `lan_ip`.
+        if ch.is_ascii_uppercase() && previous_lower {
+            out.push(' ');
+        }
+        out.push(ch.to_ascii_lowercase());
+        previous_alnum = true;
+        previous_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    out
+}
 /// Whether a unit is illustrating a format rather than stating this device's addressing.
 fn is_illustrative(unit: &str) -> bool {
-    let lowered = unit.to_ascii_lowercase();
+    let lowered = label_form(unit);
     EXAMPLE_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
@@ -344,13 +456,28 @@ fn is_illustrative(unit: &str) -> bool {
 /// Finds prefixes inside one structured unit and decides what the unit says about them.
 fn candidates_in_unit(unit: &str) -> Vec<PrefixCandidate> {
     let text = unescape_hex(unit);
-    let lowered = text.to_ascii_lowercase();
+    let lowered = label_form(&text);
     let mut out = Vec::new();
 
-    let has = |labels: &[&str]| labels.iter().any(|l| lowered.contains(l));
+    // Word boundaries, not substrings. "destination" contains "nat", so raw substring
+    // matching classified every routing table as a NAT policy and refused to promote any
+    // of it -- and the same trap catches "allow" in "allowed", "rule" in "ruleset" and so
+    // on. Labels are phrases of whole words.
+    let words: Vec<&str> = lowered.split_whitespace().collect();
+    let has = |labels: &[&str]| labels.iter().any(|label| contains_phrase(&words, label));
+
+    // A mask label is not a claim about anything. It says a field holds a mask, not what
+    // the address beside it is -- so on its own it decides nothing, and treating it as
+    // evidence of attachment promoted any unit that happened to mention one.
     let mask_labelled = has(MASK_LABELS);
-    let interface_labelled = has(INTERFACE_LABELS);
-    let route_labelled = has(ROUTE_LABELS);
+
+    // A rule about traffic is never a route to a network, whatever else the page says.
+    let policy = has(POLICY_CONTEXT);
+
+    let interface_labelled = has(INTERFACE_LABELS) && !policy;
+    // Both halves, and neither is enough alone: a destination field, and something placing
+    // it in a routing table rather than a filter table.
+    let route_labelled = has(DESTINATION_LABELS) && has(ROUTE_CONTEXT) && !policy;
 
     // A CIDR literal in a unit that names what it is.
     for token in tokens(&text) {
@@ -363,11 +490,13 @@ fn candidates_in_unit(unit: &str) -> Vec<PrefixCandidate> {
         if network.prefix_len() == network.max_prefix_len() {
             continue;
         }
-        let semantics = if interface_labelled || mask_labelled {
+        let semantics = if interface_labelled {
             PrefixSemantics::InterfaceAddress
         } else if route_labelled {
             PrefixSemantics::RouteDestination
         } else {
+            // Including every uncertain case. A prefix whose meaning the page did not state
+            // is kept as a candidate rather than guessed at.
             PrefixSemantics::Unlabelled
         };
         out.push(PrefixCandidate {
@@ -378,18 +507,27 @@ fn candidates_in_unit(unit: &str) -> Vec<PrefixCandidate> {
         });
     }
 
-    // An address and a mask in the same unit, where the unit calls one of them a mask.
-    if mask_labelled
-        && let Some(candidate) = address_and_mask(&text, route_labelled && !interface_labelled)
-    {
-        out.push(candidate);
+    // An address and a mask in the same unit. The mask lets a prefix be computed; what the
+    // prefix *means* still comes from the unit's own labels, and where it says neither the
+    // result is a candidate.
+    if mask_labelled {
+        let semantics = if interface_labelled {
+            PrefixSemantics::InterfaceAddress
+        } else if route_labelled {
+            PrefixSemantics::RouteDestination
+        } else {
+            PrefixSemantics::Unlabelled
+        };
+        if let Some(candidate) = address_and_mask(&text, semantics) {
+            out.push(candidate);
+        }
     }
 
     out
 }
 
-/// Pairs an address with a mask inside one unit.
-fn address_and_mask(text: &str, route: bool) -> Option<PrefixCandidate> {
+/// Pairs an address with a mask inside one unit, under semantics the caller decided.
+fn address_and_mask(text: &str, semantics: PrefixSemantics) -> Option<PrefixCandidate> {
     let quads: Vec<std::net::Ipv4Addr> = tokens(text)
         .iter()
         .filter_map(|t| t.parse::<std::net::Ipv4Addr>().ok())
@@ -402,11 +540,7 @@ fn address_and_mask(text: &str, route: bool) -> Option<PrefixCandidate> {
 
     Some(PrefixCandidate {
         prefix: ipnet::IpNet::V4(network.trunc()),
-        semantics: if route {
-            PrefixSemantics::RouteDestination
-        } else {
-            PrefixSemantics::InterfaceAddress
-        },
+        semantics,
         context: text.to_string(),
         source_text: format!("{address} mask {mask}"),
     })
@@ -805,12 +939,26 @@ mod tests {
 
     #[test]
     fn a_routing_table_row_proves_routing() {
+        // A real routing table names where traffic goes next. A destination alone does not:
+        // every filter table has one too.
+        let body = "<tr><td>Destination</td><td>10.9.0.0</td><td>Netmask</td><td>255.255.0.0</td><td>Gateway</td><td>192.168.70.2</td><td>Metric</td><td>1</td></tr>";
+        let routed: Vec<_> = prefix_candidates(body)
+            .into_iter()
+            .filter(|c| c.semantics == PrefixSemantics::RouteDestination)
+            .collect();
+        assert_eq!(routed.len(), 1, "{routed:?}");
+        assert_eq!(routed[0].prefix.to_string(), "10.9.0.0/16");
+    }
+
+    #[test]
+    fn a_destination_without_routing_context_is_not_a_route() {
+        // The hole this closes. A destination field appears in access lists, firewall
+        // rules, NAT policies and port forwards, and none of them routes to a network.
         let body =
             "<tr><td>Destination</td><td>10.9.0.0</td><td>Netmask</td><td>255.255.0.0</td></tr>";
-        let found = prefix_candidates(body);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].prefix.to_string(), "10.9.0.0/16");
-        assert_eq!(found[0].semantics, PrefixSemantics::RouteDestination);
+        for candidate in prefix_candidates(body) {
+            assert!(!candidate.semantics.establishes_network(), "{candidate:?}");
+        }
     }
 
     #[test]
