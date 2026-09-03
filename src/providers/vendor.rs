@@ -27,9 +27,7 @@ use crate::net::endpoint::Endpoint;
 use crate::net::socket::SocketBinding;
 
 use crate::topology::TopologyEvidence;
-use crate::topology::evidence::{
-    Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence as Evidence,
-};
+use crate::topology::evidence::{DeviceKey, Fact};
 
 /// What is known about a device when choosing adapters.
 #[derive(Debug, Clone, Default)]
@@ -164,11 +162,83 @@ impl AdapterOutcome {
 /// Future returned by a targeted adapter.
 pub type AdapterFuture<'a> = Pin<Box<dyn Future<Output = AdapterOutcome> + Send + 'a>>;
 
+/// What running a link-local broadcast amounted to.
+///
+/// Five states, because collapsing them loses the distinctions that matter. A protocol
+/// whose framing has never been verified is not the same as one that was sent and ignored;
+/// a socket that could not be opened is not the same as a device that stayed quiet; and
+/// bytes that arrived but failed validation are a finding in their own right.
+#[derive(Debug, Clone)]
+pub enum BroadcastOutcome {
+    /// The protocol's framing has not been established, so nothing is sent.
+    Unavailable { reason: String },
+    /// Transmission failed locally: no socket, no binding, no packet on the wire.
+    NotSent { reason: String },
+    /// A verified request went out and nothing came back.
+    NoResponse { sent: String },
+    /// Bytes arrived and did not survive protocol validation.
+    InvalidResponse { sent: String, rejected: usize },
+    /// A correlated, structurally valid reply produced evidence.
+    Answered {
+        sent: String,
+        evidence: Vec<TopologyEvidence>,
+    },
+}
+
+impl BroadcastOutcome {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        BroadcastOutcome::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn not_sent(reason: impl Into<String>) -> Self {
+        BroadcastOutcome::NotSent {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn evidence(self) -> Vec<TopologyEvidence> {
+        match self {
+            BroadcastOutcome::Answered { evidence, .. } => evidence,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether a request actually reached the wire.
+    ///
+    /// This is what separates "the link was quiet" from "nothing was ever asked". Only the
+    /// former is a fact about the network; reporting the latter as silence is the same
+    /// overclaim as reporting an unanswered device as offline.
+    pub fn transmitted(&self) -> bool {
+        matches!(
+            self,
+            BroadcastOutcome::NoResponse { .. }
+                | BroadcastOutcome::InvalidResponse { .. }
+                | BroadcastOutcome::Answered { .. }
+        )
+    }
+
+    pub fn describe(&self, broadcast: &str) -> String {
+        match self {
+            BroadcastOutcome::Unavailable { reason } => {
+                format!("{broadcast} unavailable: {reason}")
+            }
+            BroadcastOutcome::NotSent { reason } => format!("{broadcast} not sent: {reason}"),
+            BroadcastOutcome::NoResponse { sent } => format!("{broadcast} no response ({sent})"),
+            BroadcastOutcome::InvalidResponse { sent, rejected } => {
+                format!("{broadcast} {rejected} reply/replies failed validation ({sent})")
+            }
+            BroadcastOutcome::Answered { sent, .. } => format!("{broadcast} answered ({sent})"),
+        }
+    }
+}
+
 /// Future returned by a link-local broadcast.
 ///
 /// Broadcasts return evidence directly because, unlike the targeted adapters, they are
 /// implemented: the ASUS UDP 9999 probe really does go out on the wire.
-pub type BroadcastFuture<'a> = Pin<Box<dyn Future<Output = Vec<TopologyEvidence>> + Send + 'a>>;
+pub type BroadcastFuture<'a> = Pin<Box<dyn Future<Output = BroadcastOutcome> + Send + 'a>>;
 
 /// A vendor-specific source of evidence.
 pub trait VendorAdapter: Send + Sync {
@@ -304,55 +374,28 @@ impl VendorBroadcast for AsusBroadcast {
 
     fn probe<'a>(
         &'a self,
-        vantage: &'a str,
-        binding: &'a SocketBinding,
-        timeout: Duration,
+        _vantage: &'a str,
+        _binding: &'a SocketBinding,
+        _timeout: Duration,
     ) -> BroadcastFuture<'a> {
         Box::pin(async move {
-            let mut out = Vec::new();
-            for router in crate::probes::asus::discover_asus_routers(binding, timeout).await {
-                let address = std::net::IpAddr::V4(router.ip);
-                let device = DeviceKey::Address(address);
-
-                out.push(Evidence::new(
-                    Fact::DeviceAddress {
-                        device: device.clone(),
-                        address,
-                    },
-                    EvidenceSource::VendorDiscovery,
-                    Confidence::Observed,
-                    vantage,
-                ));
-
-                if let Some(model) = router.model_name.clone() {
-                    out.push(Evidence::new(
-                        Fact::DeviceDescription {
-                            device: device.clone(),
-                            text: model,
-                        },
-                        EvidenceSource::VendorDiscovery,
-                        Confidence::Advertised,
-                        vantage,
-                    ));
-                }
-
-                // Answering a router-management discovery protocol is behaviour, not
-                // manufacture: the device runs router firmware and said so. It is one
-                // signal among several and never decides a role by itself.
-                out.push(
-                    Evidence::new(
-                        Fact::DeviceRoleSignal {
-                            device,
-                            signal: RoleSignal::LinkLayerCapability("Router"),
-                        },
-                        EvidenceSource::VendorDiscovery,
-                        Confidence::Advertised,
-                        vantage,
-                    )
-                    .with_detail("answered a router management discovery broadcast"),
-                );
-            }
-            out
+            // Not sent, and no evidence produced, until the protocol is established.
+            //
+            // The existing code broadcasts three payloads nobody has verified and then
+            // accepts *any* datagram that arrives on the socket: no header, no opcode, no
+            // length, no transaction, no correlation with the request, and a model guessed
+            // by string prefix out of NUL-separated text. Anything at all on the link
+            // answering that port would have produced a device address and a router
+            // capability signal built from arbitrary bytes -- a fabrication path rather
+            // than a weak signal, and worse than having no adapter.
+            //
+            // Establishing it needs, from authoritative material or captured known-good
+            // traffic: the destination port or ports, including whether 18017 is part of
+            // this protocol at all; the request header, opcode and length; the reply
+            // header, opcode and length; correlation between request and reply and the
+            // sender; the exact offsets of the model, MAC, firmware and address fields;
+            // and defined behaviour for malformed and truncated packets.
+            BroadcastOutcome::unavailable(crate::probes::asus::UNVERIFIED_FRAMING)
         })
     }
 }
@@ -364,22 +407,42 @@ pub fn broadcasts() -> Vec<Box<dyn VendorBroadcast>> {
 }
 
 /// Runs every vendor broadcast on a link. None gates another and none gates recursion.
+/// What one pass of the link-local broadcasts produced.
+pub struct BroadcastRun {
+    pub evidence: Vec<TopologyEvidence>,
+    /// One line per broadcast, saying what it managed to do.
+    pub outcomes: Vec<String>,
+    /// Whether any broadcast reached the wire at all. False means every one was
+    /// unavailable or failed to send, and the link's silence proves nothing.
+    pub transmitted: bool,
+}
+
 pub async fn run_broadcasts(
     vantage: &str,
     binding: &SocketBinding,
     timeout: Duration,
-) -> Vec<TopologyEvidence> {
-    let mut out = Vec::new();
+) -> BroadcastRun {
+    let mut evidence = Vec::new();
+    let mut outcomes = Vec::new();
+    let mut transmitted = false;
+
     for broadcast in broadcasts() {
-        out.extend(
-            broadcast
-                .probe(vantage, binding, timeout)
-                .await
+        let outcome = broadcast.probe(vantage, binding, timeout).await;
+        outcomes.push(outcome.describe(broadcast.name()));
+        transmitted |= outcome.transmitted();
+        evidence.extend(
+            outcome
+                .evidence()
                 .into_iter()
                 .filter(|ev| adapter_may_assert(&ev.fact)),
         );
     }
-    out
+
+    BroadcastRun {
+        evidence,
+        outcomes,
+        transmitted,
+    }
 }
 
 /// Every adapter. Order is irrelevant: each runs independently and none gates another.
@@ -464,6 +527,7 @@ pub async fn run_adapters(context: &VendorContext) -> AdapterRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topology::evidence::{Confidence, EvidenceSource, RoleSignal};
 
     fn fingerprint(vendor: Option<&str>) -> DeviceFingerprint {
         DeviceFingerprint {
@@ -654,6 +718,73 @@ mod tests {
             device,
             text: "RT-AX88U".to_string(),
         }));
+    }
+
+    #[tokio::test]
+    async fn the_asus_broadcast_produces_no_evidence_until_its_framing_is_verified() {
+        // What this prevents. The previous implementation broadcast three unverified
+        // payloads and accepted any datagram that arrived: no header, no opcode, no
+        // length, no correlation, and a model guessed by string prefix. Anything on the
+        // link answering that port would have become a router discovery built from
+        // arbitrary bytes.
+        let run = run_broadcasts(
+            "test0",
+            &crate::net::socket::SocketBinding::unbound(),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(run.evidence.is_empty());
+        assert_eq!(run.outcomes.len(), 1);
+        assert!(
+            run.outcomes[0].contains("unavailable"),
+            "{:?}",
+            run.outcomes
+        );
+        assert!(
+            !run.outcomes[0].contains("no response"),
+            "an unverified protocol must not be reported as a silent link: {:?}",
+            run.outcomes
+        );
+    }
+
+    #[test]
+    fn a_broadcast_outcome_distinguishes_every_failure_mode() {
+        // Collapsing these loses what an operator needs: an unverified protocol, a socket
+        // that could not be opened, a link that stayed quiet and bytes that failed
+        // validation are four different findings.
+        let sent = "UDP 9999".to_string();
+        let cases = [
+            BroadcastOutcome::unavailable("framing unverified"),
+            BroadcastOutcome::not_sent("no IPv4 source address"),
+            BroadcastOutcome::NoResponse { sent: sent.clone() },
+            BroadcastOutcome::InvalidResponse {
+                sent: sent.clone(),
+                rejected: 2,
+            },
+            BroadcastOutcome::Answered {
+                sent,
+                evidence: Vec::new(),
+            },
+        ];
+
+        let described: Vec<String> = cases.iter().map(|c| c.describe("broadcast:test")).collect();
+        for (index, text) in described.iter().enumerate() {
+            for (other, previous) in described.iter().enumerate() {
+                assert!(index == other || text != previous, "{text} is ambiguous");
+            }
+        }
+        assert!(described[0].contains("unavailable"));
+        assert!(described[1].contains("not sent"));
+        assert!(described[2].contains("no response"));
+        assert!(described[3].contains("failed validation"));
+        assert!(described[4].contains("answered"));
+
+        // Only a validated answer may carry evidence.
+        for case in cases {
+            let answered = matches!(case, BroadcastOutcome::Answered { .. });
+            assert!(case.evidence().is_empty() || answered);
+        }
     }
 
     #[tokio::test]

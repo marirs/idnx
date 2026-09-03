@@ -30,7 +30,61 @@ use crate::topology::TopologyEvidence;
 /// dyn-compatible so providers can live in one heterogeneous registry, and this keeps the
 /// dependency surface as lean as the rest of the crate (the SNMP BER codec is hand-rolled
 /// for the same reason).
-pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = Vec<TopologyEvidence>> + Send + 'a>>;
+pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = ProviderOutput> + Send + 'a>>;
+
+/// What one provider pass produced.
+///
+/// Evidence remains the only channel into the graph. This adds a second, strictly
+/// non-graph channel for what the provider *attempted*, because the engine cannot infer it:
+/// an empty result previously became the note "no response", which is a claim about the
+/// network. It is only true when something was actually sent. A provider whose protocol is
+/// unimplemented, whose socket would not bind, or whose vantage cannot carry the traffic
+/// returns the same empty vector and must not borrow that claim.
+#[derive(Debug, Default)]
+pub struct ProviderOutput {
+    pub evidence: Vec<TopologyEvidence>,
+    /// What was attempted and what came back, in the provider's own words. Reported
+    /// verbatim; the engine never rewrites these.
+    pub notes: Vec<String>,
+    /// Whether any request reached the wire (or any local source was actually read).
+    ///
+    /// False turns "no response" into "not attempted" wherever the run is reported.
+    pub attempted: bool,
+}
+
+impl ProviderOutput {
+    /// Nothing was attempted, for the stated reason.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            evidence: Vec::new(),
+            notes: vec![reason.into()],
+            attempted: false,
+        }
+    }
+}
+
+/// Providers that simply return evidence keep doing so; the conversion marks the pass as
+/// attempted, which is correct for every provider that got as far as producing a vector.
+impl From<Vec<TopologyEvidence>> for ProviderOutput {
+    fn from(evidence: Vec<TopologyEvidence>) -> Self {
+        Self {
+            evidence,
+            notes: Vec::new(),
+            attempted: true,
+        }
+    }
+}
+
+/// Adapts a provider body that yields plain evidence into a [`ProviderOutput`].
+///
+/// Providers that have nothing extra to report keep returning a vector; wrapping here marks
+/// the pass as attempted without every provider restating it.
+pub async fn attempted<F>(body: F) -> ProviderOutput
+where
+    F: Future<Output = Vec<TopologyEvidence>>,
+{
+    body.await.into()
+}
 
 /// How the selected interface connects, which determines what it can observe.
 ///

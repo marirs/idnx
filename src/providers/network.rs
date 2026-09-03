@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use ipnet::IpNet;
 
-use super::{DiscoveryContext, DiscoveryProvider, ProviderFuture};
+use super::{DiscoveryContext, DiscoveryProvider, ProviderFuture, ProviderOutput};
 use crate::topology::TopologyEvidence;
 use crate::topology::evidence::{
     Capability, Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal,
@@ -34,7 +34,7 @@ impl DiscoveryProvider for SsdpProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
             // SSDP replies trickle in: each responder answers after a random delay up to
@@ -126,7 +126,7 @@ impl DiscoveryProvider for SsdpProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -146,7 +146,7 @@ impl DiscoveryProvider for MndpProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
 
@@ -197,7 +197,7 @@ impl DiscoveryProvider for MndpProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -219,12 +219,20 @@ impl DiscoveryProvider for VendorDiscoveryProvider {
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
         Box::pin(async move {
-            crate::providers::vendor::run_broadcasts(
+            let run = crate::providers::vendor::run_broadcasts(
                 &context.vantage.interface,
                 &context.binding,
                 context.timeout.max(Duration::from_millis(600)),
             )
-            .await
+            .await;
+            // Only evidence enters the graph. The outcomes travel beside it so that a
+            // broadcast whose framing is unverified is reported as unavailable rather than
+            // disappearing into an empty result the engine would then call "no response".
+            ProviderOutput {
+                evidence: run.evidence,
+                notes: run.outcomes,
+                attempted: run.transmitted,
+            }
         })
     }
 }
@@ -260,7 +268,7 @@ impl DiscoveryProvider for PathDiscoveryProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
 
@@ -333,7 +341,7 @@ impl DiscoveryProvider for PathDiscoveryProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -364,7 +372,7 @@ impl DiscoveryProvider for SnmpProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let Some(IpAddr::V4(target)) = context.target else {
                 return out;
@@ -493,7 +501,7 @@ impl DiscoveryProvider for SnmpProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -540,7 +548,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let Some(IpNet::V4(scope)) = context.scope else {
                 return out;
@@ -647,7 +655,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             }
 
             out
-        })
+        }))
     }
 }
 

@@ -70,7 +70,7 @@ impl DiscoveryProvider for InterfaceProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             // Dual-stack: an IPv6-only prefix on this link is as real as the IPv4 one, and
             // enumerating a single family hides half the attached topology.
@@ -134,7 +134,7 @@ impl DiscoveryProvider for InterfaceProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -155,7 +155,7 @@ impl DiscoveryProvider for KernelRouteProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
             let selected_addresses = selected_interface_addresses(vantage);
@@ -281,7 +281,7 @@ impl DiscoveryProvider for KernelRouteProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -302,7 +302,7 @@ impl DiscoveryProvider for DhcpLeaseProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
 
@@ -336,7 +336,7 @@ impl DiscoveryProvider for DhcpLeaseProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -353,7 +353,7 @@ impl DiscoveryProvider for NeighborCacheProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(async move {
+        Box::pin(crate::providers::attempted(async move {
             let mut out = Vec::new();
             let vantage = &context.vantage.interface;
             let iface = Some(context.vantage.interface.as_str());
@@ -431,7 +431,7 @@ impl DiscoveryProvider for NeighborCacheProvider {
             }
 
             out
-        })
+        }))
     }
 }
 
@@ -610,8 +610,8 @@ fd84:3bfe:bf84::/64                     fe80::1812:faa5:e4ee:1b9%en0            
     async fn interface_provider_emits_prefix_bearing_networks() {
         // Runs against the real host; assert on shape rather than on a specific network so
         // the test is stable anywhere.
-        let evidence = InterfaceProvider.discover(&ctx()).await;
-        for ev in &evidence {
+        let produced = InterfaceProvider.discover(&ctx()).await;
+        for ev in &produced.evidence {
             if let Fact::Network { prefix } = &ev.fact {
                 assert!(
                     prefix.prefix_len() > 0,

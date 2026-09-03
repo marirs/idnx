@@ -1,9 +1,33 @@
-use crate::net::socket::SocketBinding;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::timeout;
+//! ASUS Device Discovery (UDP 9999) — protocol audit outstanding, nothing transmitted.
+//!
+//! This module deliberately contains no probe. An earlier draft broadcast three guessed
+//! payloads (`0c 15 00 00`, `IBOX\0\0\0\0`, `INFO`) to `255.255.255.255:9999` and then
+//! accepted *any* datagram that arrived on the socket: it checked no header, no opcode,
+//! no length and no correlation with the request, split the payload on NULs, called any
+//! part beginning `RT-`/`GT-`/`BE` the model and any part longer than three characters
+//! without a dot the SSID. Anything on the link answering that port — a different vendor,
+//! an unrelated service, a host that simply echoes — would have produced a device address
+//! and a router capability signal assembled from arbitrary bytes. That is a fabrication
+//! path, not a weak signal, and it is worse than having no adapter at all.
+//!
+//! Before a probe lands here, known-good captures or authoritative material must establish:
+//!
+//! - the destination port or ports, including whether UDP 18017 belongs to this protocol
+//!   at all or is a separate service that needs its own audit;
+//! - the request header, opcode and length;
+//! - the reply header, opcode and length;
+//! - how a reply correlates with the request and with its sender;
+//! - the exact fields and offsets carrying model, MAC, firmware version and address;
+//! - defined behaviour for malformed and truncated packets.
+//!
+//! Until then [`crate::providers::vendor::AsusBroadcast`] reports
+//! `BroadcastOutcome::Unavailable` and creates no topology evidence. Reporting the link as
+//! silent would be the same overclaim in a quieter voice: nothing was ever sent.
 
+use std::net::Ipv4Addr;
+
+/// The shape a verified parser will return. Retained as the target of the audit above; it
+/// has no constructor because no code may produce one from unvalidated bytes.
 #[derive(Debug, Clone)]
 pub struct AsusRouterDiscovery {
     pub ip: Ipv4Addr,
@@ -13,69 +37,7 @@ pub struct AsusRouterDiscovery {
     pub ssid: Option<String>,
 }
 
-/// Probes the ASUS proprietary Device Discovery service on UDP port 9999 / 18017
-/// Used by ASUSWRT routers (RT-BE, RT-AX, GT, etc.)
-pub async fn discover_asus_routers(
-    binding: &SocketBinding,
-    timeout_duration: Duration,
-) -> Vec<AsusRouterDiscovery> {
-    let mut discovered = Vec::new();
-
-    // Broadcast from the selected interface only: a vendor broadcast leaving through
-    // another link discovers devices this vantage cannot actually see.
-    let socket = match binding.udp_broadcast().await {
-        Ok(s) => Arc::new(s),
-        Err(_) => return discovered,
-    };
-
-    let payloads: &[&[u8]] = &[b"\x0c\x15\x00\x00", b"IBOX\x00\x00\x00\x00", b"INFO"];
-    let bcast_addr = SocketAddrV4::new(Ipv4Addr::new(255, 255, 255, 255), 9999);
-    for payload in payloads {
-        let _ = socket.send_to(payload, bcast_addr).await;
-    }
-
-    let mut buf = [0u8; 2048];
-    let deadline = tokio::time::Instant::now() + timeout_duration;
-
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, peer))) => {
-                if let std::net::SocketAddr::V4(v4) = peer {
-                    let data = &buf[..len];
-                    let raw_str = String::from_utf8_lossy(data);
-
-                    let mut model_name = None;
-                    let mut ssid = None;
-
-                    for part in raw_str.split('\0') {
-                        let part = part.trim();
-                        if part.starts_with("RT-")
-                            || part.starts_with("GT-")
-                            || part.starts_with("BE")
-                        {
-                            model_name = Some(part.to_string());
-                        } else if part.len() > 3 && !part.contains('.') && ssid.is_none() {
-                            ssid = Some(part.to_string());
-                        }
-                    }
-
-                    discovered.push(AsusRouterDiscovery {
-                        ip: *v4.ip(),
-                        model_name,
-                        mac_address: None,
-                        firmware_version: None,
-                        ssid,
-                    });
-                }
-            }
-            _ => break,
-        }
-    }
-
-    discovered
-}
+/// Why the broadcast is not run, in the words the adapter reports to the operator.
+pub const UNVERIFIED_FRAMING: &str = "ASUS UDP 9999 framing is unverified: the request payloads are guesses and the reply \
+     parser validates no header, opcode, length or correlation, so any datagram on the link \
+     would become a router discovery";

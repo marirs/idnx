@@ -14,9 +14,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::providers::{
-    ContinuousSource, DiscoveryContext, DiscoveryProvider, ProviderRun, Vantage,
+    ContinuousSource, DiscoveryContext, DiscoveryProvider, ProviderOutput, ProviderRun, Vantage,
 };
 use crate::topology::TopologyGraph;
+
+/// How a provider pass is described when it yielded no evidence.
+///
+/// The distinction this preserves: `silent` (the caller's wording for a link or device that
+/// was actually asked) is a claim about the network and may only be made when something was
+/// transmitted. A provider that could not run states its own reason, and one that never
+/// attempted anything is reported as such rather than borrowing the network's silence.
+fn run_note(produced: &ProviderOutput, silent: &str) -> Option<String> {
+    if !produced.notes.is_empty() {
+        return Some(produced.notes.join("; "));
+    }
+    if !produced.evidence.is_empty() {
+        return None;
+    }
+    Some(if produced.attempted {
+        silent.to_string()
+    } else {
+        "not attempted".to_string()
+    })
+}
 
 /// Safety limits. These bound work; they are not user-facing tuning knobs.
 #[derive(Debug, Clone)]
@@ -172,17 +192,13 @@ impl DiscoveryEngine {
             if !provider.applies(&context) {
                 continue;
             }
-            let evidence = provider.discover(&context).await;
+            let produced = provider.discover(&context).await;
             seed_runs.push(ProviderRun {
                 provider: provider.name(),
-                evidence_count: evidence.len(),
-                note: if evidence.is_empty() {
-                    Some("no evidence from this vantage".to_string())
-                } else {
-                    None
-                },
+                evidence_count: produced.evidence.len(),
+                note: run_note(&produced, "no evidence from this vantage"),
             });
-            for ev in evidence {
+            for ev in produced.evidence {
                 graph.absorb(ev);
             }
         }
@@ -367,17 +383,13 @@ impl DiscoveryEngine {
                     if !provider.applies(&scoped) {
                         continue;
                     }
-                    let evidence = provider.discover(&scoped).await;
+                    let produced = provider.discover(&scoped).await;
                     runs.push(ProviderRun {
                         provider: provider.name(),
-                        evidence_count: evidence.len(),
-                        note: if evidence.is_empty() {
-                            Some("no response".to_string())
-                        } else {
-                            None
-                        },
+                        evidence_count: produced.evidence.len(),
+                        note: run_note(&produced, "no response"),
                     });
-                    for ev in evidence {
+                    for ev in produced.evidence {
                         graph.absorb(ev);
                     }
                 }
@@ -561,6 +573,37 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_provider_that_never_transmitted_is_not_reported_as_silence() {
+        // "no response" is a claim about the network. A provider whose protocol is
+        // unimplemented, or whose socket would not bind, produces the same empty vector as
+        // a link where nothing answered, and must not inherit that claim.
+        let never_ran = ProviderOutput {
+            attempted: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_note(&never_ran, "no response").as_deref(),
+            Some("not attempted")
+        );
+
+        let asked_and_quiet = ProviderOutput {
+            attempted: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_note(&asked_and_quiet, "no response").as_deref(),
+            Some("no response")
+        );
+
+        // A provider's own account displaces both, verbatim.
+        let stated = ProviderOutput::unavailable("broadcast:asus unavailable: framing unverified");
+        assert_eq!(
+            run_note(&stated, "no response").as_deref(),
+            Some("broadcast:asus unavailable: framing unverified")
+        );
+    }
 
     /// A continuous source that yields evidence only at the very end, standing in for a
     /// frame captured moments before convergence.

@@ -82,12 +82,16 @@ pub async fn enrich_devices(
                     continue;
                 }
                 let produced = provider.discover(&targeted).await;
-                if !produced.is_empty() {
+                if !produced.evidence.is_empty() {
                     coverage
                         .protocols_confirmed
                         .push(provider.name().to_string());
                 }
-                evidence.extend(produced);
+                // A provider's own account of what it attempted, kept beside the device it
+                // was attempted against. Without it, a provider that never transmitted is
+                // indistinguishable from a device that stayed silent.
+                coverage.adapter_outcomes.extend(produced.notes);
+                evidence.extend(produced.evidence);
             }
 
             (evidence, coverage)
