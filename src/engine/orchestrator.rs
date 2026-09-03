@@ -621,7 +621,7 @@ mod tests {
         let report = engine.run(context(), None).await;
 
         assert!(
-            report.graph.vlans_without_prefix().any(|v| v == 77),
+            report.graph.vlans_without_prefix().any(|v| v.id == 77),
             "evidence from the final drain must reach the graph"
         );
         assert!(report.converged);

@@ -62,16 +62,51 @@ impl Realm {
 
     /// Suffix that makes an identifier unique across domains.
     ///
+    /// Uses the complete peer identity, never a short form. This suffix becomes part of a
+    /// device or bridge key, and two peers sharing a 16-character prefix -- which an
+    /// attacker can arrange, and chance eventually will -- would then have their devices
+    /// merged. [`Realm::label`] is the short form, and it is for display only.
+    ///
     /// Empty for the local domain, so local identity is unchanged and nothing about a
     /// single-machine run differs.
     pub fn suffix(&self) -> String {
         match self {
             Realm::Local => String::new(),
-            Realm::Peer { peer, vantage } => {
-                let short: String = peer.chars().take(16).collect();
-                format!("@{short}/{vantage}")
-            }
+            Realm::Peer { peer, vantage } => format!("@{peer}/{vantage}"),
         }
+    }
+}
+
+/// Splits a qualified zone back into its interface part and its domain.
+///
+/// The inverse of the qualification above, needed wherever a stored identity has to be
+/// looked up: the domain must be known to make the lookup exact, and by then the only place
+/// it survives is inside the zone. An interface name never contains `@`, so the split is
+/// unambiguous.
+pub fn split_qualified_zone(zone: &str) -> (Option<String>, Realm) {
+    let Some((base, qualifier)) = zone.split_once('@') else {
+        return ((!zone.is_empty()).then(|| zone.to_string()), Realm::Local);
+    };
+    let Some((peer, vantage)) = qualifier.split_once('/') else {
+        return (Some(zone.to_string()), Realm::Local);
+    };
+    (
+        (!base.is_empty()).then(|| base.to_string()),
+        Realm::Peer {
+            peer: peer.to_string(),
+            vantage: vantage.to_string(),
+        },
+    )
+}
+
+/// The domain a stored device identity belongs to.
+pub fn realm_of_key(key: &DeviceKey) -> Realm {
+    match key {
+        DeviceKey::ScopedAddress(_, zone) => split_qualified_zone(zone).1,
+        // A MAC keeps its domain as a suffix, and a bare address is only ever local or
+        // globally unique -- an ambiguous remote address becomes a scoped one above.
+        DeviceKey::Mac(mac) => split_qualified_zone(mac).1,
+        DeviceKey::Address(_) => Realm::Local,
     }
 }
 
@@ -144,9 +179,9 @@ pub fn qualify_device(key: DeviceKey, realm: &Realm) -> DeviceKey {
         }
         // An ambiguous address becomes a scoped one, with the domain as its zone: that is
         // exactly what a zone is for, and it keeps the address itself intact for display.
-        DeviceKey::Address(address) => {
-            DeviceKey::ScopedAddress(address, realm.suffix().trim_start_matches('@').to_string())
-        }
+        // The suffix keeps its `@`, so the domain can be split back out unambiguously --
+        // an interface name never contains one.
+        DeviceKey::Address(address) => DeviceKey::ScopedAddress(address, realm.suffix()),
         DeviceKey::ScopedAddress(address, zone) => {
             // The peer's interface name means nothing here; two peers both say "eth0".
             DeviceKey::ScopedAddress(address, format!("{zone}{}", realm.suffix()))
@@ -328,6 +363,70 @@ mod tests {
         let remote = peer_realm("aaaa1111", "eth0");
         assert_eq!(scoped_realm(&remote), remote);
         assert_eq!(scoped_realm(&Realm::Local), Realm::Local);
+    }
+
+    #[test]
+    fn qualification_uses_the_whole_peer_identity() {
+        // Two peers sharing a display prefix must not share a namespace: an attacker can
+        // grind out a matching 16-character prefix, and their devices would merge.
+        let shared = "a".repeat(16);
+        let first = Realm::Peer {
+            peer: format!("{shared}1111111111111111111111111111111111111111111111111"),
+            vantage: "eth0".to_string(),
+        };
+        let second = Realm::Peer {
+            peer: format!("{shared}2222222222222222222222222222222222222222222222222"),
+            vantage: "eth0".to_string(),
+        };
+
+        assert_eq!(
+            first.label(),
+            second.label(),
+            "display truncates, as intended"
+        );
+        assert_ne!(first.suffix(), second.suffix(), "identity does not");
+
+        let key = DeviceKey::Mac("02:00:5e:00:00:01".to_string());
+        assert_ne!(
+            qualify_device(key.clone(), &first),
+            qualify_device(key, &second)
+        );
+    }
+
+    #[test]
+    fn a_qualified_zone_splits_back_into_its_parts() {
+        // The domain has to be recoverable from a stored identity, or every later lookup
+        // has to guess which peer it belonged to.
+        let realm = peer_realm("aaaa1111bbbb2222", "eth7");
+        let qualified = qualify_device(
+            DeviceKey::ScopedAddress("fe80::1".parse().unwrap(), "eth0".to_string()),
+            &realm,
+        );
+        let DeviceKey::ScopedAddress(_, zone) = &qualified else {
+            panic!("expected a scoped address");
+        };
+        assert_eq!(
+            split_qualified_zone(zone),
+            (Some("eth0".to_string()), realm.clone())
+        );
+        assert_eq!(realm_of_key(&qualified), realm);
+
+        // A bare ambiguous address becomes scoped with no interface part.
+        let bare = qualify_device(DeviceKey::Address("10.0.0.1".parse().unwrap()), &realm);
+        assert_eq!(realm_of_key(&bare), realm);
+
+        // Local identities split to the local domain.
+        assert_eq!(
+            split_qualified_zone("en0"),
+            (Some("en0".to_string()), Realm::Local)
+        );
+        assert_eq!(
+            realm_of_key(&DeviceKey::ScopedAddress(
+                "fe80::1".parse().unwrap(),
+                "en0".to_string()
+            )),
+            Realm::Local
+        );
     }
 
     #[test]

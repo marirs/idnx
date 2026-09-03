@@ -118,12 +118,19 @@ pub struct NetworkExport {
     pub confidence: String,
     /// False when the network was too large to enumerate address by address.
     pub enumerated: bool,
-    /// The observation domain this network belongs to: `local`, or the peer and vantage
-    /// that reported it. Part of its identity, not decoration -- two peers can each hold a
-    /// 10.0.0.0/24, and merging by prefix alone would fuse two different networks.
-    pub observed_in: String,
-    /// True when no local observation supports this network.
-    pub observed_by_peer: bool,
+    /// The identity domain this network belongs to: `local` for a locally observed or
+    /// globally routable prefix, otherwise the peer and vantage whose namespace it is in.
+    /// Part of its identity, not decoration -- two peers can each hold a 10.0.0.0/24, and
+    /// merging by prefix alone would fuse two different networks.
+    ///
+    /// Says nothing about who observed it: a public prefix a peer reported shares the
+    /// global identity domain and was never seen here. Use `observed_by`.
+    pub identity_domain: String,
+    /// Everyone who observed this network: `local`, and each peer that reported it.
+    pub observed_by: Vec<String>,
+    /// True when something on this machine observed it, which is also what decides whether
+    /// it can be traversed from here.
+    pub locally_observed: bool,
     pub evidence: Vec<EvidenceExport>,
 }
 
@@ -133,6 +140,8 @@ pub struct NetworkExport {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VlanExport {
     pub id: u16,
+    /// The switched domain that uses this tag: `local`, or the peer and vantage that saw it.
+    pub observed_in: String,
     pub prefix: Option<String>,
     pub note: String,
 }
@@ -259,7 +268,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
     let mut networks = Vec::new();
     for net in graph.network_refs() {
         let interfaces: Vec<String> = graph
-            .interfaces_for_network(&net.prefix)
+            .interfaces_for_network(&net)
             .into_iter()
             .map(|s| s.to_string())
             .collect();
@@ -277,23 +286,31 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
                 .map(|n| n.confidence.label().to_string())
                 .unwrap_or_else(|| Confidence::Observed.label().to_string()),
             enumerated: !report.oversized_scopes.contains(&net.prefix),
-            // Which observation domain this network belongs to. Two peers can each hold a
-            // 10.0.0.0/24, and a consumer merging exports by prefix alone would fuse them.
-            observed_in: net.realm.label(),
-            observed_by_peer: !net.realm.is_local(),
+            // The identity domain: two peers can each hold a 10.0.0.0/24, and a consumer
+            // merging exports by prefix alone would fuse them.
+            identity_domain: net.realm.label(),
+            // Who actually saw it, taken from provenance rather than from the identity
+            // domain. A public prefix reported only by a peer carries a shared identity
+            // and is still not something this vantage observed; a corroborated network has
+            // several observers and must not be reduced to one.
+            observed_by: node.map(|n| n.observations()).unwrap_or_default(),
+            locally_observed: node.is_some_and(|n| n.locally_observed()),
             evidence: node.map(|n| evidence_of(&n.provenance)).unwrap_or_default(),
         });
     }
     networks.sort_by(|a, b| {
         a.cidr
             .cmp(&b.cidr)
-            .then_with(|| a.observed_in.cmp(&b.observed_in))
+            .then_with(|| a.identity_domain.cmp(&b.identity_domain))
     });
 
     let vlans: Vec<VlanExport> = graph
         .vlans_without_prefix()
-        .map(|id| VlanExport {
-            id,
+        .map(|vlan| VlanExport {
+            id: vlan.id,
+            // The switched domain the tag belongs to. Two peers' VLAN 20 are two VLANs, and
+            // a consumer merging by number alone would fuse them.
+            observed_in: vlan.realm.label(),
             prefix: None,
             note: "observed on the wire; no prefix evidence".to_string(),
         })

@@ -868,3 +868,352 @@ mod observation_domains {
         );
     }
 }
+
+/// Lookups, probing and outputs must all respect the observation domain.
+mod domain_safety {
+    use super::*;
+    use idnx::engine::enrich::queue_from_graph;
+    use idnx::federation::bundle::EvidenceBundle;
+    use idnx::federation::identity::PeerKey;
+    use idnx::federation::ledger::PeerLedger;
+    use idnx::topology::NodeId;
+    use idnx::topology::graph::NodeKind;
+    use std::collections::HashSet;
+
+    const VANTAGE: &str = "en0";
+    const INDEX: u32 = 3;
+
+    /// Absorbs one bundle per peer, each using identical identifiers.
+    fn merged(records: impl Fn(&str) -> Vec<TopologyEvidence>) -> TopologyGraph {
+        let mut graph = TopologyGraph::new();
+        let mut ledger = PeerLedger::new();
+
+        for vantage in ["eth0", "eth0"] {
+            let key = PeerKey::generate();
+            ledger.pair(key.id());
+            let bundle = EvidenceBundle::publish(&key, vantage, 1, &records(vantage));
+            for record in ledger
+                .accept_immediately(&bundle)
+                .expect("accepted")
+                .evidence
+            {
+                graph.absorb(record);
+            }
+        }
+        graph.finalize_roles();
+        graph
+    }
+
+    fn service_scenario(vantage: &str) -> Vec<TopologyEvidence> {
+        let device = DeviceKey::Mac("02:00:5e:00:00:09".to_string());
+        vec![
+            TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device: device.clone(),
+                    address: "10.0.0.9".parse().unwrap(),
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                vantage,
+            ),
+            TopologyEvidence::new(
+                Fact::DeviceHostname {
+                    device,
+                    hostname: format!("box-on-{vantage}"),
+                },
+                EvidenceSource::Mdns,
+                Confidence::Observed,
+                vantage,
+            ),
+            TopologyEvidence::new(
+                Fact::Service {
+                    address: "10.0.0.9".parse().unwrap(),
+                    port: 443,
+                    protocol: "tcp",
+                    detail: Some(format!("TLS from {vantage}")),
+                },
+                EvidenceSource::TcpProbe,
+                Confidence::Observed,
+                vantage,
+            ),
+        ]
+    }
+
+    #[test]
+    fn two_identical_services_are_advertised_by_their_own_devices() {
+        // Not a count: the edges themselves must connect the right pairs. Matching by
+        // address alone attached one peer's TLS service to the other peer's device.
+        let graph = merged(service_scenario);
+
+        let devices: Vec<&NodeId> = graph
+            .nodes()
+            .filter(|n| n.kind != NodeKind::Service && !n.hostnames.is_empty())
+            .map(|n| &n.id)
+            .collect();
+        assert_eq!(devices.len(), 2, "one device per peer");
+
+        // Each device advertises exactly one service, and they are different nodes: the
+        // edges pair each peer's service with that peer's device. Matching by address
+        // alone gave one device both, or gave one of them the other's.
+        let mut advertised: Vec<&NodeId> = Vec::new();
+        for device in &devices {
+            let services = graph.services_of(device);
+            assert_eq!(
+                services.len(),
+                1,
+                "{device:?} advertises {} services",
+                services.len()
+            );
+            advertised.push(&services[0].id);
+        }
+        assert_ne!(
+            advertised[0], advertised[1],
+            "both devices were given the same service node"
+        );
+
+        // And each service is attributed to the same peer as the device advertising it.
+        for (device, service) in devices.iter().zip(advertised.iter()) {
+            let device_node = graph.nodes().find(|n| &&n.id == device).expect("device");
+            let service_node = graph.nodes().find(|n| &&n.id == service).expect("service");
+            assert_eq!(
+                device_node.peer_origins(),
+                service_node.peer_origins(),
+                "a device and the service it advertises must come from one peer"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_only_devices_never_enter_the_local_interrogation_queue() {
+        // Probing a peer's device sends traffic to whatever holds that address on *this*
+        // network and files the answer against a device on someone else's.
+        let graph = merged(service_scenario);
+        assert!(
+            graph.nodes().any(|n| !n.hostnames.is_empty()),
+            "peers reported devices"
+        );
+
+        let queued = queue_from_graph(&graph, &HashSet::new(), VANTAGE, INDEX);
+        assert!(
+            queued.is_empty(),
+            "{:?}",
+            queued
+                .iter()
+                .map(|t| t.device.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_merged_device_exposes_only_its_locally_observed_addresses() {
+        // A manufacturer MAC merges across domains, so one node can hold an address this
+        // machine saw and another only a peer did. Only the first is ours to probe.
+        let device = DeviceKey::Mac("74:12:13:14:75:dc".to_string());
+        let mut graph = TopologyGraph::new();
+
+        graph.absorb(TopologyEvidence::new(
+            Fact::DeviceAddress {
+                device: device.clone(),
+                address: "192.168.1.1".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+            VANTAGE,
+        ));
+
+        let mut ledger = PeerLedger::new();
+        let key = PeerKey::generate();
+        ledger.pair(key.id());
+        let bundle = EvidenceBundle::publish(
+            &key,
+            "eth0",
+            1,
+            &[TopologyEvidence::new(
+                Fact::DeviceAddress {
+                    device,
+                    address: "10.9.9.9".parse().unwrap(),
+                },
+                EvidenceSource::ArpCache,
+                Confidence::Observed,
+                "eth0",
+            )],
+        );
+        for record in ledger
+            .accept_immediately(&bundle)
+            .expect("accepted")
+            .evidence
+        {
+            graph.absorb(record);
+        }
+        graph.finalize_roles();
+
+        let queued = queue_from_graph(&graph, &HashSet::new(), VANTAGE, INDEX);
+        assert_eq!(queued.len(), 1, "one device");
+
+        let endpoints: Vec<String> = queued[0].endpoints.iter().map(|e| e.to_string()).collect();
+        assert_eq!(
+            endpoints,
+            vec!["192.168.1.1".to_string()],
+            "the peer's address must not be probed from here"
+        );
+    }
+
+    #[test]
+    fn a_remote_interface_appears_beside_its_own_network() {
+        // Looking interfaces up by prefix alone assumed the local domain, so a peer's
+        // interface attached to nothing.
+        let graph = merged(|vantage| {
+            vec![TopologyEvidence::new(
+                Fact::InterfaceNetwork {
+                    interface: format!("if-{vantage}"),
+                    prefix: "10.0.0.0/24".parse().unwrap(),
+                },
+                EvidenceSource::InterfaceAddress,
+                Confidence::Observed,
+                vantage,
+            )]
+        });
+
+        let refs = graph.network_refs();
+        assert_eq!(refs.len(), 2);
+        for reference in &refs {
+            let interfaces = graph.interfaces_for_network(reference);
+            assert_eq!(
+                interfaces.len(),
+                1,
+                "{reference} should have exactly its own interface, got {interfaces:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_numbered_vlans_stay_distinct_in_every_output() {
+        // A tag is unique inside one switched domain. Collapsed, learning a prefix for one
+        // silently claimed to have learned it for both.
+        let mut graph = merged(|vantage| {
+            vec![TopologyEvidence::new(
+                Fact::Vlan { id: 20 },
+                EvidenceSource::Stp,
+                Confidence::Observed,
+                vantage,
+            )]
+        });
+
+        let vlans: Vec<_> = graph.vlans_without_prefix().cloned().collect();
+        assert_eq!(vlans.len(), 2, "{vlans:?}");
+        assert_eq!(vlans[0].id, vlans[1].id);
+        assert_ne!(vlans[0].realm, vlans[1].realm);
+
+        // Attaching a prefix to one must not remove the other.
+        graph.attach_vlan_prefix(&vlans[0]);
+        let remaining: Vec<_> = graph.vlans_without_prefix().cloned().collect();
+        assert_eq!(remaining, vec![vlans[1].clone()]);
+    }
+
+    #[test]
+    fn a_peer_only_public_prefix_exports_as_remotely_observed() {
+        // Its identity domain is the shared one, so peers can corroborate it. That must not
+        // read as "this machine saw it".
+        let mut graph = TopologyGraph::new();
+        let mut ledger = PeerLedger::new();
+        let key = PeerKey::generate();
+        ledger.pair(key.id());
+
+        let bundle = EvidenceBundle::publish(
+            &key,
+            "eth0",
+            1,
+            &[TopologyEvidence::new(
+                Fact::Network {
+                    prefix: "203.0.113.0/24".parse().unwrap(),
+                },
+                EvidenceSource::KernelRoute,
+                Confidence::Observed,
+                "eth0",
+            )],
+        );
+        for record in ledger
+            .accept_immediately(&bundle)
+            .expect("accepted")
+            .evidence
+        {
+            graph.absorb(record);
+        }
+        graph.finalize_roles();
+
+        let node = graph
+            .network_ref_node(&graph.network_refs()[0])
+            .expect("the network");
+
+        assert!(!node.locally_observed(), "nothing here saw it");
+        let observations = node.observations();
+        assert_eq!(observations.len(), 1, "{observations:?}");
+        assert!(observations[0].starts_with("peer "), "{observations:?}");
+        assert!(!observations.contains(&"local".to_string()));
+    }
+
+    #[test]
+    fn a_corroborated_network_lists_every_observer() {
+        // Collapsing to one value lost everyone but the first.
+        let prefix: ipnet::IpNet = "203.0.113.0/24".parse().unwrap();
+        let mut graph = TopologyGraph::new();
+        let mut ledger = PeerLedger::new();
+
+        for vantage in ["eth0", "eth1"] {
+            let key = PeerKey::generate();
+            ledger.pair(key.id());
+            let bundle = EvidenceBundle::publish(
+                &key,
+                vantage,
+                1,
+                &[TopologyEvidence::new(
+                    Fact::Network { prefix },
+                    EvidenceSource::KernelRoute,
+                    Confidence::Observed,
+                    vantage,
+                )],
+            );
+            for record in ledger
+                .accept_immediately(&bundle)
+                .expect("accepted")
+                .evidence
+            {
+                graph.absorb(record);
+            }
+        }
+        graph.absorb(TopologyEvidence::new(
+            Fact::InterfaceNetwork {
+                interface: VANTAGE.to_string(),
+                prefix,
+            },
+            EvidenceSource::InterfaceAddress,
+            Confidence::Observed,
+            VANTAGE,
+        ));
+        graph.finalize_roles();
+
+        let node = graph
+            .network_ref_node(&graph.network_refs()[0])
+            .expect("the network");
+        let observations = node.observations();
+        assert_eq!(observations.len(), 3, "{observations:?}");
+        assert_eq!(observations[0], "local");
+    }
+
+    #[test]
+    fn a_node_id_never_carries_a_truncated_peer_identity() {
+        // A short form is for display. Two peers sharing a 16-character prefix -- which can
+        // be ground out -- would otherwise share a namespace.
+        let graph = merged(service_scenario);
+        for node in graph.nodes() {
+            let NodeId::Device(key) = &node.id else {
+                continue;
+            };
+            let rendered = key.to_string();
+            if let Some((_, qualifier)) = rendered.split_once('@') {
+                let peer = qualifier.split('/').next().expect("peer part");
+                assert_eq!(peer.len(), 64, "expected a full identity in {rendered}");
+            }
+        }
+    }
+}

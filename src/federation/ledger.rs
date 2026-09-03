@@ -87,12 +87,14 @@ impl std::fmt::Display for RejectReason {
 /// A prepared bundle that is dropped without committing leaves the ledger untouched, and
 /// the identical sequence can be offered again.
 #[derive(Debug)]
-#[must_use = "a prepared bundle must be committed or deliberately dropped"]
+#[must_use = "a prepared bundle must be committed or abandoned"]
 pub struct Prepared {
     peer: PeerId,
     vantage: String,
     sequence: u64,
     evidence: Vec<TopologyEvidence>,
+    /// Identifies this reservation, so a late-finishing task cannot release a newer one.
+    token: u64,
 }
 
 impl Prepared {
@@ -108,6 +110,24 @@ impl Prepared {
         self.sequence
     }
 
+    /// The reservation this transaction holds.
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Takes the evidence, to hand to whoever owns the graph.
+    ///
+    /// The token is returned alongside, because committing needs it after the evidence has
+    /// been given away.
+    pub fn split(self) -> (Accepted, Receipt) {
+        let receipt = Receipt {
+            peer: self.peer.clone(),
+            sequence: self.sequence,
+            token: self.token,
+        };
+        (self.into_accepted(), receipt)
+    }
+
     /// Takes the evidence, to hand to whoever owns the graph.
     pub fn into_accepted(self) -> Accepted {
         Accepted {
@@ -116,6 +136,30 @@ impl Prepared {
             sequence: self.sequence,
             evidence: self.evidence,
         }
+    }
+}
+
+/// Proof that a particular transaction is the one being finished.
+///
+/// Carried through delivery and cursor persistence so that `commit` and `abandon` act on
+/// the reservation they belong to. A bare peer identifier was not enough: a task that
+/// stalled and finished late would release whichever reservation happened to be current,
+/// letting a second connection's transaction be committed or freed by the first's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a receipt must be committed or abandoned, or the peer stays reserved"]
+pub struct Receipt {
+    peer: PeerId,
+    sequence: u64,
+    token: u64,
+}
+
+impl Receipt {
+    pub fn peer(&self) -> &PeerId {
+        &self.peer
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 }
 
@@ -136,12 +180,15 @@ pub struct PeerLedger {
     trusted: HashMap<String, PeerId>,
     /// Highest sequence accepted per peer, so a replay cannot re-apply old evidence.
     highest_sequence: HashMap<String, u64>,
-    /// Sequences currently being applied, per peer.
+    /// Reservations currently held, per peer, each with the token that owns it.
     ///
     /// The whole transaction -- prepare, hand to the engine, persist the cursor, commit,
     /// acknowledge -- must be serial per peer. Holding the reservation here makes a second
-    /// concurrent prepare for the same peer fail rather than duplicate the work.
+    /// concurrent prepare for the same peer fail rather than duplicate the work, and the
+    /// token means only the transaction that took it can release it.
     in_flight: HashMap<String, u64>,
+    /// Monotonic reservation counter.
+    next_token: u64,
 }
 
 impl PeerLedger {
@@ -213,18 +260,21 @@ impl PeerLedger {
             return Err(RejectReason::Undecodable(undecodable));
         }
 
-        // Reserved for the duration of the transaction. Released by `commit` or `abandon`.
-        if let Some(&held) = self.in_flight.get(&key) {
-            let _ = held;
+        // Reserved for the duration of the transaction. Released by `commit` or `abandon`,
+        // and only by the transaction whose token matches.
+        if self.in_flight.contains_key(&key) {
             return Err(RejectReason::Busy { peer: key });
         }
-        self.in_flight.insert(key, bundle.sequence);
+        self.next_token += 1;
+        let token = self.next_token;
+        self.in_flight.insert(key, token);
 
         Ok(Prepared {
             peer,
             vantage: bundle.vantage.clone(),
             sequence: bundle.sequence,
             evidence,
+            token,
         })
     }
 
@@ -233,22 +283,39 @@ impl PeerLedger {
     /// Called last: after the evidence has been queued for the graph and after the inbound
     /// cursor has been written to disk. Anything earlier risks a sequence marked consumed
     /// by work that did not happen.
-    pub fn commit(&mut self, peer: &PeerId, sequence: u64) {
-        let key = peer.to_hex();
+    /// Records a bundle as seen and releases its reservation.
+    ///
+    /// Ignored unless the receipt owns the current reservation, so a task that stalled and
+    /// finished late cannot commit on behalf of a newer transaction.
+    pub fn commit(&mut self, receipt: &Receipt) -> bool {
+        let key = receipt.peer.to_hex();
+        if self.in_flight.get(&key) != Some(&receipt.token) {
+            return false;
+        }
         let entry = self.highest_sequence.entry(key.clone()).or_default();
-        if sequence > *entry {
-            *entry = sequence;
+        if receipt.sequence > *entry {
+            *entry = receipt.sequence;
         }
         self.in_flight.remove(&key);
+        true
     }
 
     /// Releases a reservation without recording the bundle as seen.
     ///
     /// For a transaction that could not finish -- the engine declined the evidence, or the
     /// cursor could not be persisted. The sequence stays offerable, and the peer's next
-    /// attempt is not blocked by a reservation nothing is going to release.
-    pub fn abandon(&mut self, peer: &PeerId) {
-        self.in_flight.remove(&peer.to_hex());
+    /// attempt is not blocked by a reservation nothing will release.
+    ///
+    /// Ignored unless the receipt owns the current reservation. A stale abandon that freed
+    /// whatever was current would let a second connection's transaction be interrupted by
+    /// the first's failure.
+    pub fn abandon(&mut self, receipt: &Receipt) -> bool {
+        let key = receipt.peer.to_hex();
+        if self.in_flight.get(&key) != Some(&receipt.token) {
+            return false;
+        }
+        self.in_flight.remove(&key);
+        true
     }
 
     /// Whether a transaction for this peer is in flight.
@@ -261,7 +328,10 @@ impl PeerLedger {
     /// Without this a restart forgets what it accepted, and a captured bundle replayed
     /// afterwards is applied again.
     pub fn restore_cursor(&mut self, peer: &PeerId, sequence: u64) {
-        self.commit(peer, sequence);
+        let entry = self.highest_sequence.entry(peer.to_hex()).or_default();
+        if sequence > *entry {
+            *entry = sequence;
+        }
     }
 
     /// Verifies, converts and commits in one step.
@@ -278,8 +348,9 @@ impl PeerLedger {
         bundle: &EvidenceBundle,
     ) -> Result<Accepted, RejectReason> {
         let prepared = self.prepare(bundle)?;
-        self.commit(&prepared.peer, prepared.sequence);
-        Ok(prepared.into_accepted())
+        let (accepted, receipt) = prepared.split();
+        self.commit(&receipt);
+        Ok(accepted)
     }
 }
 
@@ -462,9 +533,9 @@ mod tests {
 
         let prepared = ledger.prepare(&bundle).expect("prepared");
         assert_eq!(prepared.sequence(), 1);
-        // The delivery is declined, so the bundle is dropped without committing.
-        drop(prepared);
-        ledger.abandon(&key.id());
+        // The delivery is declined, so the bundle is abandoned rather than committed.
+        let (_, receipt) = prepared.split();
+        assert!(ledger.abandon(&receipt));
 
         let second = ledger
             .prepare(&bundle)
@@ -472,7 +543,8 @@ mod tests {
         assert_eq!(second.sequence(), 1);
 
         // Once committed, it is finished with.
-        ledger.commit(&key.id(), 1);
+        let (_, receipt) = second.split();
+        assert!(ledger.commit(&receipt));
         assert_eq!(
             ledger.prepare(&bundle).unwrap_err(),
             RejectReason::Stale {
@@ -487,9 +559,10 @@ mod tests {
         let (mut ledger, key) = paired();
         for sequence in [5u64, 5, 5] {
             let bundle = EvidenceBundle::publish(&key, "br0", sequence, &evidence());
-            assert!(ledger.prepare(&bundle).is_ok(), "no cursor advanced");
+            let prepared = ledger.prepare(&bundle).expect("no cursor advanced");
             // Release the reservation without committing, as a declined delivery would.
-            ledger.abandon(&key.id());
+            let (_, receipt) = prepared.split();
+            assert!(ledger.abandon(&receipt));
         }
     }
 
@@ -532,7 +605,8 @@ mod tests {
             }
         );
 
-        ledger.commit(first.peer(), first.sequence());
+        let (_, receipt) = first.split();
+        assert!(ledger.commit(&receipt));
         assert!(!ledger.is_busy(&key.id()));
     }
 
@@ -542,15 +616,43 @@ mod tests {
         let (mut ledger, key) = paired();
         let bundle = EvidenceBundle::publish(&key, "br0", 1, &evidence());
 
-        let prepared = ledger.prepare(&bundle).expect("prepared");
-        drop(prepared);
-        ledger.abandon(&key.id());
+        let (_, receipt) = ledger.prepare(&bundle).expect("prepared").split();
+        assert!(ledger.abandon(&receipt));
 
         assert!(!ledger.is_busy(&key.id()));
         assert!(
             ledger.prepare(&bundle).is_ok(),
             "the same sequence is offerable again"
         );
+    }
+
+    #[test]
+    fn a_stale_abandon_cannot_release_a_newer_reservation() {
+        // A task that stalls and finishes late must not free -- or commit -- whichever
+        // transaction happens to be current by then.
+        let (mut ledger, key) = paired();
+        let bundle = EvidenceBundle::publish(&key, "br0", 1, &evidence());
+
+        let (_, stale) = ledger.prepare(&bundle).expect("first").split();
+        assert!(ledger.abandon(&stale), "the first releases its own");
+
+        let second = ledger.prepare(&bundle).expect("second");
+        assert!(ledger.is_busy(&key.id()));
+
+        // The stalled first task finally runs.
+        assert!(
+            !ledger.abandon(&stale),
+            "a stale receipt must not release the reservation it does not own"
+        );
+        assert!(
+            !ledger.commit(&stale),
+            "nor commit on behalf of another transaction"
+        );
+        assert!(ledger.is_busy(&key.id()), "the second still holds it");
+
+        let (_, receipt) = second.split();
+        assert!(ledger.commit(&receipt));
+        assert!(!ledger.is_busy(&key.id()));
     }
 
     #[test]

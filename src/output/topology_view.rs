@@ -99,7 +99,7 @@ fn render_networks(report: &DiscoveryReport) {
     let mut virtual_nets: Vec<NetworkRef> = Vec::new();
 
     for net in graph.network_refs() {
-        let ifaces = graph.interfaces_for_network(&net.prefix);
+        let ifaces = graph.interfaces_for_network(&net);
         if is_virtual_network(&ifaces) {
             virtual_nets.push(net);
         } else {
@@ -123,7 +123,7 @@ fn render_networks(report: &DiscoveryReport) {
                 String::new()
             };
             println!("  ├── {}{}", net.to_string().cyan().bold(), note.dimmed());
-            for iface in graph.interfaces_for_network(&net.prefix) {
+            for iface in graph.interfaces_for_network(net) {
                 println!("  │     via {}", iface.dimmed());
             }
             // A network this machine cannot reach, reported by a peer that can, must not
@@ -141,7 +141,7 @@ fn render_networks(report: &DiscoveryReport) {
             "Virtual & VPN networks (local to this machine)".bold()
         );
         for net in &virtual_nets {
-            let ifaces = graph.interfaces_for_network(&net.prefix).join(", ");
+            let ifaces = graph.interfaces_for_network(net).join(", ");
             println!(
                 "  ├── {} {}",
                 net.to_string().yellow(),
@@ -150,14 +150,22 @@ fn render_networks(report: &DiscoveryReport) {
         }
     }
 
-    let vlans: Vec<u16> = graph.vlans_without_prefix().collect();
+    let vlans: Vec<&crate::topology::graph::VlanRef> = graph.vlans_without_prefix().collect();
     if !vlans.is_empty() {
         println!("\n{}", "VLANs".bold());
-        for id in vlans {
+        for vlan in vlans {
             // A tag proves the VLAN exists and nothing more. Never a synthesised prefix.
+            // The domain is shown for a remote one, because VLAN 20 here and VLAN 20 on a
+            // peer's switch are two different VLANs.
+            let domain = if vlan.realm.is_local() {
+                String::new()
+            } else {
+                format!(" [{}]", vlan.realm.label())
+            };
             println!(
-                "  ├── VLAN {} {}",
-                id.to_string().cyan().bold(),
+                "  ├── VLAN {}{} {}",
+                vlan.to_string().cyan().bold(),
+                domain.magenta(),
                 "observed; prefix unknown".dimmed()
             );
         }
@@ -500,13 +508,13 @@ fn render_device_table(graph: &TopologyGraph, vantage: &str) {
 fn services_for(graph: &TopologyGraph, node: &crate::topology::Node) -> Vec<String> {
     let mut best: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
 
-    for service in graph.nodes_of_kind(NodeKind::Service) {
-        let NodeId::Service(addr, port, _) = &service.id else {
+    // Followed through the graph's own edges rather than matched by address. Two domains
+    // can hold the same address, and matching on it listed one peer's service against
+    // another peer's device.
+    for service in graph.services_of(&node.id) {
+        let NodeId::Service(_, port, _) = &service.id else {
             continue;
         };
-        if !node.addresses.contains(addr) {
-            continue;
-        }
         let Some(description) = strongest_description(service, *port) else {
             continue;
         };

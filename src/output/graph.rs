@@ -112,7 +112,11 @@ fn build_data(report: &DiscoveryReport) -> GraphData {
             detail.push(format!("boundary: {}", safe(reason)));
         }
         if let NodeId::Network(net, realm) = &node.id {
-            let ifaces = graph.interfaces_for_network(net);
+            let reference = crate::topology::graph::NetworkRef {
+                prefix: *net,
+                realm: realm.clone(),
+            };
+            let ifaces = graph.interfaces_for_network(&reference);
             if is_virtual_network(&ifaces) {
                 detail.push("virtual / VPN network".to_string());
             }

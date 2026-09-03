@@ -10,7 +10,9 @@ use std::net::IpAddr;
 use ipnet::IpNet;
 
 use super::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal, TopologyEvidence};
-use super::realm::{Realm, address_realm, network_realm, qualify_device, scoped_realm};
+use super::realm::{
+    Realm, address_realm, network_realm, qualify_device, realm_of_key, scoped_realm,
+};
 use super::role::{DeviceRole, score_role};
 
 /// How a device is presented to an operator.
@@ -348,6 +350,9 @@ pub struct Node {
     /// Best (strongest) confidence supporting the node's existence.
     pub confidence: Confidence,
     pub provenance: Vec<Provenance>,
+    /// Which addresses were observed remotely, so reachability can be decided per address
+    /// rather than per device.
+    address_provenance: Vec<(IpAddr, bool)>,
 }
 
 impl Node {
@@ -364,7 +369,60 @@ impl Node {
             opaque_reason: None,
             confidence,
             provenance: Vec::new(),
+            address_provenance: Vec::new(),
         }
+    }
+
+    /// Records how an address of this node came to be known.
+    fn note_address(&mut self, address: IpAddr, remote: bool) {
+        match self
+            .address_provenance
+            .iter_mut()
+            .find(|(existing, _)| *existing == address)
+        {
+            // A local observation outranks a remote one: once this machine has seen an
+            // address itself, it is reachable regardless of who else mentioned it.
+            Some((_, was_remote)) => *was_remote = *was_remote && remote,
+            None => self.address_provenance.push((address, remote)),
+        }
+    }
+
+    /// Addresses of this node that something on this machine actually observed.
+    ///
+    /// A node can hold both: a device with a globally unique MAC may be seen locally on one
+    /// address and reported by a peer on another. Only the locally observed ones are
+    /// reachable from here, and probing the others would send traffic to whatever happens
+    /// to hold that address on *this* network while filing the answer against a device on
+    /// someone else's.
+    pub fn locally_observed_addresses(&self) -> BTreeSet<IpAddr> {
+        self.address_provenance
+            .iter()
+            .filter(|(_, remote)| !*remote)
+            .map(|(address, _)| *address)
+            .collect()
+    }
+
+    /// Whether anything on this machine observed this node at all.
+    pub fn locally_observed(&self) -> bool {
+        self.provenance.iter().any(|p| !p.is_remote())
+    }
+
+    /// Who observed this node: `local`, and each peer that reported it.
+    ///
+    /// A list, because a network can be observed here *and* by several peers. Collapsing it
+    /// to one value was wrong in both directions -- a peer-only public prefix looks local
+    /// because its identity is shared, and a corroborated network loses everyone but one.
+    pub fn observations(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        if self.locally_observed() {
+            seen.push("local".to_string());
+        }
+        for origin in self.peer_origins() {
+            if !seen.contains(&origin) {
+                seen.push(origin);
+            }
+        }
+        seen
     }
 
     /// Peers that asserted something about this node, most-cited first.
@@ -451,6 +509,23 @@ impl Node {
     }
 }
 
+/// A VLAN together with the switched domain that uses the tag.
+///
+/// Both halves name one. VLAN 20 at two sites is two VLANs, and treating the tag alone as
+/// the identity meant learning a prefix for one silently claimed to have learned it for
+/// both.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VlanRef {
+    pub id: u16,
+    pub realm: Realm,
+}
+
+impl std::fmt::Display for VlanRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
+
 /// A network together with the domain it was observed in.
 ///
 /// Both halves are needed to name one: two peers can each hold a 10.0.0.0/24, and they are
@@ -494,7 +569,11 @@ pub struct TopologyGraph {
     /// the local domain, so a host two peers both see still has one owner.
     address_owner: HashMap<(IpAddr, Option<String>, Realm), DeviceKey>,
     /// VLAN IDs seen without any prefix-bearing evidence.
-    vlans_without_prefix: BTreeSet<u16>,
+    /// VLANs seen with no prefix evidence, each in the domain that saw the tag.
+    ///
+    /// A tag is unique inside one switched domain and nowhere else, so a bare `u16` set
+    /// collapsed two peers' VLAN 20 into one -- and attaching a prefix to one removed both.
+    vlans_without_prefix: BTreeSet<VlanRef>,
     /// Structured role signals per device. Kept separate from `Node::role_signals`, which
     /// holds only rendered strings, so scoring operates on typed values.
     role_weights: HashMap<NodeId, BTreeSet<RoleSignal>>,
@@ -609,8 +688,8 @@ impl TopologyGraph {
     }
 
     /// VLANs observed with no prefix evidence, reported as such rather than invented.
-    pub fn vlans_without_prefix(&self) -> impl Iterator<Item = u16> + '_ {
-        self.vlans_without_prefix.iter().copied()
+    pub fn vlans_without_prefix(&self) -> impl Iterator<Item = &VlanRef> + '_ {
+        self.vlans_without_prefix.iter()
     }
 
     /// Counts for presentation, computed once so every renderer agrees.
@@ -655,8 +734,13 @@ impl TopologyGraph {
     ///
     /// Used to separate physical topology from VPN and virtualisation plumbing without
     /// removing anything from the graph.
-    pub fn interfaces_for_network(&self, network: &IpNet) -> Vec<&str> {
-        let target = NodeId::Network(*network, Realm::Local);
+    /// Interfaces attached to one specific network.
+    ///
+    /// Takes the realm-aware reference, because two peers can each hold a 10.0.0.0/24 and
+    /// assuming the local domain returned the wrong one -- or nothing at all for a network
+    /// only a peer reported.
+    pub fn interfaces_for_network(&self, network: &NetworkRef) -> Vec<&str> {
+        let target = NodeId::Network(network.prefix, network.realm.clone());
         self.edges
             .values()
             .filter(|e| e.relationship == Relationship::AttachedTo && e.to == target)
@@ -665,6 +749,27 @@ impl TopologyGraph {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Services a device advertises, followed through the graph's own edges.
+    ///
+    /// Matching services to devices by address alone was wrong once two domains could hold
+    /// the same address: a peer's TLS service on 10.0.0.9 would be listed against another
+    /// peer's device at the same address. The `Advertises` edge already records which
+    /// device the service was attributed to, and it was built with the domain in hand.
+    pub fn services_of(&self, device: &NodeId) -> Vec<&Node> {
+        let mut services: Vec<&Node> = self
+            .edges
+            .values()
+            .filter(|e| e.relationship == Relationship::Advertises && e.from == *device)
+            .filter_map(|e| self.nodes.get(&e.to))
+            .filter(|n| n.kind == NodeKind::Service)
+            .collect();
+        services.sort_by_key(|n| match &n.id {
+            NodeId::Service(address, port, _) => (address.to_string(), *port),
+            _ => (String::new(), 0),
+        });
+        services
     }
 
     /// Addresses of devices with established infrastructure behaviour.
@@ -807,10 +912,13 @@ impl TopologyGraph {
             Fact::Vlan { id } => {
                 let node_id = NodeId::Vlan(id, scoped_realm(&realm));
                 self.upsert(node_id, NodeKind::Vlan, ev.confidence, prov);
-                self.vlans_without_prefix.insert(id);
+                self.vlans_without_prefix.insert(VlanRef {
+                    id,
+                    realm: scoped_realm(&realm),
+                });
             }
             Fact::DeviceAddress { device, address } => {
-                let key = self.canonical_key(&device, Some(address));
+                let key = self.canonical_key(&device, Some(address), &realm);
                 let id = NodeId::Device(key.clone());
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                 // The evidence's vantage is the zone: a link-local address observed on
@@ -824,10 +932,11 @@ impl TopologyGraph {
                     .insert((address, zone, address_realm(&address, &realm)), key);
                 if let Some(node) = self.nodes.get_mut(&id) {
                     node.addresses.insert(address);
+                    node.note_address(address, !realm.is_local());
                 }
             }
             Fact::DeviceHostname { device, hostname } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let id = NodeId::Device(key);
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                 if let Some(node) = self.nodes.get_mut(&id) {
@@ -835,7 +944,7 @@ impl TopologyGraph {
                 }
             }
             Fact::DeviceVendor { device, vendor } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let id = NodeId::Device(key);
                 let remote = ev.is_remote();
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
@@ -856,7 +965,7 @@ impl TopologyGraph {
                 }
             }
             Fact::DeviceDescription { device, text } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let id = NodeId::Device(key);
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                 if let Some(node) = self.nodes.get_mut(&id) {
@@ -864,7 +973,7 @@ impl TopologyGraph {
                 }
             }
             Fact::DeviceRoleSignal { device, signal } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let id = NodeId::Device(key);
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                 if let Some(node) = self.nodes.get_mut(&id) {
@@ -880,7 +989,7 @@ impl TopologyGraph {
                 capability,
                 detail,
             } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let id = NodeId::Device(key);
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                 if let Some(node) = self.nodes.get_mut(&id) {
@@ -891,7 +1000,7 @@ impl TopologyGraph {
                 }
             }
             Fact::GatewayFor { device, network } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let dev_id = NodeId::Device(key);
                 let net_id = NodeId::Network(network, network_realm(&network, &realm));
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
@@ -911,7 +1020,7 @@ impl TopologyGraph {
                 network,
                 next_hop,
             } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let dev_id = NodeId::Device(key);
                 let net_id = NodeId::Network(network, network_realm(&network, &realm));
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
@@ -926,13 +1035,13 @@ impl TopologyGraph {
                     prov.clone(),
                 );
                 if let Some(hop) = next_hop {
-                    let hop_key = self.canonical_key(&DeviceKey::Address(hop), Some(hop));
+                    let hop_key = self.canonical_key(&DeviceKey::Address(hop), Some(hop), &realm);
                     let hop_id = NodeId::Device(hop_key);
                     self.upsert(hop_id, NodeKind::Host, ev.confidence, prov);
                 }
             }
             Fact::AttachedTo { device, network } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let dev_id = NodeId::Device(key);
                 let net_id = NodeId::Network(network, network_realm(&network, &realm));
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
@@ -973,8 +1082,8 @@ impl TopologyGraph {
                 }
             }
             Fact::ObservedBehind { device, via } => {
-                let dev_id = NodeId::Device(self.canonical_key(&device, None));
-                let via_id = NodeId::Device(self.canonical_key(&via, None));
+                let dev_id = NodeId::Device(self.canonical_key(&device, None, &realm));
+                let via_id = NodeId::Device(self.canonical_key(&via, None, &realm));
                 self.upsert(dev_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
                 self.upsert(via_id.clone(), NodeKind::Host, ev.confidence, prov.clone());
                 self.link(
@@ -986,7 +1095,7 @@ impl TopologyGraph {
                 );
             }
             Fact::OpaqueBoundary { device, why } => {
-                let key = self.canonical_key(&device, None);
+                let key = self.canonical_key(&device, None, &realm);
                 let id = NodeId::Device(key);
                 let remote = ev.is_remote();
                 self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
@@ -1016,7 +1125,7 @@ impl TopologyGraph {
                         None => format!("{}/{}", port, protocol),
                     });
                 }
-                if let Some(owner) = self.owner_of(&address, &ev.vantage) {
+                if let Some(owner) = self.owner_of(&address, &ev.vantage, &realm) {
                     self.link(
                         NodeId::Device(owner),
                         id,
@@ -1027,7 +1136,7 @@ impl TopologyGraph {
                 }
             }
             Fact::ResolvedAs { name, address } => {
-                if let Some(owner) = self.owner_of(&address, &ev.vantage) {
+                if let Some(owner) = self.owner_of(&address, &ev.vantage, &realm) {
                     let id = NodeId::Device(owner);
                     self.upsert(id.clone(), NodeKind::Host, ev.confidence, prov);
                     if let Some(node) = self.nodes.get_mut(&id) {
@@ -1072,15 +1181,17 @@ impl TopologyGraph {
                 DeviceKey::ScopedAddress(addr, zone) => Some((*addr, Some(zone.clone()))),
                 DeviceKey::Mac(_) => None,
             };
-            let Some(lookup) = lookup else {
+            let Some((address, zone)) = lookup else {
                 continue;
             };
 
-            if let Some(owner) = self
-                .address_owner
-                .iter()
-                .find(|((a, z, _), _)| (*a, z.clone()) == lookup)
-                .map(|(_, owner)| owner)
+            // Exact, in the domain this identity belongs to. Searching every domain merged
+            // one peer's address-keyed node into another peer's MAC-keyed device whenever
+            // both had the same private address.
+            let realm = realm_of_key(key);
+            if let Some(owner) =
+                self.address_owner
+                    .get(&(address, zone, address_realm(&address, &realm)))
                 && matches!(owner, DeviceKey::Mac(_))
             {
                 merges.push((id.clone(), NodeId::Device(owner.clone())));
@@ -1100,6 +1211,9 @@ impl TopologyGraph {
 
             if let Some(target) = self.nodes.get_mut(&to) {
                 target.addresses.extend(source.addresses);
+                for (address, remote) in source.address_provenance {
+                    target.note_address(address, remote);
+                }
                 target.hostnames.extend(source.hostnames);
                 target.descriptions.extend(source.descriptions);
                 target.role_signals.extend(source.role_signals);
@@ -1192,8 +1306,8 @@ impl TopologyGraph {
     }
 
     /// Marks a VLAN as having gained prefix evidence, so it stops being reported as unknown.
-    pub fn attach_vlan_prefix(&mut self, vlan: u16) {
-        self.vlans_without_prefix.remove(&vlan);
+    pub fn attach_vlan_prefix(&mut self, vlan: &VlanRef) {
+        self.vlans_without_prefix.remove(vlan);
     }
 
     /// Chooses the canonical device key, merging address-only identities into a MAC when
@@ -1201,7 +1315,13 @@ impl TopologyGraph {
     ///
     /// A scoped identity resolves through its own zone: `fe80::1%en0` must never adopt the
     /// owner recorded for `fe80::1%eth1`, because they are different devices.
-    fn canonical_key(&self, key: &DeviceKey, address: Option<IpAddr>) -> DeviceKey {
+    /// Resolves an address-based identity to the device that already holds it.
+    ///
+    /// The realm is required, not optional. Searching across domains meant a fact from one
+    /// peer could resolve to another peer's device whenever both had the same private
+    /// address -- so hostnames and services attached to the wrong machine. The lookup is
+    /// exact: an identity is resolved only within the domain that observed it.
+    fn canonical_key(&self, key: &DeviceKey, address: Option<IpAddr>, realm: &Realm) -> DeviceKey {
         match key {
             DeviceKey::Mac(_) => key.clone(),
             DeviceKey::Address(_) | DeviceKey::ScopedAddress(_, _) => {
@@ -1210,12 +1330,12 @@ impl TopologyGraph {
                     _ => None,
                 };
                 if let Some(addr) = key.address()
-                    && let Some(owner) = self.owner_in_any_realm(&addr, zone.as_deref())
+                    && let Some(owner) = self.owner_in_realm(&addr, zone.as_deref(), realm)
                 {
                     return owner;
                 }
                 if let Some(addr) = address
-                    && let Some(owner) = self.owner_in_any_realm(&addr, zone.as_deref())
+                    && let Some(owner) = self.owner_in_realm(&addr, zone.as_deref(), realm)
                 {
                     return owner;
                 }
@@ -1225,30 +1345,30 @@ impl TopologyGraph {
     }
 
     /// Resolves who holds an address, honouring the zone when the address needs one.
-    fn owner_of(&self, address: &IpAddr, vantage: &str) -> Option<DeviceKey> {
+    fn owner_of(&self, address: &IpAddr, vantage: &str, realm: &Realm) -> Option<DeviceKey> {
         let zone = if crate::topology::evidence::requires_zone(address) {
             Some(vantage.to_ascii_lowercase())
         } else {
             None
         };
-        self.owner_in_any_realm(address, zone.as_deref())
+        self.owner_in_realm(address, zone.as_deref(), realm)
     }
 
-    /// Owner of an address with a given zone, in whichever domain holds it.
+    /// Owner of an address with a given zone, within one observation domain.
     ///
-    /// Identities have already been qualified by the time they reach the map, so an
-    /// address and zone pair can appear in at most one remote domain -- plus the local one,
-    /// which is preferred because it is the one this machine can act on.
-    fn owner_in_any_realm(&self, address: &IpAddr, zone: Option<&str>) -> Option<DeviceKey> {
+    /// Exact. An address is not a global name, so looking one up without saying whose
+    /// observation it came from is how a peer's service ends up on another peer's device.
+    /// The address's own identity domain is used, so a globally unique address resolves in
+    /// the shared domain and two peers seeing one host still find one owner.
+    fn owner_in_realm(
+        &self,
+        address: &IpAddr,
+        zone: Option<&str>,
+        realm: &Realm,
+    ) -> Option<DeviceKey> {
         let zone = zone.map(|z| z.to_string());
         self.address_owner
-            .get(&(*address, zone.clone(), Realm::Local))
-            .or_else(|| {
-                self.address_owner
-                    .iter()
-                    .find(|((a, z, _), _)| a == address && *z == zone)
-                    .map(|(_, owner)| owner)
-            })
+            .get(&(*address, zone, address_realm(address, realm)))
             .cloned()
     }
 
@@ -1414,7 +1534,10 @@ mod tests {
             g.networks().is_empty(),
             "a VLAN tag must not produce a network prefix"
         );
-        assert_eq!(g.vlans_without_prefix().collect::<Vec<_>>(), vec![20]);
+        assert_eq!(
+            g.vlans_without_prefix().map(|v| v.id).collect::<Vec<_>>(),
+            vec![20]
+        );
     }
 
     #[test]

@@ -156,7 +156,11 @@ fn preferred_endpoints(node: &Node, vantage: &str, index: u32) -> Vec<Endpoint> 
     let mut v6_routable: Vec<IpAddr> = Vec::new();
     let mut v6_link_local: Vec<IpAddr> = Vec::new();
 
-    for address in node.addresses.iter().copied() {
+    // Only addresses this machine observed. The rest belong to a peer's network and are
+    // not this vantage's to probe.
+    let reachable = node.locally_observed_addresses();
+
+    for address in reachable.iter().copied() {
         if !is_probeable(&address) {
             continue;
         }
@@ -226,6 +230,15 @@ pub fn queue_from_graph(
         if interrogated.contains(key) {
             continue;
         }
+        // Nothing a peer reported is reachable from here. Probing a peer's device would
+        // send traffic to whatever holds that address on *this* network and file the answer
+        // against a device on someone else's, which is worse than not probing at all.
+        if !node.locally_observed() {
+            continue;
+        }
+
+        // Per address, not per device: a globally merged device can hold one address this
+        // machine saw and another only a peer did.
         let endpoints = preferred_endpoints(node, vantage, index);
         if endpoints.is_empty() {
             continue;
