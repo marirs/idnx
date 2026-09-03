@@ -801,8 +801,18 @@ async fn probe_control_plane(
         // datagram arrives in several, and a partial read must not look like a whole table.
         coverage
             .protocols_confirmed
-            .push(format!("rip/520 ({} datagram(s))", table.datagrams));
-        for route in table.routes {
+            .push(if table.advertised_routes() {
+                format!(
+                    "rip/520 advertised routes ({} datagram(s))",
+                    table.datagrams
+                )
+            } else {
+                format!(
+                    "rip/520 answered a table request, no routes ({} datagram(s))",
+                    table.datagrams
+                )
+            });
+        for route in &table.routes {
             // A metric of 16 is RIP announcing that a route is gone. Recording it would
             // add a network the router just said it cannot reach.
             if !route.is_reachable() {
@@ -837,18 +847,24 @@ async fn probe_control_plane(
             );
         }
 
-        out.push(
-            TopologyEvidence::new(
-                Fact::DeviceRoleSignal {
-                    device: device.clone(),
-                    signal: RoleSignal::RipRouteAdvertisement,
-                },
-                EvidenceSource::Rip,
-                Confidence::Observed,
-                vantage,
-            )
-            .with_detail("returned a routing table in answer to a RIPv2 request"),
-        );
+        // Only where a usable route actually arrived. A router that answers with an empty
+        // table, or with nothing but withdrawals, has confirmed it speaks RIP and
+        // disclosed nothing -- calling that a route advertisement describes something that
+        // did not happen.
+        if table.advertised_routes() {
+            out.push(
+                TopologyEvidence::new(
+                    Fact::DeviceRoleSignal {
+                        device: device.clone(),
+                        signal: RoleSignal::RipRouteAdvertisement,
+                    },
+                    EvidenceSource::Rip,
+                    Confidence::Observed,
+                    vantage,
+                )
+                .with_detail("returned a routing table in answer to a RIPv2 request"),
+            );
+        }
     }
 
     // DNS over UDP, attempted regardless of whether TCP 53 answered. Gating confirmation

@@ -33,6 +33,13 @@ const RIP_RESPONSE: u8 = 2;
 
 /// Address family identifiers that appear in a RIP entry.
 const AFI_INET: u16 = 2;
+
+/// Entries one RIPv2 datagram may carry.
+///
+/// RFC 2453: a response is a four-byte header and at most twenty-five twenty-byte entries,
+/// which is what keeps it inside a 512-byte UDP payload. A longer message is not a RIP
+/// response, and parsing one would take prefixes out of whatever the extra bytes are.
+pub const MAX_ENTRIES_PER_DATAGRAM: usize = 25;
 /// A request for the whole table uses this family with a metric of 16.
 const AFI_UNSPECIFIED: u16 = 0;
 
@@ -121,6 +128,11 @@ pub fn parse_response(datagram: &[u8]) -> Option<Vec<RipRoute>> {
     if !(datagram.len() - 4).is_multiple_of(20) {
         return None;
     }
+    // And no more entries than the protocol permits. Documenting the limit while accepting
+    // longer messages meant prefixes could be read out of whatever followed a real table.
+    if (datagram.len() - 4) / 20 > MAX_ENTRIES_PER_DATAGRAM {
+        return None;
+    }
 
     let mut routes = Vec::new();
     let mut offset = 4usize;
@@ -192,6 +204,17 @@ pub struct RipTable {
     pub datagrams: usize,
 }
 
+impl RipTable {
+    /// Whether the router advertised any usable route.
+    ///
+    /// A router may answer with an empty table, or with nothing but withdrawals. It has
+    /// then confirmed that it speaks RIP and disclosed no routes, and saying it advertised
+    /// routes would describe something that did not happen.
+    pub fn advertised_routes(&self) -> bool {
+        self.routes.iter().any(RipRoute::is_reachable)
+    }
+}
+
 /// Asks one router for its routing table.
 ///
 /// `None` means it did not answer, which says nothing about whether it routes.
@@ -209,13 +232,17 @@ pub async fn request_table(
     const QUIET_PERIOD: Duration = Duration::from_millis(400);
     /// A ceiling on how long one router may be listened to, so a chatty or hostile
     /// responder cannot hold the run open.
+    ///
+    /// A fixed deadline, not a function of the caller's per-datagram timeout: combining
+    /// them with `max` produced a limit that grew with the timeout and imposed no ceiling
+    /// at all.
     const OVERALL_LIMIT: Duration = Duration::from_secs(5);
 
     let destination = SocketAddr::V4(SocketAddrV4::new(target, RIP_PORT));
     let socket = binding.udp_socket(&destination).await.ok()?;
     socket.send_to(&table_request(), destination).await.ok()?;
 
-    let overall_deadline = tokio::time::Instant::now() + timeout.max(OVERALL_LIMIT);
+    let overall_deadline = tokio::time::Instant::now() + OVERALL_LIMIT;
     let mut buffer = [0u8; 4096];
     let mut routes: Vec<RipRoute> = Vec::new();
     let mut datagrams = 0usize;
@@ -251,11 +278,16 @@ pub async fn request_table(
         datagrams += 1;
         for route in parsed {
             // Split tables repeat entries across datagrams, and a router may simply
-            // re-advertise. The same prefix from the same entry is one route.
-            if !routes
-                .iter()
-                .any(|existing| existing.prefix == route.prefix && existing.metric == route.metric)
-            {
+            // re-advertise. Identity is the whole route: two equal-cost paths to one
+            // prefix through different next hops are two routes, and so are the same
+            // prefix carrying different route tags -- collapsing on prefix and metric
+            // alone discarded them.
+            if !routes.iter().any(|existing| {
+                existing.prefix == route.prefix
+                    && existing.next_hop == route.next_hop
+                    && existing.metric == route.metric
+                    && existing.tag == route.tag
+            }) {
                 routes.push(route);
             }
         }
@@ -520,6 +552,129 @@ mod tests {
         packet[2] = 0;
         packet[3] = 0x01;
         assert!(parse_response(&packet).is_none());
+    }
+
+    #[test]
+    fn a_datagram_with_more_entries_than_the_protocol_allows_is_refused() {
+        // RFC 2453 caps a response at twenty-five entries. Accepting more meant prefixes
+        // could be read out of whatever followed a genuine table.
+        let usable = vec![
+            entry(
+                AFI_INET,
+                0,
+                [192, 168, 51, 0],
+                [255, 255, 255, 0],
+                [0, 0, 0, 0],
+                1
+            );
+            MAX_ENTRIES_PER_DATAGRAM
+        ];
+        assert_eq!(
+            parse_response(&response(usable.clone()))
+                .expect("a response")
+                .len(),
+            MAX_ENTRIES_PER_DATAGRAM
+        );
+
+        let mut oversized = usable;
+        oversized.push(entry(
+            AFI_INET,
+            0,
+            [10, 0, 0, 0],
+            [255, 0, 0, 0],
+            [0, 0, 0, 0],
+            1,
+        ));
+        assert!(parse_response(&response(oversized)).is_none());
+    }
+
+    #[test]
+    fn equal_cost_routes_are_distinct_when_their_next_hop_or_tag_differs() {
+        // Two paths to one prefix through different routers are two routes, and the same
+        // prefix under different tags describes different redistributions. Collapsing on
+        // prefix and metric discarded both distinctions.
+        let packet = response(vec![
+            entry(
+                AFI_INET,
+                0,
+                [10, 9, 0, 0],
+                [255, 255, 0, 0],
+                [192, 168, 70, 2],
+                2,
+            ),
+            entry(
+                AFI_INET,
+                0,
+                [10, 9, 0, 0],
+                [255, 255, 0, 0],
+                [192, 168, 70, 3],
+                2,
+            ),
+            entry(
+                AFI_INET,
+                5,
+                [10, 9, 0, 0],
+                [255, 255, 0, 0],
+                [192, 168, 70, 2],
+                2,
+            ),
+        ]);
+        let routes = parse_response(&packet).expect("a response");
+        assert_eq!(routes.len(), 3);
+
+        // Every one is a distinct identity under the rule the collector uses.
+        let mut identities: Vec<(String, Option<IpAddr>, u32, u16)> = routes
+            .iter()
+            .map(|r| (r.prefix.to_string(), r.next_hop, r.metric, r.tag))
+            .collect();
+        identities.sort_by_key(|i| format!("{i:?}"));
+        identities.dedup();
+        assert_eq!(identities.len(), 3);
+    }
+
+    #[test]
+    fn an_answer_carrying_no_usable_route_is_not_an_advertisement() {
+        // A router that answers with an empty table, or with nothing but withdrawals, has
+        // confirmed it speaks RIP and disclosed no routes.
+        let empty = RipTable {
+            routes: Vec::new(),
+            datagrams: 1,
+        };
+        assert!(!empty.advertised_routes());
+
+        let withdrawal = parse_response(&response(vec![entry(
+            AFI_INET,
+            0,
+            [172, 16, 0, 0],
+            [255, 255, 0, 0],
+            [0, 0, 0, 0],
+            16,
+        )]))
+        .expect("a response");
+        assert!(
+            !RipTable {
+                routes: withdrawal,
+                datagrams: 1
+            }
+            .advertised_routes()
+        );
+
+        let advertised = parse_response(&response(vec![entry(
+            AFI_INET,
+            0,
+            [192, 168, 51, 0],
+            [255, 255, 255, 0],
+            [0, 0, 0, 0],
+            1,
+        )]))
+        .expect("a response");
+        assert!(
+            RipTable {
+                routes: advertised,
+                datagrams: 1
+            }
+            .advertised_routes()
+        );
     }
 
     #[test]
