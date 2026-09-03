@@ -158,6 +158,10 @@ fn preferred_endpoints(node: &Node, vantage: &str, index: u32) -> Vec<Endpoint> 
 
     // Only addresses this machine observed. The rest belong to a peer's network and are
     // not this vantage's to probe.
+    //
+    // A link-local address is included, and deliberately: a router that answers on
+    // fe80:: over our own link is directly interrogable, and skipping it left the one
+    // address we could reach a device on unprobed.
     let reachable = node.locally_observed_addresses();
 
     for address in reachable.iter().copied() {

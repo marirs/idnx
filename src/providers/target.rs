@@ -673,37 +673,54 @@ async fn confirm_protocols(
 
     // The identification names a resolver may publish. Implementations differ over which
     // they answer, and identity alone never creates a network.
-    if open_ports.contains(&53) {
+    //
+    // Asked where DNS itself was confirmed, not merely where TCP 53 accepted a connection:
+    // a port that opens and answers nothing is not a resolver, and gating on it put three
+    // questions to something that could not answer them while skipping resolvers that
+    // answer only over UDP.
+    let dns_confirmed = coverage
+        .protocols_confirmed
+        .iter()
+        .any(|entry| entry.starts_with("dns/53"));
+    if dns_confirmed {
         for name in crate::probes::dns::IDENTITY_NAMES {
-            if let Some(text) =
-                crate::probes::dns::identify(target, name, binding, identify_timeout).await
-            {
-                coverage
+            match crate::probes::dns::identify(target, name, binding, identify_timeout).await {
+                Some(text) => {
+                    coverage
+                        .protocols_confirmed
+                        .push(format!("dns/{name} identity"));
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::DeviceDescription {
+                                device: device.clone(),
+                                text: format!("{name}: {text}"),
+                            },
+                            EvidenceSource::UnicastDns,
+                            Confidence::Advertised,
+                            vantage,
+                        )
+                        .with_detail(format!("CHAOS TXT {name}")),
+                    );
+                }
+                // Recorded. A resolver that publishes no identity under this name is a
+                // different finding from one that was never asked, and the earlier version
+                // reported neither.
+                None => coverage
                     .protocols_confirmed
-                    .push(format!("dns/{name} identity"));
-                out.push(
-                    TopologyEvidence::new(
-                        Fact::DeviceDescription {
-                            device: device.clone(),
-                            text: format!("{name}: {text}"),
-                        },
-                        EvidenceSource::UnicastDns,
-                        Confidence::Advertised,
-                        vantage,
-                    )
-                    .with_detail(format!("CHAOS TXT {name}")),
-                );
+                    .push(format!("dns/{name} no identity published")),
             }
         }
     }
 
     // DNS over TCP, for a resolver that answers only there. UDP was already attempted in
     // the control plane, so this runs only when that found nothing.
+    // Only where UDP found nothing. Matched on the port rather than the prefix, because an
+    // identity entry also begins with `dns/` and would have suppressed this fallback.
     if open_ports.contains(&53)
         && !coverage
             .protocols_confirmed
             .iter()
-            .any(|p| p.starts_with("dns/"))
+            .any(|entry| entry.starts_with("dns/53"))
         && let Some(identity) = crate::probes::dns::confirm_dns_tcp(target, binding, timeout).await
     {
         out.extend(dns_evidence(target, device, &identity, vantage, coverage));
@@ -763,49 +780,86 @@ async fn confirm_protocols(
         };
         coverage
             .protocols_confirmed
-            .push(match &identity.redirected_to {
-                Some(_) => format!("http/{port} identity, followed a same-origin redirect"),
-                None => format!("http/{port} identity"),
+            .push(if identity.redirect_chain.is_empty() {
+                format!("http/{port} identity")
+            } else {
+                format!(
+                    "http/{port} identity after {} same-origin redirect(s)",
+                    identity.redirect_chain.len()
+                )
             });
-
-        // The only thing on this page that may create a network: an explicit prefix, or an
-        // address beside something the page itself calls a netmask. A bare address is never
-        // enough, however router-like the device looks.
-        for stated in &identity.prefixes {
+        // A redirect that was not followed is a finding in itself: an HTTPS target means
+        // the device's real interface is somewhere this plaintext probe cannot go.
+        if let Some(declined) = &identity.redirect_declined {
             coverage
                 .protocols_confirmed
-                .push(format!("http/{port} stated prefix {}", stated.prefix));
+                .push(format!("http/{port} redirect not followed ({declined})"));
+        }
+
+        // A prefix in a page is not a network. Only one the page labelled as its own
+        // addressing may become one, and what it becomes depends on which label: an
+        // interface address with a mask proves attachment, a routing-table entry proves
+        // routing, and neither implies the other. Everything else is reported as a
+        // candidate and left alone -- that is where a documentation literal ends up, and
+        // promoting one would fabricate exactly the topology this tool must not invent.
+        for candidate in &identity.prefixes {
+            if !candidate.semantics.establishes_network() {
+                coverage.protocols_confirmed.push(format!(
+                    "http/{port} prefix candidate {} not promoted ({})",
+                    candidate.prefix,
+                    candidate.semantics.label()
+                ));
+                continue;
+            }
+
+            coverage.protocols_confirmed.push(format!(
+                "http/{port} stated {} as {}",
+                candidate.prefix,
+                candidate.semantics.label()
+            ));
+
+            let origin = format!(
+                "stated on http://{}:{port} -- {}",
+                target.host_literal(),
+                candidate.evidence()
+            );
+
             out.push(
                 TopologyEvidence::new(
                     Fact::Network {
-                        prefix: stated.prefix,
+                        prefix: candidate.prefix,
                     },
                     EvidenceSource::TcpProbe,
                     // The device said it. Nothing here observed the network.
                     Confidence::Advertised,
                     vantage,
                 )
-                .with_detail(format!(
-                    "stated on http://{}:{port} as {:?}",
-                    target.host_literal(),
-                    crate::text::clip(&stated.source_text, 120)
-                )),
+                .with_detail(origin.clone()),
             );
+
+            let relationship = match candidate.semantics {
+                // An interface address and mask says the device is on that network. It
+                // says nothing whatever about what it routes.
+                crate::probes::http::PrefixSemantics::InterfaceAddress => Fact::AttachedTo {
+                    device: device.clone(),
+                    network: candidate.prefix,
+                },
+                // Only an explicit routing-table entry establishes routing.
+                crate::probes::http::PrefixSemantics::RouteDestination => Fact::RoutesTo {
+                    device: device.clone(),
+                    network: candidate.prefix,
+                    next_hop: None,
+                },
+                crate::probes::http::PrefixSemantics::Unlabelled => continue,
+            };
             out.push(
                 TopologyEvidence::new(
-                    Fact::RoutesTo {
-                        device: device.clone(),
-                        network: stated.prefix,
-                        next_hop: None,
-                    },
+                    relationship,
                     EvidenceSource::TcpProbe,
                     Confidence::Advertised,
                     vantage,
                 )
-                .with_detail(format!(
-                    "stated on its own web interface as {:?}",
-                    crate::text::clip(&stated.source_text, 120)
-                )),
+                .with_detail(origin),
             );
         }
         if identity.requires_authentication() {

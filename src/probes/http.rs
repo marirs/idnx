@@ -31,10 +31,25 @@ pub struct HttpIdentity {
     pub authenticate: Option<String>,
     /// Contents of `<title>`, when the body carried one.
     pub title: Option<String>,
-    /// Prefixes the response stated explicitly. Never derived from a bare address.
-    pub prefixes: Vec<StatedPrefix>,
-    /// Where a redirect pointed, when it stayed on the same origin.
-    pub redirected_to: Option<String>,
+    /// Prefixes found in the body, each with the semantics the page gave it.
+    ///
+    /// A candidate is not a network. Only those the page labelled as its own addressing
+    /// may be promoted, and the rest are reported as candidates and left alone.
+    pub prefixes: Vec<PrefixCandidate>,
+    /// Where this response redirected, if it did. Overwritten on each hop by design: it
+    /// describes *this* response, and the chain is kept separately.
+    pub redirect_target: Option<String>,
+    /// Every redirect followed to reach this response, in order.
+    ///
+    /// Tracked apart from `redirect_target`, which the final response clears -- so a
+    /// successfully followed redirect was being reported as though none had happened.
+    pub redirect_chain: Vec<String>,
+    /// A redirect that was not followed, and why.
+    ///
+    /// An HTTPS target is the common case: same origin includes the scheme, and following
+    /// it over plaintext would be talking a different protocol to a different port and
+    /// calling the result the same page.
+    pub redirect_declined: Option<String>,
 }
 
 impl HttpIdentity {
@@ -62,128 +77,366 @@ impl HttpIdentity {
     }
 }
 
-/// A prefix a device stated in its own response.
+/// What a page's own structure says a prefix is.
+///
+/// The distinction that decides whether a network may be created. A CIDR appearing
+/// somewhere in HTML or JavaScript is not topology: it is as likely to be example text, an
+/// access list, a VPN pool, a validation constant or a stale form default. Only a page that
+/// labels the value as its own addressing has stated a network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixSemantics {
+    /// An interface or LAN address together with its mask, in one structured field.
+    ///
+    /// Proves the device is attached to that network. It says nothing about routing.
+    InterfaceAddress,
+    /// A route destination and mask, in a routing-table row.
+    ///
+    /// Proves the device routes toward the network.
+    RouteDestination,
+    /// A prefix with no semantics the page attached to it.
+    ///
+    /// Recorded as a candidate and never promoted. This is where a documentation literal
+    /// such as `192.168.51.0/24` ends up, and turning one into a network would fabricate
+    /// exactly the topology this tool exists to avoid inventing.
+    Unlabelled,
+}
+
+impl PrefixSemantics {
+    /// Whether this is enough to create a network node.
+    pub fn establishes_network(&self) -> bool {
+        matches!(
+            self,
+            PrefixSemantics::InterfaceAddress | PrefixSemantics::RouteDestination
+        )
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            PrefixSemantics::InterfaceAddress => "interface address and mask",
+            PrefixSemantics::RouteDestination => "route destination and mask",
+            PrefixSemantics::Unlabelled => "unlabelled prefix (candidate only)",
+        }
+    }
+}
+
+/// A prefix found in a response, with what the page said about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatedPrefix {
+pub struct PrefixCandidate {
     pub prefix: ipnet::IpNet,
-    /// The exact text that produced it, so the network can be traced to what was said
-    /// rather than to how it was parsed.
+    pub semantics: PrefixSemantics,
+    /// The structured unit it was found in -- one table row, one object, one element --
+    /// clipped for display. Kept so a promotion can be argued with rather than trusted.
+    pub context: String,
+    /// The exact text that produced the prefix.
     pub source_text: String,
 }
 
-/// Extracts prefixes a device stated explicitly.
-///
-/// Only two forms count, and both are unambiguous statements of a network.
-///
-/// * A CIDR literal: `192.168.51.0/24`.
-/// * An address and a dotted netmask together, where the mask is labelled as one.
-///
-/// A bare address is never enough. A router's status page is full of addresses -- its own,
-/// its gateway's, its DNS servers' -- and none of them names a network. Deriving a prefix
-/// from an address and an assumed mask is exactly the invention this refuses to do, so a
-/// page that mentions 192.168.51.1 and no mask produces nothing.
-///
-/// Escaping is undone first: web interfaces routinely write addresses as `192\x2e168\x2e1`
-/// to keep them out of the page source, and a device that hides its own addressing that way
-/// is not thereby making a different statement.
-pub fn stated_prefixes(body: &str) -> Vec<StatedPrefix> {
-    let text = unescape_hex(body);
-    let mut out: Vec<StatedPrefix> = Vec::new();
+impl PrefixCandidate {
+    /// One line for the evidence trail.
+    pub fn evidence(&self) -> String {
+        format!(
+            "{}: {:?} in {:?}",
+            self.semantics.label(),
+            crate::text::clip(&self.source_text, 60),
+            crate::text::clip(&self.context, 160)
+        )
+    }
+}
 
-    for token in text.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '/')) {
+/// Words a page uses when it is describing its own attached addressing.
+const INTERFACE_LABELS: &[&str] = &[
+    "lan subnet",
+    "lan network",
+    "lan ip",
+    "lan address",
+    "interface address",
+    "ip address",
+    "ipaddr",
+    "inet addr",
+    "local address",
+];
+
+/// Words that identify a mask field.
+const MASK_LABELS: &[&str] = &[
+    "netmask",
+    "subnet mask",
+    "subnetmask",
+    "subnet_mask",
+    "prefix length",
+    "prefixlen",
+];
+
+/// Words a page uses in a routing table.
+///
+/// Deliberately narrow. "network" and "prefix" appear in prose, form labels and help text
+/// everywhere -- "Enter a network in the form 192.168.51.0/24" was promoting a
+/// documentation literal to a routing-table entry.
+const ROUTE_LABELS: &[&str] = &[
+    "destination",
+    "dest network",
+    "routing table",
+    "route entry",
+];
+
+/// Words that mark text as illustrative rather than a statement about this device.
+const EXAMPLE_MARKERS: &[&str] = &[
+    "example",
+    "e.g",
+    "for instance",
+    "such as",
+    "placeholder",
+    "default is",
+    "defaults to",
+    "sample",
+    "must be in the form",
+    "in the form",
+    "format:",
+    "enter a",
+    "enter the",
+];
+
+/// Extracts prefix candidates from a response body, with the semantics the page gave them.
+///
+/// Generic parsing only. Scripts, styles and comments are removed first: a value inside
+/// them is a program's constant, not a rendered statement about this device, and the router
+/// this was written against keeps its own address in a `<script>` variable precisely
+/// because it is not page content. A vendor adapter that knows a documented configuration
+/// format may parse these; nothing generic should.
+pub fn prefix_candidates(body: &str) -> Vec<PrefixCandidate> {
+    let visible = strip_non_content(body);
+    let mut out: Vec<PrefixCandidate> = Vec::new();
+
+    for unit in structured_units(&visible) {
+        if is_illustrative(&unit) {
+            continue;
+        }
+        for candidate in candidates_in_unit(&unit) {
+            push_unique(&mut out, candidate);
+        }
+    }
+
+    out
+}
+
+/// Removes everything that is not rendered content.
+fn strip_non_content(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let lowered = body.to_ascii_lowercase();
+    let mut index = 0usize;
+
+    while index < body.len() {
+        // Comments and the two element bodies that are code rather than text.
+        let skip_to = [
+            ("<!--", "-->"),
+            ("<script", "</script>"),
+            ("<style", "</style>"),
+        ]
+        .iter()
+        .find_map(|(open, close)| {
+            lowered[index..].starts_with(open).then(|| {
+                lowered[index..]
+                    .find(close)
+                    .map(|end| index + end + close.len())
+                    .unwrap_or(body.len())
+            })
+        });
+
+        if let Some(end) = skip_to {
+            // Replaced by a separator, so removing a block cannot join two unrelated
+            // fields into one apparent unit.
+            out.push('\n');
+            index = end;
+            continue;
+        }
+
+        let ch = body[index..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// Splits content into the units a value and its label can share.
+///
+/// A table row, a JSON or XML object, a form field, or failing those a line. The unit is
+/// the whole basis for pairing: a mask two hundred characters away from an address is not
+/// in the same field, and treating a sliding window as one let unrelated values be married
+/// into a network nobody described.
+fn structured_units(content: &str) -> Vec<String> {
+    let lowered = content.to_ascii_lowercase();
+    let mut units: Vec<String> = Vec::new();
+    // Regions already claimed by a structured unit. Line splitting must skip them: a
+    // document whose rows are all on one line was being treated as a single field, which
+    // paired an address in one row with a mask in the next.
+    let mut claimed: Vec<(usize, usize)> = Vec::new();
+
+    // Table rows first, since that is how nearly every appliance renders a status page.
+    let mut index = 0usize;
+    while let Some(found) = lowered[index..].find("<tr") {
+        let start = index + found;
+        let end = lowered[start..]
+            .find("</tr>")
+            .map(|e| start + e + 5)
+            .unwrap_or(content.len());
+        units.push(content[start..end].to_string());
+        claimed.push((start, end));
+        index = end;
+        if index >= content.len() {
+            break;
+        }
+    }
+
+    // Shallow JSON and XML objects.
+    for (start, end, text) in balanced_units(content, '{', '}') {
+        units.push(text);
+        claimed.push((start, end));
+    }
+
+    // Whatever is left, by line. A line is a unit in plain-text and form-encoded output,
+    // but only the part of it no structured unit already covers.
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let (start, end) = (offset, offset + line.len());
+        offset = end;
+        if claimed.iter().any(|(from, to)| *from < end && start < *to) {
+            continue;
+        }
+        units.push(line.to_string());
+    }
+    units
+}
+
+/// Extracts balanced, non-nested regions between two delimiters.
+fn balanced_units(content: &str, open: char, close: char) -> Vec<(usize, usize, String)> {
+    let mut units = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut depth = 0usize;
+
+    for (index, ch) in content.char_indices() {
+        if ch == open {
+            if depth == 0 {
+                start = Some(index);
+            }
+            depth += 1;
+        } else if ch == close && depth > 0 {
+            depth -= 1;
+            if depth == 0
+                && let Some(from) = start.take()
+                && let Some(text) = content.get(from..index + close.len_utf8())
+                // Bounded: a whole document wrapped in braces is not one field.
+                && text.len() <= 512
+            {
+                units.push((from, index + close.len_utf8(), text.to_string()));
+            }
+        }
+    }
+    units
+}
+
+/// Whether a unit is illustrating a format rather than stating this device's addressing.
+fn is_illustrative(unit: &str) -> bool {
+    let lowered = unit.to_ascii_lowercase();
+    EXAMPLE_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// Finds prefixes inside one structured unit and decides what the unit says about them.
+fn candidates_in_unit(unit: &str) -> Vec<PrefixCandidate> {
+    let text = unescape_hex(unit);
+    let lowered = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+
+    let has = |labels: &[&str]| labels.iter().any(|l| lowered.contains(l));
+    let mask_labelled = has(MASK_LABELS);
+    let interface_labelled = has(INTERFACE_LABELS);
+    let route_labelled = has(ROUTE_LABELS);
+
+    // A CIDR literal in a unit that names what it is.
+    for token in tokens(&text) {
         if !token.contains('/') {
             continue;
         }
         let Ok(network) = token.parse::<ipnet::IpNet>() else {
             continue;
         };
-        // A single address written with a full-length prefix is an address, not a network.
         if network.prefix_len() == network.max_prefix_len() {
             continue;
         }
-        push_unique(
-            &mut out,
-            StatedPrefix {
-                prefix: network.trunc(),
-                source_text: token.to_string(),
-            },
-        );
+        let semantics = if interface_labelled || mask_labelled {
+            PrefixSemantics::InterfaceAddress
+        } else if route_labelled {
+            PrefixSemantics::RouteDestination
+        } else {
+            PrefixSemantics::Unlabelled
+        };
+        out.push(PrefixCandidate {
+            prefix: network.trunc(),
+            semantics,
+            context: text.clone(),
+            source_text: token.to_string(),
+        });
     }
 
-    out.extend(masked_prefixes(&text));
-    out
-}
-
-/// Finds an address paired with something the page itself calls a netmask.
-///
-/// The label is required. Two dotted quads near each other are usually an address and a
-/// gateway, and pairing them would produce a network nobody described.
-fn masked_prefixes(text: &str) -> Vec<StatedPrefix> {
-    const LABELS: &[&str] = &["netmask", "subnet mask", "subnetmask", "mask"];
-
-    let lowered = text.to_ascii_lowercase();
-    let mut out: Vec<StatedPrefix> = Vec::new();
-
-    for label in LABELS {
-        let mut from = 0usize;
-        while let Some(found) = lowered[from..].find(label) {
-            let at = from + found;
-            from = at + label.len();
-
-            // The window either side of the label: an address before it and the mask after,
-            // or both after. Bounded so a mask cannot be paired with an address elsewhere
-            // on the page.
-            let start = at.saturating_sub(120);
-            let end = (from + 120).min(text.len());
-            let Some(window) = text.get(start..end) else {
-                continue;
-            };
-
-            let quads: Vec<&str> = window
-                .split(|c: char| !(c.is_ascii_digit() || c == '.'))
-                .filter(|t| t.parse::<std::net::Ipv4Addr>().is_ok())
-                .collect();
-
-            // The mask is whichever quad is a contiguous mask; the address is another quad
-            // that is not.
-            let Some(mask) = quads.iter().find_map(|t| {
-                t.parse::<std::net::Ipv4Addr>()
-                    .ok()
-                    .filter(is_contiguous_mask)
-            }) else {
-                continue;
-            };
-            let Some(address) = quads.iter().find_map(|t| {
-                t.parse::<std::net::Ipv4Addr>()
-                    .ok()
-                    .filter(|a| !is_contiguous_mask(a))
-            }) else {
-                continue;
-            };
-
-            let length = u32::from_be_bytes(mask.octets()).leading_ones() as u8;
-            let Ok(network) = ipnet::Ipv4Net::new(address, length) else {
-                continue;
-            };
-            push_unique(
-                &mut out,
-                StatedPrefix {
-                    prefix: ipnet::IpNet::V4(network.trunc()),
-                    source_text: format!("{address} {label} {mask}"),
-                },
-            );
-        }
-    }
-
-    out
-}
-
-fn push_unique(out: &mut Vec<StatedPrefix>, candidate: StatedPrefix) {
-    if !out
-        .iter()
-        .any(|existing| existing.prefix == candidate.prefix)
+    // An address and a mask in the same unit, where the unit calls one of them a mask.
+    if mask_labelled
+        && let Some(candidate) = address_and_mask(&text, route_labelled && !interface_labelled)
     {
         out.push(candidate);
+    }
+
+    out
+}
+
+/// Pairs an address with a mask inside one unit.
+fn address_and_mask(text: &str, route: bool) -> Option<PrefixCandidate> {
+    let quads: Vec<std::net::Ipv4Addr> = tokens(text)
+        .iter()
+        .filter_map(|t| t.parse::<std::net::Ipv4Addr>().ok())
+        .collect();
+
+    let mask = quads.iter().copied().find(is_contiguous_mask)?;
+    let address = quads.iter().copied().find(|a| !is_contiguous_mask(a))?;
+    let length = u32::from_be_bytes(mask.octets()).leading_ones() as u8;
+    let network = ipnet::Ipv4Net::new(address, length).ok()?;
+
+    Some(PrefixCandidate {
+        prefix: ipnet::IpNet::V4(network.trunc()),
+        semantics: if route {
+            PrefixSemantics::RouteDestination
+        } else {
+            PrefixSemantics::InterfaceAddress
+        },
+        context: text.to_string(),
+        source_text: format!("{address} mask {mask}"),
+    })
+}
+
+/// Splits text into address-shaped tokens.
+///
+/// Hexadecimal digits and colons are included, without which no IPv6 literal could ever be
+/// extracted -- the earlier tokenizer made IPv6 prefixes impossible to find at all.
+fn tokens(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_ascii_hexdigit() || c == '.' || c == ':' || c == '/'))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn push_unique(out: &mut Vec<PrefixCandidate>, candidate: PrefixCandidate) {
+    match out
+        .iter_mut()
+        .find(|existing| existing.prefix == candidate.prefix)
+    {
+        // The strongest statement about a prefix wins: a page may mention it in passing and
+        // also state it properly, and the proper statement is the one that counts.
+        Some(existing) => {
+            if candidate.semantics.establishes_network()
+                && !existing.semantics.establishes_network()
+            {
+                *existing = candidate;
+            }
+        }
+        None => out.push(candidate),
     }
 }
 
@@ -212,7 +465,6 @@ fn unescape_hex(text: &str) -> String {
             index += 4;
             continue;
         }
-        // Not an escape: copy the character whole, so multi-byte text survives.
         let ch = text[index..].chars().next().unwrap_or('\u{fffd}');
         out.push(ch);
         index += ch.len_utf8();
@@ -251,7 +503,7 @@ pub fn parse_http_identity(response: &str) -> Option<HttpIdentity> {
         match name.trim().to_ascii_lowercase().as_str() {
             "server" => identity.server = Some(value),
             "www-authenticate" => identity.authenticate = Some(value),
-            "location" => identity.redirected_to = Some(value),
+            "location" => identity.redirect_target = Some(value),
             _ => {}
         }
     }
@@ -261,7 +513,7 @@ pub fn parse_http_identity(response: &str) -> Option<HttpIdentity> {
     // read a Content-Security-Policy or a cookie path as addressing.
     identity.prefixes = response
         .split_once("\r\n\r\n")
-        .map(|(_, body)| stated_prefixes(body))
+        .map(|(_, body)| prefix_candidates(body))
         .unwrap_or_default();
     Some(identity)
 }
@@ -351,50 +603,71 @@ pub async fn identify(
 ) -> Option<HttpIdentity> {
     let mut path = "/".to_string();
     let mut identity = probe_http_path(target, port, &path, binding, timeout_duration).await?;
+    let mut chain: Vec<String> = Vec::new();
+    let mut declined: Option<String> = None;
 
     for _ in 0..MAX_REDIRECTS {
-        let Some(next) = identity.redirected_to.clone() else {
+        let Some(next) = identity.redirect_target.clone() else {
             break;
         };
-        let Some(next_path) = same_origin_path(&next, target, port) else {
-            break;
-        };
-        if next_path == path {
-            break;
+        match same_origin_path(&next, target, port) {
+            Ok(next_path) => {
+                if next_path == path {
+                    break;
+                }
+                let Some(followed) =
+                    probe_http_path(target, port, &next_path, binding, timeout_duration).await
+                else {
+                    break;
+                };
+                chain.push(next_path.clone());
+                path = next_path;
+                identity = followed;
+            }
+            Err(reason) => {
+                declined = Some(format!("{next}: {reason}"));
+                break;
+            }
         }
-        path = next_path;
-        let Some(followed) = probe_http_path(target, port, &path, binding, timeout_duration).await
-        else {
-            break;
-        };
-        identity = followed;
     }
 
+    identity.redirect_chain = chain;
+    identity.redirect_declined = declined;
     Some(identity)
 }
 
 /// The path a redirect points to, when it stays on this origin.
 ///
-/// Returns `None` for anything naming a different host or scheme, which is the device
-/// sending us elsewhere rather than describing itself.
-pub fn same_origin_path(location: &str, target: &Endpoint, port: u16) -> Option<String> {
+/// Same origin means scheme, host and port. The scheme matters as much as the host: this
+/// probe speaks plaintext HTTP, and following an `https://` redirect over it would be
+/// talking a different protocol to a different port and calling the result the same page.
+/// Such a redirect is reported instead, with the reason.
+pub fn same_origin_path(
+    location: &str,
+    target: &Endpoint,
+    port: u16,
+) -> Result<String, &'static str> {
     let location = location.trim();
     if location.is_empty() {
-        return None;
+        return Err("empty Location");
     }
     // A protocol-relative URL looks like a path and is not one: `//host/path` names
     // another host, and treating it as relative would follow the device anywhere.
     if location.starts_with("//") {
-        return None;
+        return Err("protocol-relative, names another origin");
     }
-    // A genuinely relative redirect is by definition on this origin.
+    // A genuinely relative redirect is by definition on this origin and scheme.
     if location.starts_with('/') {
-        return Some(location.to_string());
+        return Ok(location.to_string());
     }
 
+    if location.starts_with("https://") {
+        return Err("HTTPS, not followed by a plaintext probe");
+    }
     let rest = location
         .strip_prefix("http://")
-        .or_else(|| location.strip_prefix("https://"))?;
+        .ok_or("not an absolute HTTP URL")?;
+
     let (authority, path) = match rest.split_once('/') {
         Some((authority, path)) => (authority, format!("/{path}")),
         None => (rest, "/".to_string()),
@@ -408,7 +681,11 @@ pub fn same_origin_path(location: &str, target: &Endpoint, port: u16) -> Option<
         || authority == format!("{}", target.address)
         || authority == format!("{}:{port}", target.address);
 
-    matches.then_some(path)
+    if matches {
+        Ok(path)
+    } else {
+        Err("different host or port")
+    }
 }
 
 #[cfg(test)]
@@ -450,144 +727,206 @@ mod tests {
 
     #[test]
     fn a_redirect_is_followed_only_within_the_same_origin() {
-        // A redirect to another host is the device pointing somewhere else. Following it
-        // would probe a machine this run never discovered and file the answer under one it
-        // did.
+        // Origin includes the scheme. This probe speaks plaintext, so following an HTTPS
+        // redirect over it would be talking a different protocol to a different port and
+        // calling the result the same page.
         let target = Endpoint::global("192.168.70.1".parse().unwrap());
 
         assert_eq!(
             same_origin_path("/login.html", &target, 80),
-            Some("/login.html".to_string())
+            Ok("/login.html".to_string())
         );
         assert_eq!(
             same_origin_path("http://192.168.70.1/index.html", &target, 80),
-            Some("/index.html".to_string())
-        );
-        assert_eq!(
-            same_origin_path("http://192.168.70.1:80/", &target, 80),
-            Some("/".to_string())
+            Ok("/index.html".to_string())
         );
 
         // Elsewhere, in every disguise.
-        assert!(same_origin_path("http://evil.example/", &target, 80).is_none());
-        assert!(same_origin_path("http://192.168.70.2/", &target, 80).is_none());
-        assert!(same_origin_path("http://192.168.70.1@evil.example/", &target, 80).is_none());
-        assert!(same_origin_path("//evil.example/", &target, 80).is_none());
-        assert!(same_origin_path("", &target, 80).is_none());
+        assert!(same_origin_path("https://192.168.70.1/", &target, 80).is_err());
+        assert!(same_origin_path("http://evil.example/", &target, 80).is_err());
+        assert!(same_origin_path("http://192.168.70.2/", &target, 80).is_err());
+        assert!(same_origin_path("http://192.168.70.1@evil.example/", &target, 80).is_err());
+        assert!(same_origin_path("//evil.example/", &target, 80).is_err());
+        assert!(same_origin_path("", &target, 80).is_err());
     }
 
     #[test]
     fn a_prefix_is_taken_from_the_body_and_not_from_headers() {
         // A Content-Security-Policy or a cookie path is not a topology statement.
-        let response = "HTTP/1.1 200 OK\r\nX-Net: 10.9.0.0/16\r\n\r\n<p>LAN 192.168.51.0/24</p>";
+        let response = "HTTP/1.1 200 OK\r\nX-Net: 10.9.0.0/16\r\n\r\n<tr><td>LAN Subnet</td><td>192.168.51.0/24</td></tr>";
         let identity = parse_http_identity(response).expect("parsed");
         assert_eq!(identity.prefixes.len(), 1);
         assert_eq!(identity.prefixes[0].prefix.to_string(), "192.168.51.0/24");
     }
 
     #[test]
-    fn a_cidr_literal_states_a_network() {
-        let found = stated_prefixes("LAN subnet is 192.168.51.0/24 (bridged)");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].prefix.to_string(), "192.168.51.0/24");
-        assert_eq!(found[0].source_text, "192.168.51.0/24");
-    }
-
-    #[test]
-    fn an_address_with_a_labelled_mask_states_a_network() {
-        for text in [
-            "IP Address: 192.168.51.1 Subnet Mask: 255.255.255.0",
-            "netmask=255.255.0.0&ip=10.4.0.1",
-            "<td>Subnetmask</td><td>255.255.255.128</td><td>172.20.5.3</td>",
+    fn a_prefix_with_no_semantics_is_a_candidate_and_never_a_network() {
+        // The whole point. A CIDR in a page could be example text, an access list, a VPN
+        // pool, a validation constant or a stale form default. Promoting one would
+        // fabricate a network -- and 192.168.51.0/24 is precisely the literal that must not
+        // become real by appearing in someone's documentation.
+        for body in [
+            "<p>Enter a network in the form 192.168.51.0/24</p>",
+            "<td>Allowed clients</td><td>10.8.0.0/24</td>",
+            "<li>VPN pool 172.16.9.0/24</li>",
         ] {
-            let found = stated_prefixes(text);
-            assert_eq!(found.len(), 1, "{text}");
-            assert!(found[0].source_text.contains("mask"), "{:?}", found[0]);
-        }
-        assert_eq!(
-            stated_prefixes("IP Address: 192.168.51.1 Subnet Mask: 255.255.255.0")[0]
-                .prefix
-                .to_string(),
-            "192.168.51.0/24"
-        );
-    }
-
-    #[test]
-    fn a_bare_address_never_becomes_a_network() {
-        // The failure this exists to prevent. A status page is full of addresses -- the
-        // device's own, its gateway, its resolvers -- and none of them names a network.
-        // Assuming a mask would invent the very prefix this tool must not invent.
-        for text in [
-            "SSLHostIp ='192.168.70.1'",
-            "Gateway 192.168.1.1 DNS 192.168.1.1 8.8.8.8",
-            "Connected to 10.0.0.5 and 10.0.0.6",
-            "Default route via 192.168.51.1",
-        ] {
-            assert!(stated_prefixes(text).is_empty(), "{text}");
+            for candidate in prefix_candidates(body) {
+                assert!(
+                    !candidate.semantics.establishes_network(),
+                    "{body} promoted {:?}",
+                    candidate
+                );
+            }
         }
     }
 
     #[test]
-    fn escaped_addresses_are_read_as_written() {
-        // Web interfaces write addresses as \x2e-escaped text to keep them out of the page
-        // source. A device hiding its own addressing that way is making the same statement.
-        let found = stated_prefixes(r"var lan ='192.168.51.0/24';");
-        assert_eq!(found.len(), 1);
+    fn illustrative_text_is_not_read_as_a_statement() {
+        for body in [
+            "<tr><td>LAN Subnet</td><td>for example 192.168.51.0/24</td></tr>",
+            "<tr><td>Netmask</td><td>e.g. 255.255.255.0 with 192.168.51.1</td></tr>",
+            "<tr><td>IP Address</td><td>default is 192.168.51.1, netmask 255.255.255.0</td></tr>",
+        ] {
+            assert!(prefix_candidates(body).is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn an_interface_address_and_mask_prove_attachment_not_routing() {
+        // Two different claims. Emitting a route for every prefix a page mentions asserted
+        // routing the device never described.
+        let body = "<tr><td>IP Address</td><td>192.168.51.1</td><td>Subnet Mask</td><td>255.255.255.0</td></tr>";
+        let found = prefix_candidates(body);
+        assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].prefix.to_string(), "192.168.51.0/24");
-
-        // And an escaped bare address is still just an address.
-        assert!(stated_prefixes(r"var ip ='192.168.70.1';").is_empty());
+        assert_eq!(found[0].semantics, PrefixSemantics::InterfaceAddress);
+        assert!(found[0].semantics.establishes_network());
     }
 
     #[test]
-    fn a_host_route_is_not_a_network() {
-        // /32 and /128 name one address. Recording them as networks would fill the topology
-        // with a node per host.
-        assert!(stated_prefixes("route 192.168.51.7/32 via eth0").is_empty());
-        assert!(stated_prefixes("fd00::1/128").is_empty());
+    fn a_routing_table_row_proves_routing() {
+        let body =
+            "<tr><td>Destination</td><td>10.9.0.0</td><td>Netmask</td><td>255.255.0.0</td></tr>";
+        let found = prefix_candidates(body);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].prefix.to_string(), "10.9.0.0/16");
+        assert_eq!(found[0].semantics, PrefixSemantics::RouteDestination);
     }
 
     #[test]
-    fn a_mask_that_is_not_contiguous_is_not_a_mask() {
-        // 255.0.255.0 describes no CIDR block, and 0.0.0.0 is every unset field on a page.
-        assert!(stated_prefixes("ip 10.0.0.1 netmask 255.0.255.0").is_empty());
-        assert!(stated_prefixes("ip 10.0.0.1 netmask 0.0.0.0").is_empty());
-    }
-
-    #[test]
-    fn a_mask_is_not_paired_with_an_address_elsewhere_on_the_page() {
-        // Two dotted quads far apart are unrelated. Pairing them would produce a network
-        // nobody described.
-        let far = format!("192.168.51.1{}netmask 255.255.255.0", " ".repeat(400));
-        let found = stated_prefixes(&far);
+    fn a_mask_and_an_address_must_share_a_structured_field() {
+        // A sliding window married unrelated values into a network nobody described. The
+        // unit is a table row, an object, or a line -- and two separate rows are two
+        // separate statements.
+        let separate = "<tr><td>WAN IP</td><td>192.168.70.1</td></tr><tr><td>Netmask</td><td>255.255.255.0</td></tr>";
+        let found = prefix_candidates(separate);
         assert!(
-            found
-                .iter()
-                .all(|p| !p.prefix.to_string().starts_with("192.168.51")),
+            found.iter().all(|c| !c.semantics.establishes_network()),
             "{found:?}"
         );
     }
 
     #[test]
-    fn the_same_network_stated_twice_is_recorded_once() {
-        let found = stated_prefixes("lan 10.9.0.0/16 ... backup 10.9.0.0/16");
+    fn scripts_styles_and_comments_are_not_page_content() {
+        // The router this was written against keeps its own address in a script variable
+        // precisely because it is not rendered content. A value there is a program's
+        // constant, and only a vendor adapter that knows the format may read it.
+        for body in [
+            r"<script>var lan ='192\x2e168\x2e51\x2e0/24'; var mask='255.255.255.0';</script>",
+            "<style>/* LAN Subnet 192.168.51.0/24 */</style>",
+            "<!-- IP Address 192.168.51.1 Subnet Mask 255.255.255.0 -->",
+        ] {
+            assert!(prefix_candidates(body).is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn removing_a_script_does_not_join_the_fields_around_it() {
+        // Otherwise an address before a script and a mask after it become one apparent
+        // field.
+        let body = "192.168.51.1<script>var x=1;</script>Netmask 255.255.255.0";
+        let found = prefix_candidates(body);
+        assert!(
+            found.iter().all(|c| !c.semantics.establishes_network()),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_json_object_is_one_structured_field() {
+        let body = r#"{"lan_ip":"192.168.51.1","netmask":"255.255.255.0"}"#;
+        let found = prefix_candidates(body);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].prefix.to_string(), "192.168.51.0/24");
+        assert!(found[0].semantics.establishes_network());
+    }
+
+    #[test]
+    fn ipv6_prefixes_can_be_extracted_at_all() {
+        // The earlier tokenizer excluded colons and hex digits, which made every IPv6
+        // literal invisible -- the parser could not have found one if a device had stated it.
+        let body = "<tr><td>LAN Subnet</td><td>fd84:3bfe:bf84::/64</td></tr>";
+        let found = prefix_candidates(body);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].prefix.to_string(), "fd84:3bfe:bf84::/64");
+        assert!(found[0].semantics.establishes_network());
+    }
+
+    #[test]
+    fn a_host_route_is_not_a_network() {
+        // /32 and /128 name one address. Recording them would fill the topology with a node
+        // per host.
+        assert!(
+            prefix_candidates("<tr><td>LAN Subnet</td><td>192.168.51.7/32</td></tr>").is_empty()
+        );
+        assert!(prefix_candidates("<tr><td>LAN Subnet</td><td>fd00::1/128</td></tr>").is_empty());
+    }
+
+    #[test]
+    fn a_mask_that_is_not_contiguous_is_not_a_mask() {
+        // 255.0.255.0 describes no CIDR block, and 0.0.0.0 is every unset field on a page.
+        for body in [
+            "<tr><td>IP Address</td><td>10.0.0.1</td><td>Netmask</td><td>255.0.255.0</td></tr>",
+            "<tr><td>IP Address</td><td>10.0.0.1</td><td>Netmask</td><td>0.0.0.0</td></tr>",
+        ] {
+            let found = prefix_candidates(body);
+            assert!(
+                found.iter().all(|c| !c.semantics.establishes_network()),
+                "{body} -> {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_strongest_statement_about_a_prefix_wins() {
+        // A page may mention a network in passing and also state it properly.
+        let body = "<li>see 10.9.0.0/16</li><tr><td>LAN Subnet</td><td>10.9.0.0/16</td></tr>";
+        let found = prefix_candidates(body);
         assert_eq!(found.len(), 1);
+        assert!(found[0].semantics.establishes_network());
     }
 
     #[test]
     fn extraction_does_not_panic_on_arbitrary_bytes() {
         // The body is whatever the device sent.
-        for text in [
+        for body in [
             "",
             "/",
             "//",
             "1.2.3.4/",
             "/24",
-            "\\x",
-            "\\xZZ",
+            r"\x",
+            r"\xZZ",
             "999.999.999.999/24",
+            "<tr",
+            "{",
+            "{{{{",
+            ":::",
+            "::/",
+            "<script",
+            "<!--",
         ] {
-            let _ = stated_prefixes(text);
+            let _ = prefix_candidates(body);
         }
     }
 

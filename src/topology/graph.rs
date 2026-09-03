@@ -459,6 +459,41 @@ impl Node {
         !self.provenance.is_empty() && self.provenance.iter().all(|p| p.is_remote())
     }
 
+    /// Identifiers that would justify merging this device with another.
+    ///
+    /// A vendor name, a set of open ports and a generic banner are not among them. Two
+    /// Huawei gateways on one link have the same manufacturer, the same ports and the same
+    /// greeting, and merging on any of those would fuse two devices into one that exists
+    /// nowhere. Only something the device reports about itself and that is unique to it
+    /// qualifies: a hardware address stated by its management service, a serial number, a
+    /// UPnP UDN, an SNMP engine identifier, a certificate fingerprint.
+    ///
+    /// Collected here so a correlation can be argued from evidence rather than resemblance.
+    /// Nothing in this crate merges on them automatically yet.
+    pub fn stable_identifiers(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for text in &self.descriptions {
+            let lowered = text.to_ascii_lowercase();
+            for marker in [
+                "serial",
+                "udn:",
+                "uuid:",
+                "engine id",
+                "enginied",
+                "fingerprint",
+                "chassis id",
+            ] {
+                if lowered.contains(marker) {
+                    out.push(text.clone());
+                    break;
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Devices that may be other interfaces of the same machine.
     ///
     /// Two nodes sharing a hostname are frequently one computer with a wired and a wireless
