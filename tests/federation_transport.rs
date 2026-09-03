@@ -1,3 +1,7 @@
+//! Requires the `federation` feature, which is off by default: the subsystem is
+//! unapproved and is not part of the shipped build.
+#![cfg(feature = "federation")]
+
 //! End-to-end federation across a relay, with the failures a real deployment produces.
 //!
 //! Peer A is on 192.168.1.0/24 and cannot see past the NAT. Peer B runs inside

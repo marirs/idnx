@@ -9,7 +9,7 @@
 //! neutralised; a `<script>` block needs the sequences that can close it neutralised; the
 //! structured exports need only the first, because their own encoders handle quoting.
 
-use crate::federation::limits::{MAX_TEXT_BYTES, clip, sanitize};
+use crate::text::{MAX_TEXT_BYTES, clip, sanitize};
 
 /// Text safe to print to a terminal or write into a structured export.
 ///

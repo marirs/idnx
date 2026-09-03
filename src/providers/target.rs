@@ -796,9 +796,13 @@ async fn probe_control_plane(
     // and addressing it to an IPv4 router found on a path would be sending a protocol to
     // something that cannot speak it.
     coverage.udp_attempted.push(crate::probes::rip::RIP_PORT);
-    if let Some(routes) = crate::probes::rip::request_table(v4, binding, timeout).await {
-        coverage.protocols_confirmed.push("rip/520".to_string());
-        for route in routes {
+    if let Some(table) = crate::probes::rip::request_table(v4, binding, timeout).await {
+        // The datagram count travels with the confirmation: a table larger than one
+        // datagram arrives in several, and a partial read must not look like a whole table.
+        coverage
+            .protocols_confirmed
+            .push(format!("rip/520 ({} datagram(s))", table.datagrams));
+        for route in table.routes {
             // A metric of 16 is RIP announcing that a route is gone. Recording it would
             // add a network the router just said it cannot reach.
             if !route.is_reachable() {
@@ -833,15 +837,18 @@ async fn probe_control_plane(
             );
         }
 
-        out.push(TopologyEvidence::new(
-            Fact::DeviceRoleSignal {
-                device: device.clone(),
-                signal: RoleSignal::SnmpForwarding,
-            },
-            EvidenceSource::Rip,
-            Confidence::Observed,
-            vantage,
-        ));
+        out.push(
+            TopologyEvidence::new(
+                Fact::DeviceRoleSignal {
+                    device: device.clone(),
+                    signal: RoleSignal::RipRouteAdvertisement,
+                },
+                EvidenceSource::Rip,
+                Confidence::Observed,
+                vantage,
+            )
+            .with_detail("returned a routing table in answer to a RIPv2 request"),
+        );
     }
 
     // DNS over UDP, attempted regardless of whether TCP 53 answered. Gating confirmation

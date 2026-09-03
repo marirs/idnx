@@ -24,11 +24,7 @@ pub const MAX_BUNDLE_BYTES: usize = MAX_ENVELOPE_BYTES;
 pub const MAX_RECORDS: usize = 20_000;
 
 /// Longest single text field accepted from a peer.
-///
-/// Hostnames, vendor strings, descriptions and detail text. Comfortably above anything
-/// legitimate: a DNS name is bounded at 253, and a certificate subject rarely exceeds a few
-/// hundred characters.
-pub const MAX_TEXT_BYTES: usize = 1024;
+pub use crate::text::MAX_TEXT_BYTES;
 
 /// Longest peer-supplied vantage name.
 pub const MAX_VANTAGE_BYTES: usize = 64;
@@ -98,35 +94,9 @@ pub fn check_record_count(claimed: usize) -> Result<(), LimitError> {
     Ok(())
 }
 
-/// Makes remote text safe to print.
-///
-/// Control characters are replaced rather than stripped, so that text which contained them
-/// is visibly different from text which did not -- a peer must not be able to make its
-/// output indistinguishable from ordinary output. ESC in particular begins a terminal
-/// sequence that can move the cursor, clear lines or recolour the screen, which would let a
-/// remote peer forge parts of this tool's display.
-pub fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            // Tab is the one control character worth keeping: it cannot reposition output.
-            '\t' => ' ',
-            c if c.is_control() => '\u{fffd}',
-            c => c,
-        })
-        .collect()
-}
+pub use crate::text::sanitize;
 
-/// Truncates remote text to its limit, by characters.
-///
-/// Used for display only; a field over its limit is refused rather than truncated on the
-/// way in. Truncation is marked so a shortened value is not mistaken for the whole one.
-pub fn clip(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(limit.saturating_sub(1)).collect();
-    format!("{kept}…")
-}
+pub use crate::text::clip;
 
 #[cfg(test)]
 mod tests {

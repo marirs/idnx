@@ -228,6 +228,12 @@ pub enum RoleSignal {
     /// Unambiguous: the kernel records a next hop because the device advertised itself as
     /// the way to reach that prefix. It stands on its own, unlike a management surface.
     KernelNextHop,
+    /// Advertised routes over RIP.
+    ///
+    /// Distinct from the SNMP signal even though both mean "this device has a routing
+    /// table": rendering one as the other told the operator SNMP was answering when it was
+    /// not, which is a false statement about what the device exposes.
+    RipRouteAdvertisement,
     /// Emitted spanning-tree BPDUs, which only a bridge does.
     SpanningTreeBridge,
     /// Serves DNS and a web management interface: the common SOHO router shape.
@@ -243,6 +249,9 @@ impl RoleSignal {
         match self {
             RoleSignal::DefaultGateway => 100,
             RoleSignal::SnmpForwarding => 90,
+            // A router that hands over its table has demonstrated routing as directly as
+            // one that answers SNMP.
+            RoleSignal::RipRouteAdvertisement => 90,
             RoleSignal::SpanningTreeBridge => 90,
             RoleSignal::InternetGatewayDevice => 80,
             RoleSignal::DhcpRouter => 80,
@@ -268,6 +277,7 @@ impl RoleSignal {
                 "advertises a UPnP InternetGatewayDevice".to_string()
             }
             RoleSignal::SnmpForwarding => "SNMP reports IP forwarding".to_string(),
+            RoleSignal::RipRouteAdvertisement => "advertised routes over RIP".to_string(),
             RoleSignal::ObservedForwarding => "observed forwarding traffic on a path".to_string(),
             RoleSignal::KernelNextHop => {
                 "is the kernel's next hop for a routed network".to_string()

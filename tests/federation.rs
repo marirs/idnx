@@ -1,3 +1,7 @@
+//! Requires the `federation` feature, which is off by default: the subsystem is
+//! unapproved and is not part of the shipped build.
+#![cfg(feature = "federation")]
+
 //! Federation acceptance: two peers either side of a NAT boundary.
 //!
 //! The scenario this whole subsystem exists for. Peer A sits on 192.168.1.0/24 and can see

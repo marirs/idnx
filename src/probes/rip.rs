@@ -91,10 +91,13 @@ pub fn table_request() -> Vec<u8> {
 
 /// Parses a RIPv2 response into the routes it advertises.
 ///
-/// Strict about the header and tolerant about individual entries: a router that includes an
-/// address family this parser does not know should lose that entry, not the whole message.
-/// Anything that is not a version 2 response is refused outright, because a RIPv1 message
-/// carries no netmask and a prefix cannot be derived from it without guessing.
+/// Strict about the message and selective about entries. A message that is not a
+/// well-formed version 2 response is refused whole: a RIPv1 message carries no netmask and
+/// a prefix cannot be derived from it without guessing, a length that is not a header plus
+/// whole entries means the datagram was truncated or is not RIP at all, and a non-zero
+/// reserved field means it is not the message this parser thinks it is. Entries that are
+/// individually unusable -- an unknown address family, a mask that is not a prefix -- are
+/// dropped without discarding the ones that are fine.
 pub fn parse_response(datagram: &[u8]) -> Option<Vec<RipRoute>> {
     if datagram.len() < 4 {
         return None;
@@ -105,6 +108,17 @@ pub fn parse_response(datagram: &[u8]) -> Option<Vec<RipRoute>> {
     // Version 2 only. A version 1 entry has no netmask field, and inventing one from the
     // address class would be assuming a prefix nobody advertised.
     if datagram[1] != 2 {
+        return None;
+    }
+    // RFC 2453: the two bytes after the version are reserved and must be zero. A non-zero
+    // value means this is not the message being parsed, and reading entries out of it
+    // would produce prefixes from arbitrary bytes.
+    if datagram[2] != 0 || datagram[3] != 0 {
+        return None;
+    }
+    // A response is a header and whole entries. Silently keeping the entries before a
+    // ragged tail would accept a truncated datagram as a complete table.
+    if !(datagram.len() - 4).is_multiple_of(20) {
         return None;
     }
 
@@ -125,6 +139,12 @@ pub fn parse_response(datagram: &[u8]) -> Option<Vec<RipRoute>> {
         let netmask = Ipv4Addr::new(entry[8], entry[9], entry[10], entry[11]);
         let next_hop = Ipv4Addr::new(entry[12], entry[13], entry[14], entry[15]);
         let metric = u32::from_be_bytes([entry[16], entry[17], entry[18], entry[19]]);
+        // RFC 2453 limits a metric to 1..=16. Zero is not a valid distance, and treating it
+        // as reachable accepted a prefix from a field the protocol says cannot hold that
+        // value; anything above 16 is out of range entirely.
+        if !(1..=16).contains(&metric) {
+            continue;
+        }
 
         let Some(prefix_length) = contiguous_prefix_length(netmask) else {
             // A non-contiguous mask is not a prefix. Refused rather than rounded.
@@ -161,32 +181,87 @@ fn contiguous_prefix_length(netmask: Ipv4Addr) -> Option<u8> {
     }
 }
 
+/// A router's answer to a table request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RipTable {
+    /// Every distinct route advertised, across all response datagrams.
+    pub routes: Vec<RipRoute>,
+    /// How many valid response datagrams arrived. A table larger than one datagram is
+    /// split across several, and reporting the count keeps a partial read distinguishable
+    /// from a complete one.
+    pub datagrams: usize,
+}
+
 /// Asks one router for its routing table.
 ///
-/// `None` means it did not answer, which says nothing about whether it routes. A router
-/// that answers has disclosed its table directly, and every prefix carries the entry bytes
-/// that established it.
+/// `None` means it did not answer, which says nothing about whether it routes.
+///
+/// A RIP table does not fit in one datagram: an entry is twenty bytes and a response holds
+/// at most twenty-five of them, so a router with more routes than that sends several.
+/// Reading one and stopping took the first twenty-five routes and called it the table.
+/// Datagrams are collected until the router goes quiet, deduplicated, and counted.
 pub async fn request_table(
     target: Ipv4Addr,
     binding: &SocketBinding,
     timeout: Duration,
-) -> Option<Vec<RipRoute>> {
+) -> Option<RipTable> {
+    /// How long to keep listening after the last datagram before deciding the table ended.
+    const QUIET_PERIOD: Duration = Duration::from_millis(400);
+    /// A ceiling on how long one router may be listened to, so a chatty or hostile
+    /// responder cannot hold the run open.
+    const OVERALL_LIMIT: Duration = Duration::from_secs(5);
+
     let destination = SocketAddr::V4(SocketAddrV4::new(target, RIP_PORT));
     let socket = binding.udp_socket(&destination).await.ok()?;
     socket.send_to(&table_request(), destination).await.ok()?;
 
+    let overall_deadline = tokio::time::Instant::now() + timeout.max(OVERALL_LIMIT);
     let mut buffer = [0u8; 4096];
-    let (length, from) = tokio::time::timeout(timeout, socket.recv_from(&mut buffer))
-        .await
-        .ok()?
-        .ok()?;
+    let mut routes: Vec<RipRoute> = Vec::new();
+    let mut datagrams = 0usize;
 
-    // Only an answer from the router that was asked. A response from elsewhere would
-    // otherwise be attributed to it.
-    if from.ip() != IpAddr::V4(target) {
-        return None;
+    loop {
+        // The first datagram gets the caller's timeout; later ones only the quiet period,
+        // so a complete table is not paid for at full price per packet.
+        let window = if datagrams == 0 {
+            timeout
+        } else {
+            QUIET_PERIOD
+        };
+        let remaining = match overall_deadline.checked_duration_since(tokio::time::Instant::now()) {
+            Some(remaining) => remaining.min(window),
+            None => break,
+        };
+
+        let Ok(Ok((length, from))) =
+            tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await
+        else {
+            break;
+        };
+
+        // Only answers from the router that was asked. A response from elsewhere would
+        // otherwise be attributed to it.
+        if from.ip() != IpAddr::V4(target) {
+            continue;
+        }
+        let Some(parsed) = parse_response(&buffer[..length]) else {
+            continue;
+        };
+
+        datagrams += 1;
+        for route in parsed {
+            // Split tables repeat entries across datagrams, and a router may simply
+            // re-advertise. The same prefix from the same entry is one route.
+            if !routes
+                .iter()
+                .any(|existing| existing.prefix == route.prefix && existing.metric == route.metric)
+            {
+                routes.push(route);
+            }
+        }
     }
-    parse_response(&buffer[..length])
+
+    (datagrams > 0).then_some(RipTable { routes, datagrams })
 }
 
 #[cfg(test)]
@@ -370,10 +445,81 @@ mod tests {
         }
         assert!(parse_response(&[]).is_none());
         assert!(parse_response(&[2]).is_none());
-        // A trailing partial entry is ignored rather than read past.
-        let mut ragged = full.clone();
+    }
+
+    #[test]
+    fn a_metric_outside_the_protocols_range_is_refused() {
+        // RFC 2453 allows 1..=16. Zero is not a distance, and accepting it produced a
+        // reachable prefix from a field that cannot legally hold that value.
+        for metric in [0u32, 17, 255, u32::MAX] {
+            let packet = response(vec![entry(
+                AFI_INET,
+                0,
+                [192, 168, 51, 0],
+                [255, 255, 255, 0],
+                [0, 0, 0, 0],
+                metric,
+            )]);
+            assert!(
+                parse_response(&packet).expect("a response").is_empty(),
+                "metric {metric} was accepted"
+            );
+        }
+
+        // The boundaries themselves are valid: 1 is reachable, 16 is a withdrawal.
+        for metric in [1u32, 16] {
+            let packet = response(vec![entry(
+                AFI_INET,
+                0,
+                [192, 168, 51, 0],
+                [255, 255, 255, 0],
+                [0, 0, 0, 0],
+                metric,
+            )]);
+            assert_eq!(parse_response(&packet).expect("a response").len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_datagram_that_is_not_a_header_and_whole_entries_is_refused() {
+        // Keeping the entries before a ragged tail accepted a truncated datagram as a
+        // complete table.
+        let mut ragged = response(vec![entry(
+            AFI_INET,
+            0,
+            [192, 168, 51, 0],
+            [255, 255, 255, 0],
+            [0, 0, 0, 0],
+            1,
+        )]);
         ragged.extend_from_slice(&[0, 2, 0]);
-        assert_eq!(parse_response(&ragged).expect("a response").len(), 1);
+        assert!(parse_response(&ragged).is_none());
+
+        // And a header with no entries at all is still well formed.
+        assert_eq!(
+            parse_response(&response(vec![])).expect("a response").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_nonzero_reserved_field_is_refused() {
+        // It means this is not the message being parsed, and reading entries out of it
+        // would produce prefixes from arbitrary bytes.
+        let mut packet = response(vec![entry(
+            AFI_INET,
+            0,
+            [192, 168, 51, 0],
+            [255, 255, 255, 0],
+            [0, 0, 0, 0],
+            1,
+        )]);
+        packet[2] = 0x01;
+        assert!(parse_response(&packet).is_none());
+
+        packet[2] = 0;
+        packet[3] = 0x01;
+        assert!(parse_response(&packet).is_none());
     }
 
     #[test]

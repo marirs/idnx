@@ -95,6 +95,13 @@ pub enum WireFact {
         device: WireDevice,
         via: WireDevice,
     },
+    ForwardsToward {
+        device: WireDevice,
+        toward: String,
+        distance: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<WireDevice>,
+    },
     OpaqueBoundary {
         device: WireDevice,
         why: String,
@@ -166,15 +173,14 @@ pub struct WireEvidence {
 }
 
 impl WireEvidence {
-    /// Converts a record for the wire, or `None` when this format cannot express it.
+    /// Converts a record for the wire.
     ///
-    /// A catch-all rather than an exhaustive match, deliberately. The wire format is
-    /// versioned and must not change when the internal model does, and an exhaustive match
-    /// made every new `Fact` variant a compile error here -- so the evidence model could
-    /// not grow without editing the federation code. A fact this version has no
-    /// representation for is refused and reported, never approximated into a neighbouring
-    /// variant.
-    pub fn from_evidence(evidence: &TopologyEvidence) -> Option<Self> {
+    /// Exhaustive on purpose. A bundle is signed and all-or-nothing, so a record silently
+    /// left out would produce a signature over an incomplete view of what the sender
+    /// observed -- valid, and wrong. Adding a fact this format cannot express must be a
+    /// compile error here, resolved by extending the format and its version, not by
+    /// dropping the record.
+    pub fn from_evidence(evidence: &TopologyEvidence) -> Self {
         let (signal, label) = match &evidence.fact {
             Fact::DeviceRoleSignal { signal, .. } => role_signal_wire(signal),
             _ => ("", None),
@@ -268,13 +274,20 @@ impl WireEvidence {
                 name: name.clone(),
                 address: address.to_string(),
             },
-            // Anything this version of the format does not represent. Refused rather than
-            // mapped onto something close: a receiver would then record a fact the sender
-            // never stated.
-            _ => return None,
+            Fact::ForwardsToward {
+                device,
+                toward,
+                distance,
+                previous,
+            } => WireFact::ForwardsToward {
+                device: WireDevice::from_key(device),
+                toward: toward.to_string(),
+                distance: *distance,
+                previous: previous.as_ref().map(WireDevice::from_key),
+            },
         };
 
-        Some(Self {
+        Self {
             fact,
             source: source_wire(evidence.source).to_string(),
             confidence: confidence_wire(evidence.confidence).to_string(),
@@ -285,7 +298,7 @@ impl WireEvidence {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             detail: evidence.detail.clone(),
-        })
+        }
     }
 
     /// Converts back, rejecting anything this version does not understand.
@@ -361,6 +374,17 @@ impl WireEvidence {
             WireFact::ObservedBehind { device, via } => Fact::ObservedBehind {
                 device: device.to_key()?,
                 via: via.to_key()?,
+            },
+            WireFact::ForwardsToward {
+                device,
+                toward,
+                distance,
+                previous,
+            } => Fact::ForwardsToward {
+                device: device.to_key()?,
+                toward: parse_address(toward)?,
+                distance: *distance,
+                previous: previous.as_ref().map(|p| p.to_key()).transpose()?,
             },
             WireFact::OpaqueBoundary { device, why } => Fact::OpaqueBoundary {
                 device: device.to_key()?,
@@ -491,6 +515,19 @@ impl WireFact {
             WireFact::ObservedBehind { device, via } => {
                 let mut out = device.text_fields();
                 out.extend(via.text_fields());
+                out
+            }
+            WireFact::ForwardsToward {
+                device,
+                toward,
+                previous,
+                ..
+            } => {
+                let mut out = device.text_fields();
+                out.push(("probe destination", toward));
+                if let Some(previous) = previous {
+                    out.extend(previous.text_fields());
+                }
                 out
             }
             WireFact::OpaqueBoundary { device, why } => {
@@ -686,6 +723,7 @@ fn role_signal_wire(signal: &RoleSignal) -> (&'static str, Option<String>) {
         }
         RoleSignal::InternetGatewayDevice => ("internet_gateway_device", None),
         RoleSignal::SnmpForwarding => ("snmp_forwarding", None),
+        RoleSignal::RipRouteAdvertisement => ("rip_route_advertisement", None),
         RoleSignal::ObservedForwarding => ("observed_forwarding", None),
         RoleSignal::KernelNextHop => ("kernel_next_hop", None),
         RoleSignal::SpanningTreeBridge => ("spanning_tree_bridge", None),
@@ -700,6 +738,7 @@ fn role_signal_from_wire(text: &str, label: Option<&str>) -> Result<RoleSignal, 
         "router_advertisement" => RoleSignal::RouterAdvertisement,
         "internet_gateway_device" => RoleSignal::InternetGatewayDevice,
         "snmp_forwarding" => RoleSignal::SnmpForwarding,
+        "rip_route_advertisement" => RoleSignal::RipRouteAdvertisement,
         "observed_forwarding" => RoleSignal::ObservedForwarding,
         "kernel_next_hop" => RoleSignal::KernelNextHop,
         "spanning_tree_bridge" => RoleSignal::SpanningTreeBridge,
@@ -857,7 +896,7 @@ mod tests {
 
         for fact in facts {
             let original = evidence(fact);
-            let wire = WireEvidence::from_evidence(&original).expect("representable");
+            let wire = WireEvidence::from_evidence(&original);
             let json = serde_json::to_string(&wire).expect("serialisable");
             let decoded: WireEvidence = serde_json::from_str(&json).expect("deserialisable");
             assert_eq!(decoded, wire, "json round trip");
@@ -883,8 +922,7 @@ mod tests {
         let wire = WireEvidence::from_evidence(&evidence(Fact::DeviceAddress {
             device: scoped.clone(),
             address: "fe80::1".parse().unwrap(),
-        }))
-        .expect("representable");
+        }));
         let back = wire.to_evidence().expect("convertible");
         let Fact::DeviceAddress { device, .. } = back.fact else {
             panic!("wrong fact");
@@ -1018,7 +1056,7 @@ mod tests {
         ];
 
         for (fact, expected) in cases {
-            let wire = WireEvidence::from_evidence(&evidence(fact)).expect("representable");
+            let wire = WireEvidence::from_evidence(&evidence(fact));
             let found: Vec<&str> = wire.text_fields().iter().map(|(_, v)| *v).collect();
             for needle in expected {
                 assert!(
@@ -1027,20 +1065,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn a_fact_this_format_cannot_express_is_refused_not_approximated() {
-        // The wire format is versioned and must not change when the internal model does.
-        // A fact it has no representation for is left out; mapping it onto a neighbouring
-        // variant would have a receiver record something the sender never said.
-        let unrepresentable = evidence(Fact::ForwardsToward {
-            device: DeviceKey::mac("02:00:5e:00:00:01"),
-            toward: "192.0.2.1".parse().unwrap(),
-            distance: 2,
-            previous: None,
-        });
-        assert!(WireEvidence::from_evidence(&unrepresentable).is_none());
     }
 
     #[test]
@@ -1060,8 +1084,8 @@ mod tests {
 
     #[test]
     fn the_signed_payload_changes_when_any_part_of_the_bundle_does() {
-        let record = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 1 })).expect("ok");
-        let other = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 2 })).expect("ok");
+        let record = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 1 }));
+        let other = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 2 }));
         let base = signing_payload(1, "peer", "eth0", 7, 100, std::slice::from_ref(&record));
 
         assert_ne!(
@@ -1093,8 +1117,8 @@ mod tests {
         // Length prefixes, not delimiters: otherwise two records could be re-split into
         // two different records with the same byte stream, and one signature would cover
         // both readings.
-        let a = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 1 })).expect("ok");
-        let b = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 2 })).expect("ok");
+        let a = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 1 }));
+        let b = WireEvidence::from_evidence(&evidence(Fact::Vlan { id: 2 }));
         assert_ne!(
             signing_payload(1, "p", "v", 0, 0, &[a.clone(), b.clone()]),
             signing_payload(1, "p", "v", 0, 0, &[b, a])

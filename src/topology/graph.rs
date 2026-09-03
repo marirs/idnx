@@ -504,10 +504,7 @@ impl Node {
         // exists only to be rendered, so it neutralises what it returns rather than
         // relying on every call site to remember.
         if let Some(name) = self.hostnames.iter().next() {
-            return crate::federation::limits::clip(
-                &crate::federation::limits::sanitize(name),
-                crate::federation::limits::MAX_TEXT_BYTES,
-            );
+            return crate::text::clip(&crate::text::sanitize(name), crate::text::MAX_TEXT_BYTES);
         }
         if let Some(addr) = self.addresses.iter().next() {
             return addr.to_string();
