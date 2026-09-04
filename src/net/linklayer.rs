@@ -12,7 +12,10 @@
 //! than an empty result, so a probe that could not run is never reported as a device that
 //! did not answer.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
+// Only the polling read path takes a wait limit, and that path is unix-only.
+#[cfg(unix)]
+use std::time::Duration;
 
 /// A frame as it appeared on the wire, link header included.
 pub type Frame = Vec<u8>;
@@ -116,6 +119,9 @@ pub fn raw_link_status(interface: &str) -> Result<(), String> {
 ///
 /// Pinned deliberately: an ARP request that leaves through a different link resolves a
 /// different network's address space while the answer is attributed to this vantage.
+/// The fields are read only by the unix implementation; elsewhere `open` refuses before one
+/// of these can exist, and the type is kept so callers compile unchanged.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct LinkChannel {
     fd: libc::c_int,
     /// Read buffer size the kernel expects. On BPF a short read returns `EINVAL`, and the

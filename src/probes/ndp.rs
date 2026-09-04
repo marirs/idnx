@@ -534,6 +534,8 @@ struct ReceivedMessage {
 }
 
 /// A raw ICMPv6 socket pinned to one interface.
+/// The descriptor is read only by the unix implementation; elsewhere `open` refuses first.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct IcmpV6Socket {
     fd: libc::c_int,
 }

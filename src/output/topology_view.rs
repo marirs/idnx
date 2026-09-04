@@ -806,7 +806,7 @@ fn incomplete_for_pivot(
     let adapters: Vec<String> = report
         .coverage
         .iter()
-        .filter(|record| record.addresses.iter().any(|a| *a == address))
+        .filter(|record| record.addresses.contains(&address))
         .flat_map(|record| record.adapter_outcomes.clone())
         .collect();
     unfinished_work(&pivot.runs, &adapters)
