@@ -1404,8 +1404,20 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
                     .chain(std::iter::once(local.ip))
                     .collect();
 
-            let candidates =
-                crate::probes::reach::candidates(&[local.ip], &known, self.max_candidates);
+            // Neighbourhoods are seeded from what this vantage has actually seen -- its own
+            // address, its neighbours, and the gateways the kernel names -- so the search
+            // starts where a cascaded network is most likely to sit.
+            let mut observed = vec![local.ip];
+            observed.extend(known.iter().copied().filter(|address| *address != local.ip));
+            if let Some(gateway) = local.default_gateway {
+                observed.insert(1.min(observed.len()), gateway);
+            }
+
+            let (candidates, coverage) = crate::probes::reach::candidates_with_coverage(
+                &observed,
+                &known,
+                self.max_candidates,
+            );
             if candidates.is_empty() {
                 return ProviderOutput::not_applicable(
                     "no gateway candidate remained after excluding what is already known"
@@ -1417,6 +1429,10 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
             // a reply attributable to the address it was sent to.
             let identifier = std::process::id() as u16;
             let per_probe = context.timeout.min(Duration::from_millis(400));
+            let channel = context.probe_channel();
+            // Everything already scheduled, so an expansion never re-asks an address.
+            let mut queued: std::collections::BTreeSet<std::net::Ipv4Addr> =
+                candidates.iter().copied().collect();
             let mut sweep = crate::probes::reach::ReachabilitySweep {
                 budget_exhausted: candidates.len() >= self.max_candidates,
                 ..Default::default()
@@ -1426,51 +1442,107 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
             let mut unresolved: Vec<std::net::Ipv4Addr> = Vec::new();
             let mut resolved: Vec<String> = Vec::new();
 
-            // The run-wide probe budget, not a pool of this provider's own: bounded work
-            // means bounded against everything else running, not merely against itself.
-            let channel = context.probe_channel();
-            for (sequence, target) in candidates.into_iter().enumerate() {
-                let Ok(_permit) = channel.permits.clone().acquire_owned().await else {
-                    break;
-                };
-                sweep.asked.push(target);
-                if !crate::probes::reach::probe(
-                    target,
-                    identifier,
-                    sequence as u16,
-                    &context.binding,
-                    per_probe,
-                )
-                .await
-                {
-                    continue;
+            // Concurrent, on the run-wide permit pool. Asked one at a time, a budget of 512
+            // candidates times seven questions each is a run measured in tens of minutes;
+            // the pool is what bounds this against everything else, so the work belongs in
+            // it rather than in a sequential loop beside it.
+            let mut wave: Vec<std::net::Ipv4Addr> = candidates;
+            let mut answers: Vec<(std::net::Ipv4Addr, crate::probes::reach::ResponseSignal)> =
+                Vec::new();
+
+            while !wave.is_empty() && sweep.asked.len() < self.max_candidates {
+                let mut asking: tokio::task::JoinSet<(
+                    std::net::Ipv4Addr,
+                    Option<crate::probes::reach::ResponseSignal>,
+                )> = tokio::task::JoinSet::new();
+
+                for target in wave.drain(..) {
+                    if sweep.asked.len() >= self.max_candidates {
+                        sweep.budget_exhausted = true;
+                        break;
+                    }
+                    sweep.asked.push(target);
+                    let channel = channel.clone();
+                    // Derived from the address, so a reply is attributable to the candidate
+                    // it was sent to even with every probe in flight at once.
+                    let sequence = (u32::from(target) & 0xffff) as u16;
+                    asking.spawn(async move {
+                        let Ok(_permit) = channel.permits.clone().acquire_owned().await else {
+                            return (target, None);
+                        };
+                        let signal = crate::probes::reach::probe_signals(
+                            target, identifier, sequence, &channel, per_probe,
+                        )
+                        .await;
+                        (target, signal)
+                    });
                 }
-                sweep.responded.push(target);
 
-                // It answered for itself, so it exists. That is a device and nothing more.
-                let device = DeviceKey::Address(IpAddr::V4(target));
-                out.push(TopologyEvidence::new(
-                    Fact::DeviceAddress {
-                        device: device.clone(),
-                        address: IpAddr::V4(target),
-                    },
-                    EvidenceSource::IcmpProbe,
-                    Confidence::Observed,
-                    vantage,
-                ));
+                let mut responded_this_wave = Vec::new();
+                while let Some(joined) = asking.join_next().await {
+                    // A panicking probe loses that one candidate, not the pass.
+                    let Ok((target, Some(signal))) = joined else {
+                        continue;
+                    };
+                    sweep.responded.push(target);
+                    answers.push((target, signal.clone()));
+                    responded_this_wave.push(target);
 
-                // Ask the interface for its own mask. This is the one thing that can turn
-                // the address into a network without anyone else disclosing it.
+                    // It answered for itself, so it exists. That is a device and nothing
+                    // more until something states a prefix.
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::DeviceAddress {
+                                device: DeviceKey::Address(IpAddr::V4(target)),
+                                address: IpAddr::V4(target),
+                            },
+                            // Attributed to what actually answered rather than to ICMP for
+                            // everything: a device found by a TCP reset was not found by
+                            // ping.
+                            match signal {
+                                crate::probes::reach::ResponseSignal::Icmp => {
+                                    EvidenceSource::IcmpProbe
+                                }
+                                crate::probes::reach::ResponseSignal::Dns => {
+                                    EvidenceSource::UnicastDns
+                                }
+                                crate::probes::reach::ResponseSignal::NatPmp => {
+                                    EvidenceSource::NatPmp
+                                }
+                                _ => EvidenceSource::TcpProbe,
+                            },
+                            Confidence::Observed,
+                            vantage,
+                        )
+                        .with_detail(signal.label()),
+                    );
+                }
+
+                // Networks are provisioned in runs, so the /24s beside a live interface are
+                // asked next, still inside the same budget.
+                for target in responded_this_wave {
+                    for neighbour in crate::probes::reach::expand_around(target) {
+                        if !known.contains(&neighbour) && queued.insert(neighbour) {
+                            wave.push(neighbour);
+                        }
+                    }
+                }
+            }
+
+            // Escalation happens only now, against addresses that answered: ask each
+            // interface for its own mask, which is the one thing that can turn an address
+            // into a network without anyone else disclosing it.
+            for (target, _) in &answers {
                 let mask = crate::probes::icmp_mask::ask(
-                    target,
+                    *target,
                     identifier,
-                    sequence as u16,
+                    (u32::from(*target) & 0xffff) as u16,
                     &context.binding,
                     per_probe,
                 )
                 .await;
 
-                match ReachedInterface::from_mask(target, &mask) {
+                match ReachedInterface::from_mask(*target, &mask) {
                     ReachedInterface::Resolved {
                         prefix,
                         mask: stated,
@@ -1490,7 +1562,7 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
                         );
                         out.push(TopologyEvidence::new(
                             Fact::AttachedTo {
-                                device,
+                                device: DeviceKey::Address(IpAddr::V4(*target)),
                                 network: prefix,
                             },
                             EvidenceSource::IcmpProbe,
@@ -1504,11 +1576,22 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
             }
 
             notes.push(format!(
-                "{} candidate(s) asked, {} answered for themselves, {} silent",
+                "{} candidate(s) asked ({}), {} answered for themselves, {} produced no \
+                 response to any probe",
                 sweep.asked.len(),
+                coverage.describe(),
                 sweep.responded.len(),
                 sweep.silent()
             ));
+            // Named so "no response" is readable: it means these questions, not all
+            // possible questions.
+            notes.push(format!(
+                "  probes attempted per candidate: {}",
+                crate::probes::reach::probes_attempted()
+            ));
+            for (address, signal) in &answers {
+                notes.push(format!("  {address} answered: {}", signal.label()));
+            }
             for line in &resolved {
                 notes.push(format!("  prefix disclosed: {line}"));
             }
