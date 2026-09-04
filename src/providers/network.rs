@@ -1306,6 +1306,237 @@ impl DiscoveryProvider for DhcpInformProvider {
     }
 }
 
+/// What a responding candidate turned out to be.
+///
+/// Isolated from the probing so the rule can be tested without a network: an address that
+/// answered is a device, and it becomes a network only when something states a prefix for
+/// it. A responding 192.168.51.1 with no mask and no route is an unresolved interface, and
+/// saying anything more about it would be inventing the /24 around it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReachedInterface {
+    /// The address answered and stated its own mask: a network, attached to the interface.
+    Resolved {
+        address: std::net::Ipv4Addr,
+        prefix: IpNet,
+        mask: std::net::Ipv4Addr,
+    },
+    /// The address answered and nothing states its prefix.
+    Unresolved { address: std::net::Ipv4Addr },
+}
+
+impl ReachedInterface {
+    /// Reads a mask outcome into the decision, which is the whole of the rule.
+    pub fn from_mask(
+        address: std::net::Ipv4Addr,
+        mask: &crate::probes::icmp_mask::MaskOutcome,
+    ) -> Self {
+        match mask {
+            crate::probes::attempt::AttemptOutcome::Answered { result, .. } => {
+                ReachedInterface::Resolved {
+                    address,
+                    prefix: IpNet::V4(result.prefix),
+                    mask: result.mask,
+                }
+            }
+            // Every other outcome -- no reply, an invalid mask, no ICMP socket -- leaves the
+            // interface exactly as reachability found it: an address.
+            _ => ReachedInterface::Unresolved { address },
+        }
+    }
+}
+
+/// Bounded reachability probing for router interfaces nobody disclosed.
+///
+/// Runs when the disclosing sources have all been asked and none named a network beyond
+/// this link. It probes a small, ordered set of gateway candidates in private space, and it
+/// is active work on the same interface-bound channel, shared permit pool and run-wide
+/// budget as everything else -- not a second scanner with its own limits.
+///
+/// The rules it holds to are what separate it from a sweep. Only gateway addresses are
+/// asked. Only the exact target answering for itself creates a device. And a device becomes
+/// a network only when a prefix is stated: an address mask reply here, or a route or
+/// interrogation elsewhere. Recursion follows the network, never the address.
+pub struct BoundedReachabilityProvider {
+    /// Hard bound on candidates per run.
+    pub max_candidates: usize,
+}
+
+impl Default for BoundedReachabilityProvider {
+    fn default() -> Self {
+        // Two addresses per /24 across roughly a class-B worth of subnets: enough to reach
+        // a cascaded network in the same private block, small enough that the run stays
+        // bounded on any link.
+        Self {
+            max_candidates: 512,
+        }
+    }
+}
+
+impl DiscoveryProvider for BoundedReachabilityProvider {
+    fn name(&self) -> &'static str {
+        "bounded-reachability"
+    }
+
+    fn applies(&self, context: &DiscoveryContext) -> bool {
+        context.target.is_none() && context.scope.is_none()
+    }
+
+    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let vantage = &context.vantage.interface;
+            let Ok(local) = crate::net::interface::get_interface_by_name(vantage) else {
+                return ProviderOutput::not_applicable(format!(
+                    "{vantage} has no IPv4 address to probe from"
+                ));
+            };
+            if crate::probes::reach::enclosing_private_block(local.ip).is_none() {
+                return ProviderOutput::not_applicable(format!(
+                    "{} is not in private address space, which is the only space this probes",
+                    local.ip
+                ));
+            }
+
+            // Addresses this vantage has already established, so none is asked twice.
+            let known: std::collections::BTreeSet<std::net::Ipv4Addr> =
+                crate::net::arp::read_system_arp_table(Some(vantage.as_str()))
+                    .into_iter()
+                    .map(|entry| entry.ip)
+                    .chain(std::iter::once(local.ip))
+                    .collect();
+
+            let candidates =
+                crate::probes::reach::candidates(&[local.ip], &known, self.max_candidates);
+            if candidates.is_empty() {
+                return ProviderOutput::not_applicable(
+                    "no gateway candidate remained after excluding what is already known"
+                        .to_string(),
+                );
+            }
+
+            // One identifier for the run, a sequence per candidate: that pair is what makes
+            // a reply attributable to the address it was sent to.
+            let identifier = std::process::id() as u16;
+            let per_probe = context.timeout.min(Duration::from_millis(400));
+            let mut sweep = crate::probes::reach::ReachabilitySweep {
+                budget_exhausted: candidates.len() >= self.max_candidates,
+                ..Default::default()
+            };
+            let mut out = Vec::new();
+            let mut notes = Vec::new();
+            let mut unresolved: Vec<std::net::Ipv4Addr> = Vec::new();
+            let mut resolved: Vec<String> = Vec::new();
+
+            // The run-wide probe budget, not a pool of this provider's own: bounded work
+            // means bounded against everything else running, not merely against itself.
+            let channel = context.probe_channel();
+            for (sequence, target) in candidates.into_iter().enumerate() {
+                let Ok(_permit) = channel.permits.clone().acquire_owned().await else {
+                    break;
+                };
+                sweep.asked.push(target);
+                if !crate::probes::reach::probe(
+                    target,
+                    identifier,
+                    sequence as u16,
+                    &context.binding,
+                    per_probe,
+                )
+                .await
+                {
+                    continue;
+                }
+                sweep.responded.push(target);
+
+                // It answered for itself, so it exists. That is a device and nothing more.
+                let device = DeviceKey::Address(IpAddr::V4(target));
+                out.push(TopologyEvidence::new(
+                    Fact::DeviceAddress {
+                        device: device.clone(),
+                        address: IpAddr::V4(target),
+                    },
+                    EvidenceSource::IcmpProbe,
+                    Confidence::Observed,
+                    vantage,
+                ));
+
+                // Ask the interface for its own mask. This is the one thing that can turn
+                // the address into a network without anyone else disclosing it.
+                let mask = crate::probes::icmp_mask::ask(
+                    target,
+                    identifier,
+                    sequence as u16,
+                    &context.binding,
+                    per_probe,
+                )
+                .await;
+
+                match ReachedInterface::from_mask(target, &mask) {
+                    ReachedInterface::Resolved {
+                        prefix,
+                        mask: stated,
+                        ..
+                    } => {
+                        out.push(
+                            TopologyEvidence::new(
+                                Fact::Network { prefix },
+                                EvidenceSource::IcmpProbe,
+                                // The device's own claim about its network.
+                                Confidence::Advertised,
+                                vantage,
+                            )
+                            .with_detail(format!(
+                                "ICMP address mask reply from {target}: {stated}"
+                            )),
+                        );
+                        out.push(TopologyEvidence::new(
+                            Fact::AttachedTo {
+                                device,
+                                network: prefix,
+                            },
+                            EvidenceSource::IcmpProbe,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                        resolved.push(format!("{target} states {stated} -> {prefix}"));
+                    }
+                    ReachedInterface::Unresolved { address } => unresolved.push(address),
+                }
+            }
+
+            notes.push(format!(
+                "{} candidate(s) asked, {} answered for themselves, {} silent",
+                sweep.asked.len(),
+                sweep.responded.len(),
+                sweep.silent()
+            ));
+            for line in &resolved {
+                notes.push(format!("  prefix disclosed: {line}"));
+            }
+            for address in &unresolved {
+                // Named individually: each is a router interface that exists and whose
+                // network nothing has stated.
+                notes.push(format!(
+                    "  unresolved interface: {address} answered; no mask or route states its \
+                     prefix"
+                ));
+            }
+            if sweep.budget_exhausted {
+                notes.push(format!(
+                    "candidate budget of {} exhausted; further gateway candidates were not \
+                     asked",
+                    self.max_candidates
+                ));
+            }
+
+            ProviderOutput {
+                evidence: out,
+                notes,
+                attempted: !sweep.asked.is_empty(),
+            }
+        })
+    }
+}
+
 /// Active IPv6 liveness confirmation on the attached link.
 ///
 /// There is no IPv6 host sweep and there cannot be one, so the addresses come from what
@@ -1474,6 +1705,86 @@ mod tests {
         let names: Vec<&str> = network_providers().iter().map(|p| p.name()).collect();
         assert!(!names.contains(&"lldp-cdp"));
         assert!(!names.contains(&"passive-capture"));
+    }
+
+    #[test]
+    fn a_reached_interface_becomes_a_network_only_when_it_states_its_own_mask() {
+        // The positive fixture. 192.168.51.1 answers for itself, and its address mask reply
+        // advertises 255.255.255.0 -- which is what creates 192.168.51.0/24, attaches the
+        // interface to it, and gives the engine a network to recurse into.
+        use crate::probes::attempt::AttemptOutcome;
+        use crate::probes::icmp_mask::MaskReply;
+
+        let address = std::net::Ipv4Addr::new(192, 168, 51, 1);
+        let answered = AttemptOutcome::Answered {
+            sent: "ICMP address mask request to 192.168.51.1".to_string(),
+            result: MaskReply {
+                address,
+                mask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+                prefix: "192.168.51.0/24".parse().unwrap(),
+                raw: vec![18, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 0],
+            },
+        };
+
+        assert_eq!(
+            ReachedInterface::from_mask(address, &answered),
+            ReachedInterface::Resolved {
+                address,
+                prefix: "192.168.51.0/24".parse().unwrap(),
+                mask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn a_reached_interface_with_no_stated_prefix_stops_at_the_interface() {
+        // The negative fixture, and the more important one. The address answered, so the
+        // interface exists; nothing states its prefix, so nothing may be said about the
+        // network behind it. Assuming a /24 around a responding address is the invention
+        // this whole path refuses.
+        use crate::probes::attempt::AttemptOutcome;
+
+        let address = std::net::Ipv4Addr::new(192, 168, 51, 1);
+        let unresolved = ReachedInterface::Unresolved { address };
+
+        for silent in [
+            AttemptOutcome::NoResponse {
+                sent: "ICMP address mask request to 192.168.51.1".to_string(),
+            },
+            AttemptOutcome::InvalidResponse {
+                sent: "ICMP address mask request to 192.168.51.1".to_string(),
+                rejected: 1,
+            },
+            AttemptOutcome::unavailable("an ICMP socket could not be opened"),
+            AttemptOutcome::not_sent("the request could not be sent"),
+            AttemptOutcome::not_applicable("nothing to ask"),
+        ] {
+            assert_eq!(
+                ReachedInterface::from_mask(address, &silent),
+                unresolved,
+                "only a stated mask may resolve the interface: {silent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reachability_probes_nothing_outside_private_space() {
+        // It is bounded by address space as well as by count: probing outside RFC 1918 on a
+        // guess would put traffic on addresses the operator does not hold.
+        let seeded = ctx(VantageKind::Wired, true);
+        let provider = BoundedReachabilityProvider::default();
+        assert!(provider.applies(&seeded));
+        assert_eq!(provider.max_candidates, 512);
+
+        // test0 has no address, so the provider reports why rather than probing anything.
+        let produced = provider.discover(&seeded).await;
+        assert!(produced.evidence.is_empty());
+        assert!(!produced.attempted);
+        assert!(
+            produced.notes[0].contains("not applicable"),
+            "{:?}",
+            produced.notes
+        );
     }
 
     #[tokio::test]

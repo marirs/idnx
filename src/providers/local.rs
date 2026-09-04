@@ -451,6 +451,9 @@ pub fn local_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         // The IPv4 counterpart: option 121 is one of the few mechanisms that can name a
         // prefix this machine is not attached to.
         Box::new(crate::providers::network::DhcpInformProvider),
+        // Last of the seed providers: it asks only where the disclosing sources have
+        // already been asked, and it creates a network only when an interface states one.
+        Box::new(crate::providers::network::BoundedReachabilityProvider::default()),
     ]
 }
 

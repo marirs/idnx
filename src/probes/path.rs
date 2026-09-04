@@ -235,7 +235,7 @@ fn bind_source(socket: &tokio::net::UdpSocket, local: std::net::SocketAddr) -> s
 
 /// Opens an unprivileged ICMP datagram socket.
 #[cfg(unix)]
-fn icmp_socket() -> Option<tokio::net::UdpSocket> {
+pub fn icmp_socket() -> Option<tokio::net::UdpSocket> {
     // SAFETY: a plain socket(2) call with constant arguments.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
     if fd < 0 {
@@ -263,7 +263,7 @@ pub fn echo_request(identifier: u16, sequence: u16) -> Vec<u8> {
 }
 
 /// The one's-complement sum every IP-family protocol uses.
-fn internet_checksum(data: &[u8]) -> u16 {
+pub fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let (pairs, remainder) = data.as_chunks::<2>();
     for pair in pairs {
@@ -339,7 +339,7 @@ const fn libc_icmp_protocol() -> u8 {
 /// macOS delivers the IP header of the error packet; Linux delivers the ICMP message alone.
 /// Assuming one shape read a version nibble as a message type and found no hops at all on a
 /// path where every router was answering.
-fn icmp_message(datagram: &[u8]) -> Option<&[u8]> {
+pub fn icmp_message(datagram: &[u8]) -> Option<&[u8]> {
     let &first = datagram.first()?;
     if first >> 4 == 4 {
         let header_length = usize::from(first & 0x0f) * 4;
