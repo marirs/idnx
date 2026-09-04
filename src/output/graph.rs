@@ -554,6 +554,7 @@ mod tests {
                 binding_mode: crate::net::socket::BindingMode::SourceAddress,
                 observed_frames: Some(7),
                 routing_updates: None,
+                control_plane: None,
                 accepted_facts: Some(3),
             },
             oversized_scopes: Vec::new(),

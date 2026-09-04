@@ -1447,13 +1447,16 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
             // the pool is what bounds this against everything else, so the work belongs in
             // it rather than in a sequential loop beside it.
             let mut wave: Vec<std::net::Ipv4Addr> = candidates;
-            let mut answers: Vec<(std::net::Ipv4Addr, crate::probes::reach::ResponseSignal)> =
-                Vec::new();
+            // Every signal each responder produced, not merely the first to arrive.
+            let mut answers: Vec<(
+                std::net::Ipv4Addr,
+                Vec<crate::probes::reach::ResponseSignal>,
+            )> = Vec::new();
 
             while !wave.is_empty() && sweep.asked.len() < self.max_candidates {
                 let mut asking: tokio::task::JoinSet<(
                     std::net::Ipv4Addr,
-                    Option<crate::probes::reach::ResponseSignal>,
+                    Vec<crate::probes::reach::ResponseSignal>,
                 )> = tokio::task::JoinSet::new();
 
                 for target in wave.drain(..) {
@@ -1468,7 +1471,7 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
                     let sequence = (u32::from(target) & 0xffff) as u16;
                     asking.spawn(async move {
                         let Ok(_permit) = channel.permits.clone().acquire_owned().await else {
-                            return (target, None);
+                            return (target, Vec::new());
                         };
                         let signal = crate::probes::reach::probe_signals(
                             target, identifier, sequence, &channel, per_probe,
@@ -1481,11 +1484,16 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
                 let mut responded_this_wave = Vec::new();
                 while let Some(joined) = asking.join_next().await {
                     // A panicking probe loses that one candidate, not the pass.
-                    let Ok((target, Some(signal))) = joined else {
+                    let Ok((target, signals)) = joined else {
+                        continue;
+                    };
+                    // Attribution follows a fixed precedence over everything that answered,
+                    // never whichever probe happened to finish first.
+                    let Some(signal) = crate::probes::reach::attribution(&signals).cloned() else {
                         continue;
                     };
                     sweep.responded.push(target);
-                    answers.push((target, signal.clone()));
+                    answers.push((target, signals.clone()));
                     responded_this_wave.push(target);
 
                     // It answered for itself, so it exists. That is a device and nothing
@@ -1514,7 +1522,13 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
                             Confidence::Observed,
                             vantage,
                         )
-                        .with_detail(signal.label()),
+                        .with_detail(
+                            signals
+                                .iter()
+                                .map(|signal| signal.label())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
                     );
                 }
 
@@ -1589,8 +1603,15 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
                 "  probes attempted per candidate: {}",
                 crate::probes::reach::probes_attempted()
             ));
-            for (address, signal) in &answers {
-                notes.push(format!("  {address} answered: {}", signal.label()));
+            for (address, signals) in &answers {
+                notes.push(format!(
+                    "  {address} answered: {}",
+                    signals
+                        .iter()
+                        .map(|signal| signal.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
             for line in &resolved {
                 notes.push(format!("  prefix disclosed: {line}"));

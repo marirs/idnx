@@ -218,12 +218,17 @@ async fn run() {
         report.visibility.routing_updates = Some(format!(
             "not decoded: packet capture unavailable ({reason})"
         ));
+        // The same for OSPF and IS-IS, which ride the same capture.
+        report.visibility.control_plane = Some(format!(
+            "not decoded: packet capture unavailable ({reason})"
+        ));
     } else {
         // Read only after the engine stopped capture, so both counts are final.
         debug_assert!(observation.is_stopped());
         report.visibility.observed_frames = Some(observation.frames_seen());
         report.visibility.accepted_facts = Some(observation.facts_accepted());
         report.visibility.routing_updates = Some(observation.rip_tally().describe());
+        report.visibility.control_plane = Some(observation.rip_tally().describe_control_plane());
     }
 
     output::topology_view::render(&report, &start);

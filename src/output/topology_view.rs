@@ -81,6 +81,15 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
             routing.dimmed()
         );
     }
+    // OSPF and IS-IS get their own line: a link can carry an enterprise's whole prefix list
+    // in IS-IS while no router on it speaks RIP at all.
+    if let Some(control) = &report.visibility.control_plane {
+        println!(
+            "    {} {}",
+            "Passive OSPF/IS-IS:".dimmed(),
+            control.dimmed()
+        );
+    }
 }
 
 /// A network's peer attribution, where it has one.
@@ -235,6 +244,14 @@ fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
         .is_some_and(|state| !state.starts_with("not decoded"))
     {
         asked.push("passive RIPv2/RIPng".to_string());
+    }
+    if report
+        .visibility
+        .control_plane
+        .as_ref()
+        .is_some_and(|state| !state.starts_with("not decoded"))
+    {
+        asked.push("passive OSPF/IS-IS".to_string());
     }
     asked.sort();
     asked.dedup();

@@ -70,6 +70,17 @@ pub struct RipTally {
     pub routes: AtomicU64,
     /// Withdrawals (RIPv2 metric 16), which create no topology.
     pub withdrawals: AtomicU64,
+    /// OSPF and IS-IS packets that parsed.
+    pub control_packets: AtomicU64,
+    /// Of those, hellos: routers and areas, no prefixes.
+    pub control_hellos: AtomicU64,
+    /// Prefixes promoted to current topology from them.
+    pub control_prefixes: AtomicU64,
+    /// Prefixes reported without promotion: withdrawn, or authenticated in a way this
+    /// decoder cannot verify.
+    pub control_reported_only: AtomicU64,
+    /// Packets on a routing protocol that failed validation outright.
+    pub control_invalid: AtomicU64,
 }
 
 impl RipTally {
@@ -85,11 +96,51 @@ impl RipTally {
                 self.withdrawals
                     .fetch_add(withdrawn.len() as u64, Ordering::Relaxed);
             }
-            FrameFact::RoutingUpdateRejected { .. } => {
-                self.datagrams.fetch_add(1, Ordering::Relaxed);
+            FrameFact::RoutingUpdateRejected { protocol, .. } => {
+                // RIP arrives as a datagram; OSPF and IS-IS are packets on their own
+                // protocols, and conflating the two counts would misreport both.
+                if protocol.starts_with("RIP") {
+                    self.datagrams.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.control_invalid.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            FrameFact::ControlPlane {
+                hello,
+                current,
+                reported_only,
+                ..
+            } => {
+                self.control_packets.fetch_add(1, Ordering::Relaxed);
+                if *hello {
+                    self.control_hellos.fetch_add(1, Ordering::Relaxed);
+                }
+                self.control_prefixes
+                    .fetch_add(current.len() as u64, Ordering::Relaxed);
+                self.control_reported_only
+                    .fetch_add(reported_only.len() as u64, Ordering::Relaxed);
             }
             _ => {}
         }
+    }
+
+    /// One line for OSPF and IS-IS, in the words the evidence supports.
+    ///
+    /// Reported separately from RIP because they are different questions: a link can carry
+    /// an enterprise's whole prefix list in IS-IS while no router speaks RIP at all.
+    pub fn describe_control_plane(&self) -> String {
+        let packets = self.control_packets.load(Ordering::Relaxed);
+        let invalid = self.control_invalid.load(Ordering::Relaxed);
+        if packets == 0 && invalid == 0 {
+            return "no OSPF or IS-IS packets observed".to_string();
+        }
+        format!(
+            "{packets} packet(s) ({} hello(s)), {} prefix(es) promoted, {} reported without \
+             promotion, {invalid} failed validation",
+            self.control_hellos.load(Ordering::Relaxed),
+            self.control_prefixes.load(Ordering::Relaxed),
+            self.control_reported_only.load(Ordering::Relaxed),
+        )
     }
 
     /// One line for the coverage report, in the words the evidence supports.
@@ -449,6 +500,108 @@ fn convert(
             // Counted by the tally and nothing more: a datagram that failed validation
             // establishes no device and no network.
             FrameFact::RoutingUpdateRejected { .. } => {}
+
+            // A routing control-plane packet, heard and never answered.
+            FrameFact::ControlPlane {
+                sender_mac,
+                sender,
+                protocol,
+                identity,
+                scope,
+                hello,
+                verifiable,
+                current,
+                reported_only,
+                sequences,
+            } => {
+                let device = DeviceKey::mac(sender_mac);
+                if let Some(address) = sender {
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceAddress {
+                            device: device.clone(),
+                            address: *address,
+                        },
+                        EvidenceSource::Rip,
+                        Confidence::Observed,
+                        interface,
+                    ));
+                }
+
+                // Speaking a routing protocol at all is observed router behaviour. A hello
+                // establishes exactly this and no network: a router-id is not an address
+                // space and an area is not a subnet.
+                out.push(
+                    TopologyEvidence::new(
+                        Fact::DeviceRoleSignal {
+                            device: device.clone(),
+                            signal: RoleSignal::RipRouteAdvertisement,
+                        },
+                        EvidenceSource::Rip,
+                        Confidence::Observed,
+                        interface,
+                    )
+                    .with_detail(format!(
+                        "{protocol} {} from {identity}, {scope}",
+                        if *hello { "hello" } else { "advertisement" }
+                    )),
+                );
+                out.push(TopologyEvidence::new(
+                    Fact::DeviceDescription {
+                        device: device.clone(),
+                        text: format!(
+                            "{protocol} {identity}, {scope}{}",
+                            match sequences.first() {
+                                Some(sequence) => format!(", sequence {sequence:#x}"),
+                                None => String::new(),
+                            }
+                        ),
+                    },
+                    EvidenceSource::Rip,
+                    Confidence::Observed,
+                    interface,
+                ));
+
+                for (prefix, metric, described) in current {
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::Network { prefix: *prefix },
+                            EvidenceSource::Rip,
+                            Confidence::Advertised,
+                            interface,
+                        )
+                        .with_detail(format!("{protocol} {described}")),
+                    );
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::RoutesTo {
+                                device: device.clone(),
+                                network: *prefix,
+                                next_hop: *sender,
+                            },
+                            EvidenceSource::Rip,
+                            Confidence::Advertised,
+                            interface,
+                        )
+                        .with_detail(format!("{protocol} {described}, metric {metric}")),
+                    );
+                }
+
+                // Withdrawn or unverifiable: recorded against the router that said it, and
+                // never turned into a network. An advertisement being withdrawn describes
+                // what is going away, and a digest we cannot check is not ours to trust.
+                for (prefix, why) in reported_only {
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceDescription {
+                            device: device.clone(),
+                            text: format!("{protocol} reported {prefix}: {why}"),
+                        },
+                        EvidenceSource::Rip,
+                        Confidence::Observed,
+                        interface,
+                    ));
+                }
+                let _ = verifiable;
+            }
 
             FrameFact::RoutingUpdate {
                 sender_mac,

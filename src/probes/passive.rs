@@ -82,6 +82,33 @@ pub enum FrameFact {
         withdrawn: Vec<(IpNet, Vec<u8>)>,
     },
 
+    /// A routing control-plane packet: OSPF or IS-IS, heard and never answered.
+    ///
+    /// Hellos identify routers, areas and adjacencies and carry no prefix. Only complete,
+    /// checksum-valid, prefix-bearing advertisements name networks, and only while they are
+    /// current: a withdrawal describes what is going away.
+    ControlPlane {
+        sender_mac: String,
+        /// The IP source, where the protocol runs over IP. IS-IS runs directly over the
+        /// link layer and has none.
+        sender: Option<IpAddr>,
+        protocol: &'static str,
+        /// Router-id for OSPF, system id for IS-IS.
+        identity: String,
+        /// Area for OSPF, area addresses and level for IS-IS.
+        scope: String,
+        hello: bool,
+        /// Whether the packet's own authentication could be verified. When it could not,
+        /// the prefixes are reported and not promoted.
+        verifiable: bool,
+        /// Prefixes that may become current topology.
+        current: Vec<PromotedPrefix>,
+        /// Prefixes carried but not promotable: withdrawn, or unverifiable.
+        reported_only: Vec<ReportedPrefix>,
+        /// Sequence numbers seen, so a replay is distinguishable from an advertisement.
+        sequences: Vec<u32>,
+    },
+
     /// A datagram on a routing protocol's port that did not survive validation.
     ///
     /// Counted so silence can be told apart from noise. "No valid updates observed" means
@@ -201,6 +228,38 @@ fn decode_llc(
     let dsap = payload[0];
     let ssap = payload[1];
 
+    // IS-IS rides 802.2 LLC with SAP 0xFE, directly over the link layer rather than over
+    // IP. That is why it is reachable only from a capture on the selected interface.
+    if dsap == 0xFE && ssap == 0xFE {
+        facts.push(match crate::probes::isis::parse(&payload[3..]) {
+            Some(pdu) => {
+                let areas = if pdu.areas.is_empty() {
+                    pdu.level.to_string()
+                } else {
+                    format!("{} area {}", pdu.level, pdu.areas.join(", "))
+                };
+                let (current, reported_only) = split_isis_prefixes(&pdu);
+                FrameFact::ControlPlane {
+                    sender_mac: source_mac.to_string(),
+                    sender: None,
+                    protocol: "IS-IS",
+                    identity: pdu.system_id.clone(),
+                    scope: areas,
+                    hello: pdu.hello,
+                    verifiable: !pdu.unverifiable_authentication,
+                    current,
+                    reported_only,
+                    sequences: pdu.sequence.into_iter().collect(),
+                }
+            }
+            None => FrameFact::RoutingUpdateRejected {
+                sender_mac: source_mac.to_string(),
+                protocol: "IS-IS",
+            },
+        });
+        return;
+    }
+
     if dsap == LLC_SAP_STP && ssap == LLC_SAP_STP && destination == STP_MULTICAST_MAC {
         if let Some(fact) = decode_bpdu(source_mac, &payload[3..]) {
             facts.push(fact);
@@ -279,6 +338,24 @@ fn decode_ipv4(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
     if ihl < 20 || payload.len() < ihl + 8 {
         return;
     }
+    // OSPFv2 rides IP protocol 89 directly rather than UDP.
+    if payload[9] == 89 {
+        let mut source = [0u8; 4];
+        source.copy_from_slice(&payload[12..16]);
+        facts.push(match crate::probes::ospf::parse_v2(&payload[ihl..]) {
+            Some(packet) => control_plane_fact(
+                source_mac,
+                Some(IpAddr::V4(Ipv4Addr::from(source))),
+                &packet,
+            ),
+            None => FrameFact::RoutingUpdateRejected {
+                sender_mac: source_mac.to_string(),
+                protocol: "OSPFv2",
+            },
+        });
+        return;
+    }
+
     // UDP only; DHCP is the sole IPv4 payload passive discovery decodes.
     if payload[9] != 17 {
         return;
@@ -462,6 +539,20 @@ fn decode_ipv6(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
         }
     }
 
+    // OSPFv3 rides next-header 89.
+    if payload[6] == 89 && payload.len() > 40 {
+        facts.push(match crate::probes::ospf::parse_v3(&payload[40..]) {
+            Some(packet) => {
+                control_plane_fact(source_mac, Some(IpAddr::V6(source_address)), &packet)
+            }
+            None => FrameFact::RoutingUpdateRejected {
+                sender_mac: source_mac.to_string(),
+                protocol: "OSPFv3",
+            },
+        });
+        return;
+    }
+
     // Only ICMPv6 carries the neighbour and router discovery messages.
     if payload[6] != 58 {
         return;
@@ -577,6 +668,86 @@ pub fn decode_ra_prefixes(icmp: &[u8]) -> Vec<(Ipv6Addr, u8)> {
 /// One advertised route, with the fields that make it traceable: where to send traffic,
 /// what it cost the advertiser, the tag it carried, and the exact entry bytes.
 pub type AdvertisedRoute = (IpNet, Option<IpAddr>, u32, u16, Vec<u8>);
+
+/// Builds the control-plane fact for one OSPF packet.
+///
+/// The split is the rule: a prefix is current only when the advertisement is current and
+/// the packet's own authentication could be verified. Everything else is reported and
+/// counted without becoming topology.
+fn control_plane_fact(
+    source_mac: &str,
+    sender: Option<IpAddr>,
+    packet: &crate::probes::ospf::OspfPacket,
+) -> FrameFact {
+    let mut current = Vec::new();
+    let mut reported_only = Vec::new();
+    let verifiable = packet.authentication.routes_are_verifiable();
+
+    for prefix in &packet.prefixes {
+        let described = format!("{} LSA, metric {}", prefix.lsa_type, prefix.metric);
+        if verifiable && !prefix.withdrawn {
+            current.push((prefix.prefix, prefix.metric, described));
+        } else {
+            reported_only.push((
+                prefix.prefix,
+                if prefix.withdrawn {
+                    format!("{described}, at MaxAge (withdrawn)")
+                } else {
+                    format!(
+                        "{described}, {} authentication could not be verified",
+                        packet.authentication.label()
+                    )
+                },
+            ));
+        }
+    }
+
+    FrameFact::ControlPlane {
+        sender_mac: source_mac.to_string(),
+        sender,
+        protocol: packet.protocol,
+        identity: packet.router_id.to_string(),
+        scope: format!("area {}", packet.area),
+        hello: packet.hello,
+        verifiable,
+        current,
+        reported_only,
+        sequences: packet.sequences.clone(),
+    }
+}
+
+/// A prefix that may become current topology, with what stated it.
+pub type PromotedPrefix = (IpNet, u32, String);
+/// A prefix reported without promotion, with why.
+pub type ReportedPrefix = (IpNet, String);
+
+/// The same split for IS-IS, whose withdrawals are absences rather than a MaxAge flag.
+fn split_isis_prefixes(
+    pdu: &crate::probes::isis::IsisPdu,
+) -> (Vec<PromotedPrefix>, Vec<ReportedPrefix>) {
+    let mut current = Vec::new();
+    let mut reported_only = Vec::new();
+
+    for prefix in &pdu.prefixes {
+        let described = match prefix.topology {
+            Some(topology) => format!(
+                "{}, metric {}, topology {topology}",
+                prefix.tlv, prefix.metric
+            ),
+            None => format!("{}, metric {}", prefix.tlv, prefix.metric),
+        };
+        if pdu.unverifiable_authentication {
+            reported_only.push((
+                prefix.prefix,
+                format!("{described}, authentication could not be verified"),
+            ));
+        } else {
+            current.push((prefix.prefix, prefix.metric, described));
+        }
+    }
+
+    (current, reported_only)
+}
 
 /// Decodes a RIPv2 response heard on UDP 520.
 ///

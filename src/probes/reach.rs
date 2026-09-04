@@ -379,25 +379,27 @@ pub async fn probe(
     false
 }
 
-/// Asks one candidate every cheap question, stopping at the first answer.
+/// Asks one candidate every cheap question and keeps every answer.
 ///
-/// ICMP alone was too narrow a test. Plenty of router interfaces drop echo and answer a TCP
-/// handshake, a reset, a DNS query or NAT-PMP -- and recording those as "silent" reported a
-/// device that is present and answering as one that said nothing. Each signal is an exact
-/// answer from the target itself, so any of them establishes the device equally.
+/// Deliberately not first-answer-wins. Stopping early made the set of signals a function of
+/// which probe finished first, so a device that answers ICMP and TCP could be attributed to
+/// either depending on timing -- and the report claimed seven probes were attempted when
+/// four of them never ran. Every question is asked, every answer is retained, and the order
+/// is fixed, so two runs against an unchanged device produce the same attribution.
 ///
-/// The set stays small on purpose: five TCP ports and two UDP protocols per candidate. The
-/// full interrogation is the per-device pipeline's work and runs only after this finds
-/// something.
+/// The set stays small: five TCP ports and two UDP protocols per candidate. The full
+/// interrogation is the per-device pipeline's work and runs only after this finds something.
 pub async fn probe_signals(
     target: Ipv4Addr,
     identifier: u16,
     sequence: u16,
     channel: &crate::net::socket::ProbeChannel,
     budget: std::time::Duration,
-) -> Option<ResponseSignal> {
+) -> Vec<ResponseSignal> {
+    let mut answers = Vec::new();
+
     if probe(target, identifier, sequence, &channel.binding, budget).await {
-        return Some(ResponseSignal::Icmp);
+        answers.push(ResponseSignal::Icmp);
     }
 
     // A completed handshake and a reset are equally answers: one says the port is open, the
@@ -405,32 +407,48 @@ pub async fn probe_signals(
     for port in INFRASTRUCTURE_TCP_PORTS {
         let destination = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(target, port));
         match channel.binding.tcp_connect(destination, budget).await {
-            Ok(_) => return Some(ResponseSignal::TcpOpen(port)),
+            Ok(_) => answers.push(ResponseSignal::TcpOpen(port)),
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                return Some(ResponseSignal::TcpRefused(port));
+                answers.push(ResponseSignal::TcpRefused(port));
             }
             Err(_) => {}
         }
     }
 
-    // UDP, for the interfaces that answer a protocol and nothing else.
-    // Any correlated answer counts, identity or not: speaking DNS at all is the target
-    // answering for itself.
+    // UDP, for the interfaces that answer a protocol and nothing else. Any correlated
+    // answer counts, identity or not: speaking DNS at all is the target answering for
+    // itself.
     let endpoint = crate::net::endpoint::Endpoint::global(std::net::IpAddr::V4(target));
     if crate::probes::dns::identify(&endpoint, "version.bind", &channel.binding, budget)
         .await
         .is_some()
     {
-        return Some(ResponseSignal::Dns);
+        answers.push(ResponseSignal::Dns);
     }
     if crate::probes::natpmp::probe_nat_gateway(target, &channel.binding, budget)
         .await
         .is_some()
     {
-        return Some(ResponseSignal::NatPmp);
+        answers.push(ResponseSignal::NatPmp);
     }
 
-    None
+    answers
+}
+
+/// Which source a set of signals is attributed to.
+///
+/// Fixed precedence, never arrival order: the same device answering the same way must be
+/// attributed the same way on every run.
+pub fn attribution(signals: &[ResponseSignal]) -> Option<&ResponseSignal> {
+    const ORDER: [u8; 5] = [0, 1, 2, 3, 4];
+    let rank = |signal: &ResponseSignal| match signal {
+        ResponseSignal::Icmp => ORDER[0],
+        ResponseSignal::TcpOpen(_) => ORDER[1],
+        ResponseSignal::TcpRefused(_) => ORDER[2],
+        ResponseSignal::Dns => ORDER[3],
+        ResponseSignal::NatPmp => ORDER[4],
+    };
+    signals.iter().min_by_key(|signal| rank(signal))
 }
 
 /// Where raw ICMP cannot be opened, nothing is asked and nothing answers.
@@ -555,6 +573,40 @@ mod tests {
             assert!(enclosing_private_block(*address).is_some());
         }
         assert!(expand_around(Ipv4Addr::new(8, 8, 8, 8)).is_empty());
+    }
+
+    #[test]
+    fn attribution_is_by_fixed_precedence_and_never_by_arrival() {
+        // Evidence attribution must not depend on which probe finished first: the same
+        // device answering the same way is attributed the same way on every run.
+        let both = [
+            ResponseSignal::TcpOpen(80),
+            ResponseSignal::Icmp,
+            ResponseSignal::Dns,
+        ];
+        assert_eq!(attribution(&both), Some(&ResponseSignal::Icmp));
+
+        let reversed = [
+            ResponseSignal::Dns,
+            ResponseSignal::Icmp,
+            ResponseSignal::TcpOpen(80),
+        ];
+        assert_eq!(
+            attribution(&both),
+            attribution(&reversed),
+            "order of discovery must not change attribution"
+        );
+
+        // An open port outranks a reset, which outranks the UDP protocols.
+        assert_eq!(
+            attribution(&[ResponseSignal::TcpRefused(22), ResponseSignal::TcpOpen(443)]),
+            Some(&ResponseSignal::TcpOpen(443))
+        );
+        assert_eq!(
+            attribution(&[ResponseSignal::NatPmp, ResponseSignal::TcpRefused(22)]),
+            Some(&ResponseSignal::TcpRefused(22))
+        );
+        assert_eq!(attribution(&[]), None);
     }
 
     #[test]

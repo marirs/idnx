@@ -1262,6 +1262,7 @@ mod cross_realm_leaks {
                 observed_frames: None,
                 accepted_facts: None,
                 routing_updates: None,
+                control_plane: None,
             },
             oversized_scopes: Vec::new(),
             converged: true,

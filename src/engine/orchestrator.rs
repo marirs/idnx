@@ -98,6 +98,8 @@ pub struct VisibilityReport {
     /// Reported because RIP silence and RIP never being decoded leave the graph identical,
     /// and only one of them is a fact about the network.
     pub routing_updates: Option<String>,
+    /// What passive OSPF and IS-IS decoding saw, reported separately from RIP.
+    pub control_plane: Option<String>,
 }
 
 /// Result of a complete discovery run.
@@ -452,6 +454,7 @@ impl DiscoveryEngine {
                 observed_frames: None,
                 accepted_facts: None,
                 routing_updates: None,
+                control_plane: None,
             },
             oversized_scopes: oversized,
             converged,
