@@ -21,6 +21,17 @@ use std::os::fd::FromRawFd;
 #[cfg(unix)]
 use std::time::Duration;
 
+/// What one poll established about the channel.
+#[cfg(unix)]
+enum Readiness {
+    /// Data is waiting.
+    Ready,
+    /// Nothing yet, which is the ordinary case and not a fault.
+    NotYet,
+    /// The descriptor is in a state the network cannot explain.
+    Fault(String),
+}
+
 /// A frame as it appeared on the wire, link header included.
 pub type Frame = Vec<u8>;
 
@@ -235,7 +246,7 @@ impl LinkChannel {
         for (slot, byte) in request.ifr_name.iter_mut().zip(name) {
             *slot = *byte as libc::c_char;
         }
-        if unsafe { libc::ioctl(channel.raw_fd(), BIOCSETIF, &request) } < 0 {
+        if unsafe { libc::ioctl(channel.fd(), BIOCSETIF, &request) } < 0 {
             return Err(format!(
                 "BPF could not be attached to {interface}: {}",
                 std::io::Error::last_os_error()
@@ -247,7 +258,7 @@ impl LinkChannel {
         // assumed -- and the probe then reported the link's silence rather than its own.
         let setting =
             |name: libc::c_ulong, value: libc::c_uint, what: &str| -> Result<(), String> {
-                if unsafe { libc::ioctl(channel.raw_fd(), name, &value) } < 0 {
+                if unsafe { libc::ioctl(channel.fd(), name, &value) } < 0 {
                     return Err(format!(
                         "BPF refused {what} on {interface}: {}",
                         std::io::Error::last_os_error()
@@ -276,7 +287,7 @@ impl LinkChannel {
         // The framing the driver will actually use. Building Ethernet ARP frames for a
         // link that is not Ethernet-framed produces bytes with the wrong header entirely.
         let mut link_type: libc::c_uint = 0;
-        if unsafe { libc::ioctl(channel.raw_fd(), BIOCGDLT, &mut link_type) } < 0 {
+        if unsafe { libc::ioctl(channel.fd(), BIOCGDLT, &mut link_type) } < 0 {
             return Err(format!(
                 "BPF did not report a link type for {interface}: {}",
                 std::io::Error::last_os_error()
@@ -290,9 +301,7 @@ impl LinkChannel {
         }
 
         let mut buffer_len: libc::c_uint = 0;
-        if unsafe { libc::ioctl(channel.raw_fd(), BIOCGBLEN, &mut buffer_len) } < 0
-            || buffer_len == 0
-        {
+        if unsafe { libc::ioctl(channel.fd(), BIOCGBLEN, &mut buffer_len) } < 0 || buffer_len == 0 {
             return Err(format!(
                 "BPF did not report a read buffer size for {interface}: {}",
                 std::io::Error::last_os_error()
@@ -301,14 +310,14 @@ impl LinkChannel {
         channel.read_size = buffer_len as usize;
 
         // Non-blocking, so the deadline is enforced by us rather than by the driver.
-        let flags = unsafe { libc::fcntl(channel.raw_fd(), libc::F_GETFL, 0) };
+        let flags = unsafe { libc::fcntl(channel.fd(), libc::F_GETFL, 0) };
         if flags < 0 {
             return Err(format!(
                 "BPF descriptor flags could not be read for {interface}: {}",
                 std::io::Error::last_os_error()
             ));
         }
-        if unsafe { libc::fcntl(channel.raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        if unsafe { libc::fcntl(channel.fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(format!(
                 "BPF descriptor could not be made non-blocking for {interface}: {}",
                 std::io::Error::last_os_error()
@@ -351,7 +360,7 @@ impl LinkChannel {
         address.sll_ifindex = index as i32;
         let bound = unsafe {
             libc::bind(
-                channel.raw_fd(),
+                channel.fd(),
                 &address as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             )
@@ -372,17 +381,11 @@ impl LinkChannel {
 /// would mean a probe that reports silence it never listened for.
 #[cfg(unix)]
 impl LinkChannel {
-    /// The descriptor for a syscall, borrowed rather than surrendered.
-    fn raw_fd(&self) -> libc::c_int {
-        use std::os::fd::AsRawFd;
-        self.fd.as_raw_fd()
-    }
-
     /// Transmits one complete frame, link header included.
     pub fn send(&self, frame: &[u8]) -> Result<(), String> {
         let written = unsafe {
             libc::write(
-                self.raw_fd(),
+                self.fd(),
                 frame.as_ptr() as *const libc::c_void,
                 frame.len(),
             )
@@ -413,21 +416,37 @@ impl LinkChannel {
     ) -> ReadResult<T> {
         let mut buffer = vec![0u8; self.read_size];
         let mut seen = 0usize;
+        let mut fault = None;
 
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if !self.wait_readable(remaining) {
-                continue;
+            match self.wait_readable(remaining) {
+                Readiness::Ready => {}
+                Readiness::NotYet => continue,
+                Readiness::Fault(reason) => {
+                    fault = Some(reason);
+                    break;
+                }
             }
 
             let read = unsafe {
                 libc::read(
-                    self.raw_fd(),
+                    self.fd(),
                     buffer.as_mut_ptr() as *mut libc::c_void,
                     buffer.len(),
                 )
             };
-            if read <= 0 {
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                // Nothing buffered, or a signal interrupted the call: neither is a fault.
+                // EAGAIN is EWOULDBLOCK on every platform this builds for.
+                if matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
+                    continue;
+                }
+                fault = Some(format!("read failed: {error}"));
+                break;
+            }
+            if read == 0 {
                 continue;
             }
             let filled = &buffer[..read as usize];
@@ -438,6 +457,7 @@ impl LinkChannel {
                     return ReadResult {
                         found: Some(found),
                         frames_seen: seen,
+                        fault,
                     };
                 }
             }
@@ -446,61 +466,77 @@ impl LinkChannel {
         ReadResult {
             found: None,
             frames_seen: seen,
+            fault,
         }
     }
 
-    /// Blocks until the channel has data or `limit` elapses. False means neither happened
-    /// yet, which is not an error.
-    fn wait_readable(&self, limit: Duration) -> bool {
+    /// Blocks until the channel has data or `limit` elapses.
+    ///
+    /// Three outcomes, not two. Treating everything that is not readable as "nothing yet"
+    /// meant a descriptor the kernel had marked as errored, hung up or invalid was polled
+    /// to the deadline and then reported as a quiet link.
+    fn wait_readable(&self, limit: Duration) -> Readiness {
         let mut poller = libc::pollfd {
-            fd: self.raw_fd(),
+            fd: self.fd(),
             events: libc::POLLIN,
             revents: 0,
         };
         // Capped so a long deadline still returns to the loop and re-checks the clock.
         let millis = limit.as_millis().min(200) as libc::c_int;
         let ready = unsafe { libc::poll(&mut poller, 1, millis) };
-        ready > 0 && (poller.revents & libc::POLLIN) != 0
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                return Readiness::NotYet;
+            }
+            return Readiness::Fault(format!("poll failed: {error}"));
+        }
+
+        // These say something about the descriptor, not about the network.
+        if poller.revents & libc::POLLNVAL != 0 {
+            return Readiness::Fault("the channel descriptor is not valid".to_string());
+        }
+        if poller.revents & libc::POLLERR != 0 {
+            return Readiness::Fault("the channel reported an error condition".to_string());
+        }
+        if poller.revents & libc::POLLHUP != 0 {
+            return Readiness::Fault("the channel hung up".to_string());
+        }
+
+        if poller.revents & libc::POLLIN != 0 {
+            Readiness::Ready
+        } else {
+            Readiness::NotYet
+        }
     }
 
-    /// Splits one read into frames. BPF packs several records with alignment padding;
-    /// a packet socket returns exactly one frame per read.
+    /// The descriptor for a syscall, borrowed rather than surrendered.
+    fn fd(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        self.fd.as_raw_fd()
+    }
+
+    /// Splits one read into frames.
+    ///
+    /// Delegates to the capture reader's unpacker rather than carrying a second copy. The
+    /// copy that used to live here read Darwin's `bpf_hdr` as though its timestamp were a
+    /// 64-bit `timeval`, so it took the captured length from offset 16 instead of 8, got a
+    /// nonsense value, and stopped at the first record. That is why this channel reported
+    /// zero frames on a link where the capture reader was delivering thousands -- and why
+    /// no ARP reply was ever seen. Two subtly different readers of one format is how a
+    /// defect survives in only one of them.
     fn unpack<'a>(&self, filled: &'a [u8]) -> Vec<&'a [u8]> {
         if !self.bpf_framing {
             return vec![filled];
         }
-
-        /// `BPF_WORDALIGN` from `net/bpf.h`; `BPF_ALIGNMENT` is `sizeof(int32_t)`.
-        fn word_align(len: usize) -> usize {
-            const ALIGNMENT: usize = std::mem::size_of::<i32>();
-            (len + (ALIGNMENT - 1)) & !(ALIGNMENT - 1)
+        #[cfg(target_os = "macos")]
+        {
+            crate::net::capture::bpf_frames(filled)
         }
-
-        let mut frames = Vec::new();
-        let mut offset = 0usize;
-        // `struct bpf_hdr`: timeval (16 bytes on 64-bit), caplen, datalen, hdrlen.
-        const CAPLEN_AT: usize = 16;
-        const DATALEN_AT: usize = 20;
-        const HDRLEN_AT: usize = 24;
-        const HEADER_MIN: usize = 26;
-
-        while offset + HEADER_MIN <= filled.len() {
-            let record = &filled[offset..];
-            let caplen =
-                u32::from_ne_bytes(record[CAPLEN_AT..CAPLEN_AT + 4].try_into().unwrap()) as usize;
-            let datalen =
-                u32::from_ne_bytes(record[DATALEN_AT..DATALEN_AT + 4].try_into().unwrap()) as usize;
-            let hdrlen =
-                u16::from_ne_bytes(record[HDRLEN_AT..HDRLEN_AT + 2].try_into().unwrap()) as usize;
-
-            if hdrlen == 0 || caplen == 0 || datalen == 0 || hdrlen + caplen > record.len() {
-                break;
-            }
-            frames.push(&record[hdrlen..hdrlen + caplen]);
-            offset += word_align(hdrlen + caplen);
+        #[cfg(not(target_os = "macos"))]
+        {
+            vec![filled]
         }
-
-        frames
     }
 }
 
@@ -523,6 +559,7 @@ impl LinkChannel {
         ReadResult {
             found: None,
             frames_seen: 0,
+            fault: Some("raw link-layer access is not implemented on this platform".to_string()),
         }
     }
 }
@@ -534,6 +571,13 @@ impl LinkChannel {
 pub struct ReadResult<T> {
     pub found: Option<T>,
     pub frames_seen: usize,
+    /// A fault on this channel, when one occurred.
+    ///
+    /// Reported because a failing read and a quiet link produced identical results: `read`
+    /// returning an error was collapsed into "nothing yet", so a channel that was broken
+    /// reported the network as silent. `EAGAIN` is not a fault -- it is the ordinary answer
+    /// on a non-blocking descriptor with nothing buffered.
+    pub fault: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -558,6 +602,52 @@ mod tests {
         match LinkChannel::open("idnx-nonexistent0") {
             Ok(_) => panic!("a channel was opened on an interface that does not exist"),
             Err(reason) => assert!(!reason.is_empty()),
+        }
+    }
+
+    /// The test that would have caught the defect this module carried.
+    ///
+    /// Two readers on one interface disagreeing completely is a fault in the one that sees
+    /// nothing, not a property of the medium: any link carrying traffic delivers frames to
+    /// both. It compares them directly rather than asserting an absolute count, so it holds
+    /// on a quiet link as well as a busy one.
+    // The capture reader it compares against is macOS-only, as is the defect it guards.
+    #[test]
+    #[ignore = "needs root and an interface carrying traffic"]
+    #[cfg(target_os = "macos")]
+    fn ambient_frames_reach_both_readers() {
+        let interface = std::env::var("IDNX_ARP_INTERFACE").expect("IDNX_ARP_INTERFACE");
+        let window = std::time::Duration::from_millis(1500);
+
+        let counted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = std::sync::Arc::clone(&counted);
+        let session = crate::net::capture::start(&interface, move |_frame| {
+            sink.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .expect("the capture reader opens");
+
+        let channel = LinkChannel::open_observer(&interface).expect("the link channel opens");
+        let read = channel.read_until(Instant::now() + window, |_frame| -> Option<()> { None });
+
+        let mut session = session;
+        session.stop();
+        let by_capture = counted.load(std::sync::atomic::Ordering::Relaxed);
+
+        println!(
+            "capture saw {by_capture} frame(s), link channel saw {} (fault: {:?})",
+            read.frames_seen, read.fault
+        );
+        assert!(
+            read.fault.is_none(),
+            "the channel faulted: {:?}",
+            read.fault
+        );
+        if by_capture > 0 {
+            assert!(
+                read.frames_seen > 0,
+                "capture read {by_capture} frames while the link channel read none: the \
+                 receive path is defective"
+            );
         }
     }
 

@@ -297,6 +297,11 @@ pub async fn confirm_liveness(
             parse_arp_reply(frame, &query)
         });
 
+        if read.found.is_none()
+            && let Some(fault) = &read.fault
+        {
+            return AttemptOutcome::not_sent(format!("{}; {fault}", query.describe()));
+        }
         match read.found {
             Some(reply) => AttemptOutcome::Answered {
                 sent: query.describe(),
@@ -566,9 +571,22 @@ pub async fn sweep_liveness(
         let rejected = candidates.saturating_sub(correlated);
         let diagnostics = format!(
             "{sent}; {observation}; {} frame(s) read, {candidates} ARP candidate(s), \
-             {correlated} correlated",
-            read.frames_seen
+             {correlated} correlated{}",
+            read.frames_seen,
+            match &read.fault {
+                Some(fault) => format!("; channel fault: {fault}"),
+                None => String::new(),
+            }
         );
+
+        // A channel that faulted did not hear the link; reporting its silence as the
+        // network's would be the same overclaim as reporting an unanswered device as
+        // offline.
+        if replies.is_empty()
+            && let Some(fault) = read.fault
+        {
+            return AttemptOutcome::not_sent(format!("{sent}; {fault}"));
+        }
 
         if !replies.is_empty() {
             return AttemptOutcome::Answered {
