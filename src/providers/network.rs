@@ -555,18 +555,12 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             };
             let vantage = &context.vantage.interface;
 
-            // Exactly one ARP sweep per network. Where raw access exists, arp-liveness has
-            // already asked and validated the answers, so provoking the kernel to ask the
-            // same addresses again would only double the broadcast traffic and add a cache
-            // read on top of a set of confirmed replies.
-            let raw = crate::net::linklayer::raw_link_status(vantage);
-            let mut notes = vec![match &raw {
-                Ok(()) => "ARP resolution left to arp-liveness (validated raw sweep)".to_string(),
-                Err(reason) => format!(
-                    "fallback: kernel-triggered ARP provocation, and its results are cache \
-                     reads rather than fresh confirmations ({reason})"
-                ),
-            }];
+            // ARP resolution is not this provider's decision to make. arp-liveness owns the
+            // whole sequence -- raw sweep, and the kernel-ARP fallback when nothing was
+            // transmitted -- so that two providers cannot reach contradictory conclusions
+            // about whether the link has already been asked.
+            let mut notes =
+                vec!["port sweep only; ARP resolution belongs to arp-liveness".to_string()];
 
             let summary = crate::engine::scanner::scan_subnet_ext(
                 scope,
@@ -576,7 +570,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                 context.timeout,
                 None,
                 true,
-                raw.is_err(),
+                false,
             )
             .await;
             let summary_hosts = summary.active_hosts.len();
@@ -755,6 +749,30 @@ impl DiscoveryProvider for ArpLivenessProvider {
             let mut notes = vec![outcome.describe(self.name())];
             let mut out = Vec::new();
 
+            // What the outcome means for the rest of address resolution on this link, and
+            // the fallback run here rather than by a second provider working from a
+            // preflight that cannot see whether anything was actually sent.
+            let resolution = crate::probes::arp::resolve_sweep(&outcome);
+            if let crate::probes::arp::ArpResolution::Fallback { .. } = &resolution {
+                crate::net::arp::trigger_kernel_arp_sweep(scope.trunc(), &context.probe_channel())
+                    .await;
+
+                // Context, bounded by what can actually be established from here. The
+                // sweep's own observation says whether the request entered this host's
+                // egress path; nothing on this machine can say whether it was modulated
+                // onto the medium, and a wireless vantage is a reason to read the
+                // observation carefully rather than a reason to stop asking.
+                if context.vantage.kind == crate::providers::VantageKind::Wireless {
+                    notes.push(
+                        "note: this vantage is a wireless station; an observed outbound \
+                         request proves it reached the local egress path, and only a capture \
+                         point off this machine could prove it reached the medium"
+                            .to_string(),
+                    );
+                }
+            }
+            notes.push(describe_resolution(&resolution));
+
             if let Some(sweep) = outcome.result() {
                 notes.push(format!(
                     "{} reply/replies from {} asked; the other {} are not confirmed, which is \
@@ -822,6 +840,30 @@ impl DiscoveryProvider for ArpLivenessProvider {
                 attempted,
             }
         })
+    }
+}
+
+/// How an ARP resolution decision is reported, in words that match what was done.
+///
+/// Pure so it can be tested without a link: the wording is the part that was wrong before.
+/// Nothing here may say the raw sweep handled the link unless a reply was correlated to a
+/// request. Two earlier versions got this wrong: a preflight declared raw access available
+/// and the sends then failed, and afterwards a successful `write` was read as proof that a
+/// frame reached the medium. Only an answer proves the exchange.
+fn describe_resolution(resolution: &crate::probes::arp::ArpResolution) -> String {
+    use crate::probes::arp::ArpResolution;
+    match resolution {
+        ArpResolution::Confirmed { replies } => format!(
+            "kernel ARP provocation skipped: {replies} raw reply/replies were correlated to \
+             requests we sent"
+        ),
+        ArpResolution::Fallback { reason } => format!(
+            "kernel fallback used ({reason}); its results are cache reads rather than fresh \
+             confirmations"
+        ),
+        ArpResolution::Skip { reason } => {
+            format!("no ARP resolution attempted here: {reason}")
+        }
     }
 }
 
@@ -1012,6 +1054,55 @@ mod tests {
             produced.notes[0].contains("no IPv4 address") || produced.notes[0].contains("attached"),
             "{:?}",
             produced.notes
+        );
+    }
+
+    #[test]
+    fn a_sweep_without_a_correlated_reply_falls_back_and_claims_no_transmission() {
+        // The wording is the part that was wrong twice over: first "left to arp-liveness"
+        // after the sends failed, then "raw requests reached the wire" after a successful
+        // BPF write that produced no reply at all. Neither may be reachable.
+        use crate::probes::arp::{ArpResolution, resolve_sweep};
+
+        let accepted_then_silent =
+            resolve_sweep(&crate::probes::attempt::AttemptOutcome::NoResponse {
+                sent: "BPF accepted 254 ARP request(s) for 192.168.1.0/24; 0 frame(s) read"
+                    .to_string(),
+            });
+        assert!(matches!(
+            accepted_then_silent,
+            ArpResolution::Fallback { .. }
+        ));
+
+        let note = describe_resolution(&accepted_then_silent);
+        assert!(note.contains("kernel fallback used"), "{note}");
+        assert!(note.contains("BPF accepted"), "{note}");
+        assert!(note.contains("no correlated replies observed"), "{note}");
+        assert!(
+            note.contains("cache reads rather than fresh confirmations"),
+            "{note}"
+        );
+
+        // Neither discredited phrase may come out of any decision.
+        for resolution in [
+            ArpResolution::Confirmed { replies: 2 },
+            accepted_then_silent.clone(),
+            ArpResolution::Fallback {
+                reason: "needs root".to_string(),
+            },
+            ArpResolution::Skip {
+                reason: "not the attached prefix".to_string(),
+            },
+        ] {
+            let rendered = describe_resolution(&resolution);
+            assert!(!rendered.contains("left to arp-liveness"), "{rendered}");
+            assert!(!rendered.contains("reached the wire"), "{rendered}");
+        }
+
+        // Only a correlated reply may claim the sweep resolved the link.
+        assert!(
+            describe_resolution(&ArpResolution::Confirmed { replies: 2 })
+                .contains("correlated to requests we sent")
         );
     }
 

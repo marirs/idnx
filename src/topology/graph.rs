@@ -26,6 +26,16 @@ pub enum DeviceCategory {
     OpaqueBoundary,
     Router,
     Switch,
+    /// An interface observed forwarding traffic, whose owner is unknown.
+    ///
+    /// A TTL-limited probe expiring at an address proves that interface forwarded our
+    /// packet. That is routing behaviour, established. It says nothing about who
+    /// administers the device -- a carrier's, a landlord's and the operator's own routers
+    /// are indistinguishable by hop count -- and the corroboration a `Router` needs is
+    /// exactly what is missing here. Rendering these as `Host` was the contradiction:
+    /// they appeared in the inventory as hosts while carrying confirmed forwarding
+    /// evidence and appearing under the egress path.
+    ForwardingInterface,
     /// A non-infrastructure device with a *confirmed* AI capability.
     AiSystem,
     Host,
@@ -37,10 +47,21 @@ impl DeviceCategory {
             DeviceCategory::OpaqueBoundary => "opaque boundary",
             DeviceCategory::Router => "router",
             DeviceCategory::Switch => "switch",
+            DeviceCategory::ForwardingInterface => "forwarding interface (ownership unknown)",
             DeviceCategory::AiSystem => "AI system",
             DeviceCategory::Host => "host",
         }
     }
+}
+
+/// Whether this node was observed forwarding traffic.
+///
+/// Read from the rendered role signal, which is what a node carries; the typed weights live
+/// on the graph. The signal is only emitted for an interface that answered a TTL-limited
+/// probe, so it is behaviour this run observed rather than anything inferred.
+fn forwards_traffic(node: &Node) -> bool {
+    let observed = crate::topology::evidence::RoleSignal::ObservedForwarding.describe();
+    node.role_signals.iter().any(|signal| *signal == observed)
 }
 
 /// Capability labels that qualify a device as an AI system.
@@ -65,7 +86,11 @@ pub fn categorize(node: &Node) -> Option<DeviceCategory> {
         // Infrastructure placement wins: a router hosting AI is still a router.
         NodeKind::Router => Some(DeviceCategory::Router),
         NodeKind::Switch => Some(DeviceCategory::Switch),
-        NodeKind::Host => Some(if has_confirmed_ai(node) {
+        // Confirmed forwarding outranks the AI and host readings: the strongest thing
+        // known about such a node is that it moved our traffic.
+        NodeKind::Host => Some(if forwards_traffic(node) {
+            DeviceCategory::ForwardingInterface
+        } else if has_confirmed_ai(node) {
             DeviceCategory::AiSystem
         } else {
             DeviceCategory::Host
@@ -80,6 +105,8 @@ pub struct TopologyCounts {
     pub routers: usize,
     pub switches: usize,
     pub opaque_boundaries: usize,
+    /// Interfaces observed forwarding traffic, with no evidence of who owns them.
+    pub forwarding_interfaces: usize,
     pub ai_systems: usize,
     pub other_hosts: usize,
     pub networks: usize,
@@ -93,7 +120,12 @@ pub struct TopologyCounts {
 impl TopologyCounts {
     /// Unique physical or logical devices. Each is counted exactly once.
     pub fn devices(&self) -> usize {
-        self.routers + self.switches + self.opaque_boundaries + self.ai_systems + self.other_hosts
+        self.routers
+            + self.switches
+            + self.opaque_boundaries
+            + self.forwarding_interfaces
+            + self.ai_systems
+            + self.other_hosts
     }
 }
 
@@ -859,6 +891,7 @@ impl TopologyGraph {
                     Some(DeviceCategory::Router) => counts.routers += 1,
                     Some(DeviceCategory::Switch) => counts.switches += 1,
                     Some(DeviceCategory::OpaqueBoundary) => counts.opaque_boundaries += 1,
+                    Some(DeviceCategory::ForwardingInterface) => counts.forwarding_interfaces += 1,
                     Some(DeviceCategory::AiSystem) => counts.ai_systems += 1,
                     Some(DeviceCategory::Host) => counts.other_hosts += 1,
                     None => {}
@@ -2091,6 +2124,62 @@ mod tests {
                 assert!(node.superseded_addresses.is_empty(), "{what}");
             }
         }
+    }
+
+    #[test]
+    fn a_ttl_confirmed_hop_is_a_forwarding_interface_and_never_a_host() {
+        // The contradiction this removes: 192.168.70.1 and 10.100.136.62 appeared in the
+        // inventory as hosts while carrying confirmed forwarding evidence and appearing
+        // under the egress path. Routing behaviour is established; ownership is not, and
+        // "host" asserts the opposite of the first while implying nothing about the second.
+        let mut g = TopologyGraph::new();
+        let hop = DeviceKey::Address("10.100.136.62".parse().unwrap());
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: hop.clone(),
+                address: "10.100.136.62".parse().unwrap(),
+            },
+            EvidenceSource::IcmpProbe,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceRoleSignal {
+                device: hop.clone(),
+                signal: RoleSignal::ObservedForwarding,
+            },
+            EvidenceSource::IcmpProbe,
+            Confidence::Observed,
+        ));
+        g.finalize_roles();
+
+        let node = g
+            .nodes()
+            .find(|node| node.id == NodeId::Device(hop.clone()))
+            .expect("the hop exists");
+        assert_eq!(
+            categorize(node),
+            Some(DeviceCategory::ForwardingInterface),
+            "a hop that forwarded our traffic is not a host"
+        );
+        assert!(
+            g.devices_in(DeviceCategory::Host).is_empty(),
+            "it must not also appear among hosts"
+        );
+        assert_eq!(g.devices_in(DeviceCategory::ForwardingInterface).len(), 1);
+
+        // Ownership stays unclaimed: forwarding alone is not enough to call it a router.
+        assert!(g.devices_in(DeviceCategory::Router).is_empty());
+        assert!(
+            DeviceCategory::ForwardingInterface
+                .label()
+                .contains("ownership unknown")
+        );
+
+        // Counted exactly once, in its own category.
+        let counts = g.counts();
+        assert_eq!(counts.forwarding_interfaces, 1);
+        assert_eq!(counts.other_hosts, 0);
+        assert_eq!(counts.devices(), 1);
     }
 
     #[test]

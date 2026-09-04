@@ -182,6 +182,13 @@ fn render_infrastructure(graph: &TopologyGraph, vantage: &str) {
     for (category, heading) in [
         (DeviceCategory::Router, "Routers & gateways"),
         (DeviceCategory::Switch, "Switches & bridges"),
+        // Named for what was established. These interfaces forwarded our traffic; who
+        // administers them is a separate question that a hop count cannot answer, and
+        // listing them among hosts contradicted the forwarding evidence they carry.
+        (
+            DeviceCategory::ForwardingInterface,
+            "Forwarding interfaces (routing confirmed, ownership unknown)",
+        ),
         (DeviceCategory::AiSystem, "AI agents & runtimes"),
     ] {
         let devices = graph.devices_in(category);
@@ -911,6 +918,10 @@ fn render_coverage(report: &DiscoveryReport) {
     println!("    {:<14}{}", "Switches", counts.switches);
     if counts.opaque_boundaries > 0 {
         println!("    {:<14}{}", "Boundaries", counts.opaque_boundaries);
+    }
+    if counts.forwarding_interfaces > 0 {
+        // Named for the behaviour that was confirmed, not for an owner nobody established.
+        println!("    {:<14}{}", "Forwarding", counts.forwarding_interfaces);
     }
     println!("    {:<14}{}", "AI systems", counts.ai_systems);
     println!("    {:<14}{}", "Other hosts", counts.other_hosts);

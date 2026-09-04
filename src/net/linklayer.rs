@@ -13,6 +13,10 @@
 //! did not answer.
 
 use std::time::Instant;
+// The owned-descriptor types exist only on unix, which is also the only place a channel
+// can be opened.
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 // Only the polling read path takes a wait limit, and that path is unix-only.
 #[cfg(unix)]
 use std::time::Duration;
@@ -103,27 +107,21 @@ fn link_address(addr: *const libc::sockaddr) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-/// Whether raw link-layer access is available here, and why not when it is not.
-///
-/// Exists so that exactly one ARP sweep runs per network. The validated raw sweep and the
-/// scanner's indirect trick of sending UDP datagrams to provoke the kernel's own ARP both
-/// resolve the same addresses; running both doubles the broadcast traffic and produces two
-/// accounts of the same link, one of which is only a cache read. This predicate decides
-/// which one runs, and it answers by opening a channel rather than by guessing from the
-/// platform or the effective uid.
-pub fn raw_link_status(interface: &str) -> Result<(), String> {
-    LinkChannel::open(interface).map(|_| ())
-}
-
 /// A raw link-layer channel pinned to one interface.
 ///
 /// Pinned deliberately: an ARP request that leaves through a different link resolves a
 /// different network's address space while the answer is attributed to this vantage.
-/// The fields are read only by the unix implementation; elsewhere `open` refuses before one
-/// of these can exist, and the type is kept so callers compile unchanged.
-#[cfg_attr(not(unix), allow(dead_code))]
+///
+/// The descriptor is an [`OwnedFd`], which is what makes the ownership single and explicit.
+/// It was a bare `c_int` with a hand-written `Drop`, and the open path finished with a
+/// struct update -- `LinkChannel { read_size, ..channel }` -- which copied the integer into
+/// the new value and then dropped the old one, closing the descriptor both now referred to.
+/// Every send afterwards failed with `EBADF`, so the sweep reported a silent link it had
+/// never transmitted on. A `c_int` is `Copy` and a file descriptor is not; using a type that
+/// says so is what prevents the same mistake returning.
+#[cfg(unix)]
 pub struct LinkChannel {
-    fd: libc::c_int,
+    fd: std::os::fd::OwnedFd,
     /// Read buffer size the kernel expects. On BPF a short read returns `EINVAL`, and the
     /// value is negotiated by the driver rather than chosen by us.
     read_size: usize,
@@ -132,41 +130,72 @@ pub struct LinkChannel {
     bpf_framing: bool,
 }
 
-#[cfg(unix)]
-impl Drop for LinkChannel {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
-    }
+/// Where raw frames cannot be reached at all, the type carries nothing: `open` refuses
+/// before an instance can exist.
+#[cfg(not(unix))]
+pub struct LinkChannel {
+    _unreachable: (),
+}
+
+/// Whether a channel should also deliver the frames this process sends.
+///
+/// Off for a probe, so its own request cannot be read back as a reply. On for an observer,
+/// which exists precisely to check that a request reached the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeeSent {
+    Exclude,
+    Include,
 }
 
 impl LinkChannel {
     /// Opens the interface for raw frames, or explains why it could not.
     pub fn open(interface: &str) -> Result<Self, String> {
+        Self::open_with(interface, SeeSent::Exclude)
+    }
+
+    /// Opens a channel that also reports this process's own transmissions.
+    ///
+    /// Used to check what a `write` actually produced. A successful `write` to a BPF device
+    /// means the kernel accepted the bytes and nothing more -- not that a frame left the
+    /// interface -- and on some links, macOS Wi-Fi among them, the two differ.
+    pub fn open_observer(interface: &str) -> Result<Self, String> {
+        Self::open_with(interface, SeeSent::Include)
+    }
+
+    fn open_with(interface: &str, see_sent: SeeSent) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
         {
-            Self::open_bpf(interface)
+            Self::open_bpf(interface, see_sent)
         }
         #[cfg(target_os = "linux")]
         {
+            let _ = see_sent;
             Self::open_packet_socket(interface)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = interface;
+            let _ = (interface, see_sent);
             Err("raw link-layer access is not implemented on this platform".to_string())
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn open_bpf(interface: &str) -> Result<Self, String> {
+    fn open_bpf(interface: &str, see_sent: SeeSent) -> Result<Self, String> {
         use std::ffi::CString;
 
         // `_IOW('B', n, T)` / `_IOR('B', n, T)` encodings from `net/bpf.h`.
         const BIOCSETIF: libc::c_ulong = 0x8020_426c;
         const BIOCIMMEDIATE: libc::c_ulong = 0x8004_4270;
         const BIOCGBLEN: libc::c_ulong = 0x4004_4266;
+        // _IOR('B', 106, u_int): 0x40000000 | (4 << 16) | ('B' << 8) | 106, and 106 is 0x6a.
+        const BIOCGDLT: libc::c_ulong = 0x4004_426a;
         const BIOCSHDRCMPLT: libc::c_ulong = 0x8004_4275;
         const BIOCSSEESENT: libc::c_ulong = 0x8004_4277;
+
+        /// `DLT_EN10MB` from `net/bpf.h`: Ethernet framing, which is what an ARP request
+        /// built here assumes. Any other link type takes a different header, and writing
+        /// an Ethernet frame to it produces bytes the driver has no reason to accept.
+        const DLT_EN10MB: libc::c_uint = 1;
 
         let mut fd = -1;
         let mut denied = false;
@@ -190,8 +219,10 @@ impl LinkChannel {
             });
         }
 
-        let channel = LinkChannel {
-            fd,
+        // Ownership moves here and stays here. Everything below reads the descriptor
+        // through `as_raw_fd`, and the single owner closes it exactly once.
+        let mut channel = LinkChannel {
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
             read_size: 4096,
             bpf_framing: true,
         };
@@ -204,38 +235,87 @@ impl LinkChannel {
         for (slot, byte) in request.ifr_name.iter_mut().zip(name) {
             *slot = *byte as libc::c_char;
         }
-        if unsafe { libc::ioctl(channel.fd, BIOCSETIF, &request) } < 0 {
+        if unsafe { libc::ioctl(channel.raw_fd(), BIOCSETIF, &request) } < 0 {
             return Err(format!(
                 "BPF could not be attached to {interface}: {}",
                 std::io::Error::last_os_error()
             ));
         }
 
+        // Every setting below is checked. They were fire-and-forget, so a driver that
+        // refused one left the channel quietly configured differently from what the probe
+        // assumed -- and the probe then reported the link's silence rather than its own.
+        let setting =
+            |name: libc::c_ulong, value: libc::c_uint, what: &str| -> Result<(), String> {
+                if unsafe { libc::ioctl(channel.raw_fd(), name, &value) } < 0 {
+                    return Err(format!(
+                        "BPF refused {what} on {interface}: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(())
+            };
+
         // Deliver each frame as it arrives rather than when the buffer fills, so a reply is
         // seen inside the probe's deadline.
-        let enable: libc::c_uint = 1;
-        unsafe { libc::ioctl(channel.fd, BIOCIMMEDIATE, &enable) };
+        setting(BIOCIMMEDIATE, 1, "immediate mode")?;
         // We supply the complete link header, including the source address; without this
         // the kernel overwrites it and the request no longer says who to answer.
-        unsafe { libc::ioctl(channel.fd, BIOCSHDRCMPLT, &enable) };
-        // Do not read back our own transmissions: a request looped straight into the
-        // receive path would otherwise be a candidate for "a reply arrived".
-        let disable: libc::c_uint = 0;
-        unsafe { libc::ioctl(channel.fd, BIOCSSEESENT, &disable) };
+        setting(BIOCSHDRCMPLT, 1, "complete-header mode")?;
+        // A probe must not read back its own transmissions, or its request becomes a
+        // candidate for "a reply arrived"; an observer exists to see exactly that.
+        setting(
+            BIOCSSEESENT,
+            match see_sent {
+                SeeSent::Exclude => 0,
+                SeeSent::Include => 1,
+            },
+            "see-sent mode",
+        )?;
 
-        let mut buffer_len: libc::c_uint = 0;
-        if unsafe { libc::ioctl(channel.fd, BIOCGBLEN, &mut buffer_len) } < 0 || buffer_len == 0 {
-            return Err("BPF did not report a read buffer size".to_string());
+        // The framing the driver will actually use. Building Ethernet ARP frames for a
+        // link that is not Ethernet-framed produces bytes with the wrong header entirely.
+        let mut link_type: libc::c_uint = 0;
+        if unsafe { libc::ioctl(channel.raw_fd(), BIOCGDLT, &mut link_type) } < 0 {
+            return Err(format!(
+                "BPF did not report a link type for {interface}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if link_type != DLT_EN10MB {
+            return Err(format!(
+                "{interface} uses BPF link type {link_type}, not Ethernet (DLT_EN10MB); \
+                 Ethernet ARP frames cannot be framed for it"
+            ));
         }
 
-        // Non-blocking, so the deadline is enforced by us rather than by the driver.
-        let flags = unsafe { libc::fcntl(channel.fd, libc::F_GETFL, 0) };
-        unsafe { libc::fcntl(channel.fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let mut buffer_len: libc::c_uint = 0;
+        if unsafe { libc::ioctl(channel.raw_fd(), BIOCGBLEN, &mut buffer_len) } < 0
+            || buffer_len == 0
+        {
+            return Err(format!(
+                "BPF did not report a read buffer size for {interface}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        channel.read_size = buffer_len as usize;
 
-        Ok(LinkChannel {
-            read_size: buffer_len as usize,
-            ..channel
-        })
+        // Non-blocking, so the deadline is enforced by us rather than by the driver.
+        let flags = unsafe { libc::fcntl(channel.raw_fd(), libc::F_GETFL, 0) };
+        if flags < 0 {
+            return Err(format!(
+                "BPF descriptor flags could not be read for {interface}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::fcntl(channel.raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(format!(
+                "BPF descriptor could not be made non-blocking for {interface}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok(channel)
     }
 
     #[cfg(target_os = "linux")]
@@ -260,7 +340,7 @@ impl LinkChannel {
         }
 
         let channel = LinkChannel {
-            fd,
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
             read_size: 2048,
             bpf_framing: false,
         };
@@ -271,7 +351,7 @@ impl LinkChannel {
         address.sll_ifindex = index as i32;
         let bound = unsafe {
             libc::bind(
-                channel.fd,
+                channel.raw_fd(),
                 &address as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             )
@@ -292,10 +372,21 @@ impl LinkChannel {
 /// would mean a probe that reports silence it never listened for.
 #[cfg(unix)]
 impl LinkChannel {
+    /// The descriptor for a syscall, borrowed rather than surrendered.
+    fn raw_fd(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        self.fd.as_raw_fd()
+    }
+
     /// Transmits one complete frame, link header included.
     pub fn send(&self, frame: &[u8]) -> Result<(), String> {
-        let written =
-            unsafe { libc::write(self.fd, frame.as_ptr() as *const libc::c_void, frame.len()) };
+        let written = unsafe {
+            libc::write(
+                self.raw_fd(),
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+            )
+        };
         if written < 0 {
             return Err(format!(
                 "frame could not be transmitted: {}",
@@ -331,7 +422,7 @@ impl LinkChannel {
 
             let read = unsafe {
                 libc::read(
-                    self.fd,
+                    self.raw_fd(),
                     buffer.as_mut_ptr() as *mut libc::c_void,
                     buffer.len(),
                 )
@@ -362,7 +453,7 @@ impl LinkChannel {
     /// yet, which is not an error.
     fn wait_readable(&self, limit: Duration) -> bool {
         let mut poller = libc::pollfd {
-            fd: self.fd,
+            fd: self.raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };

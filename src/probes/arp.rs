@@ -32,6 +32,15 @@ const OPERATION_REPLY: u16 = 2;
 /// Ethernet header plus a full ARP payload.
 const ARP_FRAME_LEN: usize = 14 + 28;
 
+/// Shortest frame Ethernet carries, padding included.
+///
+/// An ARP request is 42 bytes and a NIC normally pads it. When the frame is injected
+/// through BPF that padding is the sender's job, and some drivers drop a short frame rather
+/// than completing it -- a candidate explanation for requests that are accepted by the
+/// kernel and never seen on the medium. Padding costs 18 zero bytes and removes the
+/// question.
+const MIN_ETHERNET_FRAME: usize = 60;
+
 /// What was asked, kept so the reply can be checked against it.
 ///
 /// Correlation is the whole point. Without the original question, any ARP reply on a busy
@@ -66,6 +75,7 @@ impl ArpQuery {
         // Target hardware address is unknown; that is what is being asked.
         frame.extend_from_slice(&[0u8; 6]);
         frame.extend_from_slice(&self.target_ip.octets());
+        frame.resize(MIN_ETHERNET_FRAME, 0);
         frame
     }
 
@@ -131,6 +141,18 @@ pub fn is_candidate_reply(frame: &[u8], sender_mac: &[u8; 6]) -> bool {
     frame
         .get(offset + 8..offset + 10)
         .is_some_and(|op| u16::from_be_bytes([op[0], op[1]]) == OPERATION_REPLY)
+}
+
+/// Whether a frame is an ARP request this station sent.
+///
+/// Used only by the observing channel, to tell "the request entered the local egress path"
+/// from "the write was accepted and nothing more came of it". Neither answers whether the
+/// frame reached the medium; only a capture point off this machine can.
+pub fn is_our_request(frame: &[u8], sender_mac: &[u8; 6]) -> bool {
+    frame.len() >= ARP_FRAME_LEN
+        && frame[6..12] == *sender_mac
+        && frame[12..14] == ETHERTYPE_ARP.to_be_bytes()
+        && frame[20..22] == OPERATION_REQUEST.to_be_bytes()
 }
 
 /// Validates a frame as the answer to `query`.
@@ -307,6 +329,21 @@ pub async fn confirm_liveness(
 pub struct ArpSweep {
     pub asked: Vec<Ipv4Addr>,
     pub replies: Vec<ArpReply>,
+    /// Frames the channel delivered at all, whatever they were.
+    ///
+    /// Carried because it is the first thing that separates "the link is quiet" from "our
+    /// receive path is not working": zero frames on a live link means the second.
+    pub frames_seen: usize,
+    /// ARP replies addressed to this station -- answers to something, correlated or not.
+    pub candidates: usize,
+    /// Candidates that failed correlation against a transmitted request.
+    pub rejected: usize,
+    /// Requests of ours that a second channel saw leaving.
+    ///
+    /// Bounds the claim precisely: an observer on this host proves the frame entered the
+    /// local BPF and egress path, and nothing more. Whether it was modulated onto the
+    /// medium can only be established from a capture point that is not this machine.
+    pub locally_observed: usize,
 }
 
 impl ArpSweep {
@@ -341,6 +378,51 @@ impl ArpSweep {
 
 /// The outcome of one sweep.
 pub type ArpSweepOutcome = AttemptOutcome<ArpSweep>;
+
+/// What the ARP sweep's outcome means for the rest of address resolution on this link.
+///
+/// Only a validated reply settles it. A successful `write` to a BPF device proves the
+/// kernel accepted the bytes and nothing further: the frame may never reach the medium,
+/// which is what the live run showed -- every request was accepted and even the gateway,
+/// known to be answering, produced no reply. Reporting that as "requests reached the wire"
+/// and skipping the kernel fallback left the link unresolved and said it had been asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArpResolution {
+    /// A reply was correlated to a request we sent. The exchange happened, so provoking
+    /// the kernel to ask the same addresses again would only duplicate the traffic.
+    Confirmed { replies: usize },
+    /// No validated reply, whatever the cause. The kernel fallback is the only remaining
+    /// way to resolve this link, and its results are cache reads rather than confirmations.
+    Fallback { reason: String },
+    /// Nothing to resolve here.
+    Skip { reason: String },
+}
+
+/// Maps a sweep outcome onto that decision.
+pub fn resolve_sweep(outcome: &ArpSweepOutcome) -> ArpResolution {
+    match outcome {
+        AttemptOutcome::Answered { result, .. } => ArpResolution::Confirmed {
+            replies: result.replies.len(),
+        },
+        // Accepted by BPF, and nothing came back. On macOS Wi-Fi this is the ordinary
+        // outcome even for a station that answers everything else, so it cannot be read as
+        // the link having been asked.
+        AttemptOutcome::NoResponse { sent } => ArpResolution::Fallback {
+            reason: format!("{sent}; no correlated replies observed"),
+        },
+        AttemptOutcome::InvalidResponse { sent, rejected } => ArpResolution::Fallback {
+            reason: format!("{sent}; {rejected} candidate reply/replies failed correlation"),
+        },
+        AttemptOutcome::Unavailable { reason } | AttemptOutcome::NotSent { reason } => {
+            ArpResolution::Fallback {
+                reason: reason.clone(),
+            }
+        }
+        AttemptOutcome::NotApplicable { reason } => ArpResolution::Skip {
+            reason: reason.clone(),
+        },
+    }
+}
 
 /// Asks every named on-link address to identify itself, over one channel.
 ///
@@ -379,6 +461,9 @@ pub async fn sweep_liveness(
             Ok(channel) => channel,
             Err(reason) => return AttemptOutcome::unavailable(reason),
         };
+        // A second channel that does see our own transmissions. Its absence is not fatal:
+        // it sharpens the diagnosis and is never required for the sweep itself.
+        let observer = LinkChannel::open_observer(&interface).ok();
 
         // Only queries whose request actually reached the wire may correlate a reply.
         //
@@ -411,13 +496,45 @@ pub async fn sweep_liveness(
         }
         let asked: Vec<Ipv4Addr> = sent_queries.iter().map(|q| q.target_ip).collect();
 
-        let sent = format!("ARP who-has {} address(es) on {network}", asked.len());
+        // "Accepted" rather than "sent": a BPF write that returns success has handed the
+        // bytes to the kernel, which is not the same as a frame on the medium.
+        let sent = format!("BPF accepted {} ARP request(s) for {network}", asked.len());
+
+        // What the local egress path did with them. Read for a slice of the budget, since
+        // whatever it is going to show was buffered while the requests were being written.
+        //
+        // The claim this supports is bounded: seeing our own request proves it entered this
+        // host's BPF and egress path. Whether it was modulated onto the medium can only be
+        // established from a capture point that is not this machine.
+        let mut locally_observed = 0usize;
+        let observation = match &observer {
+            Some(observer) => {
+                let until = Instant::now() + Duration::from_millis(250);
+                observer.read_until(until, |frame| -> Option<()> {
+                    if is_our_request(frame, &sender_mac) {
+                        locally_observed += 1;
+                    }
+                    None
+                });
+                if locally_observed > 0 {
+                    format!(
+                        "locally observed outbound ({locally_observed} of {})",
+                        asked.len()
+                    )
+                } else {
+                    "no outbound request observed locally".to_string()
+                }
+            }
+            None => "outbound observation unavailable".to_string(),
+        };
+
         let deadline = Instant::now() + budget;
         let mut replies: Vec<ArpReply> = Vec::new();
         let mut candidates = 0usize;
+        let mut correlated = 0usize;
 
         // Never returns Some, so the read runs to the deadline and collects every answer.
-        channel.read_until(deadline, |frame| -> Option<()> {
+        let read = channel.read_until(deadline, |frame| -> Option<()> {
             // Counted once per frame, before any correlation: whether a frame is an ARP
             // reply addressed to this station does not depend on which address we asked
             // about, and testing it inside the query loop counted one stray reply once per
@@ -430,32 +547,49 @@ pub async fn sweep_liveness(
                 // Deduplicated by (address, hardware address), not by address alone.
                 // Collapsing on the address discarded the second station answering for it,
                 // which is exactly the conflict worth reporting.
-                if let Some(reply) = parse_arp_reply(frame, query)
-                    && !replies
+                if let Some(reply) = parse_arp_reply(frame, query) {
+                    correlated += 1;
+                    if !replies
                         .iter()
                         .any(|seen| seen.address == reply.address && seen.mac == reply.mac)
-                {
-                    replies.push(reply);
+                    {
+                        replies.push(reply);
+                    }
                 }
             }
             None
         });
 
+        // Every count the read produced travels with the outcome. Without them, "nothing
+        // answered" cannot be told apart from "nothing was delivered to us at all", and the
+        // second is a fault on this machine rather than a fact about the link.
+        let rejected = candidates.saturating_sub(correlated);
+        let diagnostics = format!(
+            "{sent}; {observation}; {} frame(s) read, {candidates} ARP candidate(s), \
+             {correlated} correlated",
+            read.frames_seen
+        );
+
         if !replies.is_empty() {
             return AttemptOutcome::Answered {
-                sent,
-                result: ArpSweep { asked, replies },
+                sent: diagnostics,
+                result: ArpSweep {
+                    asked,
+                    replies,
+                    frames_seen: read.frames_seen,
+                    candidates,
+                    rejected,
+                    locally_observed,
+                },
             };
         }
-        // Candidates were counted against every query, so a reply addressed to us about an
-        // address nobody asked for is the only way to reach this without an answer.
         if candidates > 0 {
             return AttemptOutcome::InvalidResponse {
-                sent,
+                sent: diagnostics,
                 rejected: candidates,
             };
         }
-        AttemptOutcome::NoResponse { sent }
+        AttemptOutcome::NoResponse { sent: diagnostics }
     })
     .await
     .unwrap_or_else(|error| {
@@ -495,7 +629,12 @@ mod tests {
     #[test]
     fn the_request_is_a_broadcast_naming_this_interface_and_the_target() {
         let frame = query().request_frame();
-        assert_eq!(frame.len(), ARP_FRAME_LEN);
+        // Padded to Ethernet's minimum rather than left at the ARP payload's 42 bytes.
+        assert_eq!(frame.len(), MIN_ETHERNET_FRAME);
+        assert!(
+            frame[ARP_FRAME_LEN..].iter().all(|byte| *byte == 0),
+            "padding carries no data"
+        );
         assert_eq!(&frame[0..6], &[0xff; 6]);
         assert_eq!(&frame[6..12], &query().sender_mac);
         assert_eq!(&frame[12..14], &ETHERTYPE_ARP.to_be_bytes());
@@ -598,6 +737,73 @@ mod tests {
         }
     }
 
+    /// Live acceptance check: does a request we write actually appear on the link?
+    ///
+    /// A second channel opened with see-sent enabled watches while the first transmits, so
+    /// the answer comes from an independent observation rather than from `write` returning
+    /// success. That distinction is the whole point -- the privileged run showed every
+    /// write accepted and no reply from a gateway that answers everything else, which is
+    /// consistent with the frame never reaching the medium.
+    ///
+    /// Reports rather than asserts on the reply: a link where the request is observed and
+    /// nothing answers is a different finding from one where the request never appears.
+    #[tokio::test]
+    #[ignore = "needs root and a live on-link neighbour"]
+    async fn arp_transmission_observed_live() {
+        let interface = std::env::var("IDNX_ARP_INTERFACE").expect("IDNX_ARP_INTERFACE");
+        let target: Ipv4Addr = std::env::var("IDNX_ARP_TARGET")
+            .expect("IDNX_ARP_TARGET")
+            .parse()
+            .expect("an IPv4 address");
+        let source = crate::net::interface::get_interface_by_name(&interface)
+            .expect("the interface has an IPv4 address");
+        let sender_mac =
+            crate::net::linklayer::interface_mac(&interface).expect("a hardware address");
+        let query = ArpQuery {
+            sender_mac,
+            sender_ip: source.ip,
+            target_ip: target,
+        };
+        let request = query.request_frame();
+
+        let observer = LinkChannel::open_observer(&interface).expect("an observing channel");
+        let sender = LinkChannel::open(&interface).expect("a transmitting channel");
+
+        let watching = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            let mut ours = 0usize;
+            let mut replies = 0usize;
+            let mut frames = 0usize;
+            observer.read_until(deadline, |frame| -> Option<()> {
+                frames += 1;
+                if frame.len() >= 42 && frame[6..12] == sender_mac && frame[12..14] == [0x08, 0x06]
+                {
+                    ours += 1;
+                }
+                if is_candidate_reply(frame, &sender_mac) {
+                    replies += 1;
+                }
+                None
+            });
+            (frames, ours, replies)
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        let sent = sender.send(&request);
+        let (frames, ours, replies) = watching.join().expect("the observer finished");
+
+        println!("write: {sent:?}");
+        println!(
+            "observer saw {frames} frame(s), {ours} of our ARP request(s), {replies} reply/replies"
+        );
+        assert!(sent.is_ok(), "BPF refused the write: {sent:?}");
+        assert!(
+            ours > 0,
+            "the request was accepted by BPF but never observed on {interface}: a write that \
+             returns success is not evidence of transmission"
+        );
+    }
+
     /// Live check of the whole path: hardware address lookup, channel open, transmit and
     /// validated receive. Ignored by default because it needs root and a real neighbour;
     /// run it as `sudo ./target/debug/deps/idnx-<hash> --ignored --nocapture arp_probe_live`
@@ -660,6 +866,98 @@ mod tests {
     }
 
     #[test]
+    fn only_a_correlated_reply_lets_the_kernel_fallback_be_skipped() {
+        // Two live failures are encoded here. First: the BPF device opened, a preflight
+        // declared raw access available, every send then failed, and the run reported ARP
+        // resolution as handled. Second, after that was fixed: every write succeeded and
+        // even the gateway -- answering everything else -- produced no ARP reply, because
+        // a BPF write means the kernel took the bytes and not that a frame left the
+        // interface. Only an answer settles it.
+        let accepted = "BPF accepted 254 ARP request(s) for 192.168.1.0/24".to_string();
+
+        for silent in [
+            AttemptOutcome::not_sent("frame could not be transmitted: Bad file descriptor"),
+            AttemptOutcome::unavailable("needs root"),
+            AttemptOutcome::NoResponse {
+                sent: accepted.clone(),
+            },
+            AttemptOutcome::InvalidResponse {
+                sent: accepted.clone(),
+                rejected: 3,
+            },
+        ] {
+            assert!(
+                matches!(resolve_sweep(&silent), ArpResolution::Fallback { .. }),
+                "no correlated reply means the link is unresolved: {silent:?}"
+            );
+        }
+
+        // A validated reply, and only that, skips the fallback.
+        assert_eq!(
+            resolve_sweep(&AttemptOutcome::Answered {
+                sent: accepted,
+                result: ArpSweep {
+                    replies: vec![ArpReply {
+                        address: Ipv4Addr::new(192, 168, 1, 1),
+                        mac: [0x74, 0x12, 0x13, 0x14, 0x75, 0xdc],
+                        vlan: None,
+                        raw: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+            }),
+            ArpResolution::Confirmed { replies: 1 }
+        );
+
+        assert!(matches!(
+            resolve_sweep(&AttemptOutcome::not_applicable("not the attached prefix")),
+            ArpResolution::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn the_sweep_reports_what_the_local_egress_path_showed() {
+        // Three distinguishable states, and none of them claims the medium carried the
+        // frame. Only a capture point off this machine could establish that.
+        let observed = ArpSweep {
+            asked: vec![Ipv4Addr::new(192, 168, 1, 1)],
+            locally_observed: 1,
+            ..Default::default()
+        };
+        assert_eq!(observed.locally_observed, 1);
+        assert!(observed.replies.is_empty());
+
+        // Seeing the request and getting no answer is a finding about the exchange, not a
+        // reason to call the sweep successful.
+        assert!(matches!(
+            resolve_sweep(&AttemptOutcome::NoResponse {
+                sent: "BPF accepted 1 ARP request(s) for 192.168.1.0/24; locally observed \
+                       outbound (1 of 1); 12 frame(s) read, 0 ARP candidate(s), 0 correlated"
+                    .to_string(),
+            }),
+            ArpResolution::Fallback { .. }
+        ));
+
+        // And a request that never appeared locally is a fault on this host, reported as
+        // such and still falling back.
+        let unusable = resolve_sweep(&AttemptOutcome::NoResponse {
+            sent: "BPF accepted 254 ARP request(s) for 192.168.1.0/24; no outbound request \
+                   observed locally; 0 frame(s) read, 0 ARP candidate(s), 0 correlated"
+                .to_string(),
+        });
+        match unusable {
+            ArpResolution::Fallback { reason } => {
+                assert!(
+                    reason.contains("no outbound request observed locally"),
+                    "{reason}"
+                );
+                assert!(!reason.contains("reached the wire"), "{reason}");
+            }
+            other => panic!("a sweep nothing answered must fall back: {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_sweep_separates_what_was_asked_from_what_answered() {
         // The distinction that makes an absence meaningful: an address nobody asked about
         // and one that was asked and stayed quiet are different facts.
@@ -675,6 +973,7 @@ mod tests {
                 vlan: None,
                 raw: Vec::new(),
             }],
+            ..Default::default()
         };
         assert_eq!(
             sweep.unconfirmed(),

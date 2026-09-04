@@ -50,12 +50,63 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let close = format!("</{}>", tag);
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
-    let val = xml[start..end].trim();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val.to_string())
+    let val = decode_entities(xml[start..end].trim());
+    if val.is_empty() { None } else { Some(val) }
+}
+
+/// Turns XML character entities back into the characters they stand for.
+///
+/// A display name is text, and the entities are an artifact of the transport. A monitor
+/// advertising `49&quot; Odyssey OLED G9` was rendered with the markup intact, which is not
+/// the name of anything.
+///
+/// Only the five predefined XML entities plus numeric references. Anything else is left
+/// exactly as it arrived rather than guessed at, and `&amp;` is resolved last so a device
+/// that double-encoded its name does not have the result re-interpreted.
+fn decode_entities(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find(';').filter(|end| *end <= 10) else {
+            // An unterminated ampersand is a literal ampersand.
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+
+        let entity = &tail[1..end];
+        let decoded = match entity {
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            _ => numeric_entity(entity),
+        };
+        match decoded {
+            Some(character) => out.push(character),
+            // Unknown entity: kept verbatim, since inventing a character would be worse
+            // than showing what the device actually sent.
+            None => out.push_str(&tail[..=end]),
+        }
+        rest = &tail[end + 1..];
     }
+
+    out.push_str(rest);
+    out
+}
+
+/// `&#34;` and `&#x22;` forms.
+fn numeric_entity(entity: &str) -> Option<char> {
+    let digits = entity.strip_prefix('#')?;
+    let value = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    char::from_u32(value)
 }
 
 /// Fetches UPnP device description XML from a location URL (e.g. http://192.168.1.1:49153/wps_device.xml)
@@ -249,4 +300,40 @@ ST: ssdp:all\r\n\r\n";
     // would defeat comparing two runs.
     devices.sort_by_key(|d| d.ip);
     devices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_display_name_is_text_not_markup() {
+        // The device on this link advertises `49&quot; Odyssey OLED G9`. The entities are
+        // an artifact of the XML transport; the name is what an operator has to recognise.
+        let xml = "<root><friendlyName>49&quot; Odyssey OLED G9</friendlyName></root>";
+        assert_eq!(
+            extract_tag(xml, "friendlyName").as_deref(),
+            Some("49\" Odyssey OLED G9")
+        );
+
+        assert_eq!(decode_entities("a &amp; b"), "a & b");
+        assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
+        assert_eq!(decode_entities("it&apos;s"), "it's");
+        assert_eq!(decode_entities("&#34;quoted&#x22;"), "\"quoted\"");
+    }
+
+    #[test]
+    fn anything_that_is_not_an_entity_survives_unchanged() {
+        // Inventing a character would be worse than showing what the device sent.
+        assert_eq!(decode_entities("AT&T"), "AT&T");
+        assert_eq!(decode_entities("100% & rising"), "100% & rising");
+        assert_eq!(decode_entities("&unknown;"), "&unknown;");
+        assert_eq!(decode_entities("&#xZZZ;"), "&#xZZZ;");
+        assert_eq!(decode_entities("trailing &"), "trailing &");
+        assert_eq!(decode_entities("no entities here"), "no entities here");
+
+        // A double-encoded name resolves one level, not two: the inner text is the
+        // device's own, and re-interpreting it would change what it said.
+        assert_eq!(decode_entities("&amp;quot;"), "&quot;");
+    }
 }

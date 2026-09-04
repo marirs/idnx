@@ -311,11 +311,13 @@ pub struct ProviderOutcomeExport {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SummaryExport {
     /// Unique devices, counted once each. Equals routers + switches + boundaries +
-    /// ai_systems + other_hosts.
+    /// forwarding_interfaces + ai_systems + other_hosts.
     pub devices: usize,
     pub routers: usize,
     pub switches: usize,
     pub opaque_boundaries: usize,
+    /// Interfaces observed forwarding traffic, with no evidence of who owns them.
+    pub forwarding_interfaces: usize,
     /// Devices with a protocol-confirmed AI capability that are not infrastructure.
     pub ai_systems: usize,
     pub other_hosts: usize,
@@ -550,6 +552,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
         routers: counts.routers,
         switches: counts.switches,
         opaque_boundaries: counts.opaque_boundaries,
+        forwarding_interfaces: counts.forwarding_interfaces,
         ai_systems: counts.ai_systems,
         other_hosts: counts.other_hosts,
         networks: counts.networks,
@@ -909,7 +912,12 @@ mod tests {
         let s = &data.summary;
 
         assert_eq!(
-            s.routers + s.switches + s.opaque_boundaries + s.ai_systems + s.other_hosts,
+            s.routers
+                + s.switches
+                + s.opaque_boundaries
+                + s.forwarding_interfaces
+                + s.ai_systems
+                + s.other_hosts,
             s.devices,
             "every device must fall in exactly one category"
         );
