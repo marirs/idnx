@@ -70,6 +70,10 @@ pub struct RipTally {
     pub routes: AtomicU64,
     /// Withdrawals (RIPv2 metric 16), which create no topology.
     pub withdrawals: AtomicU64,
+    /// Table requests seen, which solicit an update rather than being one.
+    pub requests: AtomicU64,
+    /// Of those, ones this process sent: the capture sees our own frames leaving.
+    pub local_requests: AtomicU64,
     /// OSPF and IS-IS packets that parsed.
     pub control_packets: AtomicU64,
     /// Of those, hellos: routers and areas, no prefixes.
@@ -84,8 +88,20 @@ pub struct RipTally {
 }
 
 impl RipTally {
-    fn note(&self, fact: &FrameFact) {
+    /// Counts one fact, telling this host's own frames apart from the link's.
+    ///
+    /// The local hardware address is what separates "thirteen requests were observed on
+    /// this link" from "we sent thirteen requests and the capture saw them leave". Both are
+    /// true; only one is a fact about the network.
+    fn note_with_local_mac(&self, fact: &FrameFact, local_mac: Option<&str>) {
         match fact {
+            FrameFact::RoutingRequest { sender_mac, .. } => {
+                self.datagrams.fetch_add(1, Ordering::Relaxed);
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                if local_mac.is_some_and(|local| local.eq_ignore_ascii_case(sender_mac)) {
+                    self.local_requests.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             FrameFact::RoutingUpdate {
                 routes, withdrawn, ..
             } => {
@@ -147,13 +163,34 @@ impl RipTally {
     pub fn describe(&self) -> String {
         let datagrams = self.datagrams.load(Ordering::Relaxed);
         let updates = self.updates.load(Ordering::Relaxed);
+        let requests = self.requests.load(Ordering::Relaxed);
+        let local = self.local_requests.load(Ordering::Relaxed);
+        let invalid = datagrams.saturating_sub(updates + requests);
+
         if datagrams == 0 {
             return "no valid updates observed (0 datagrams on UDP 520/521)".to_string();
         }
+        // Requests are valid RIP and advertise nothing. Ours are named as ours, because
+        // "13 datagrams failed validation" was a statement about this crate rather than
+        // about the link.
         if updates == 0 {
+            let mut said = Vec::new();
+            if local > 0 {
+                said.push(format!("{local} locally generated request(s) observed"));
+            }
+            if requests > local {
+                said.push(format!("{} request(s) from the link", requests - local));
+            }
+            if invalid > 0 {
+                said.push(format!("{invalid} datagram(s) failed validation"));
+            }
             return format!(
-                "no valid updates observed ({datagrams} datagram(s) on UDP 520/521, none \
-                 survived validation)"
+                "0 routing updates received{}",
+                if said.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", said.join(", "))
+                }
             );
         }
         format!(
@@ -260,6 +297,16 @@ impl PassiveObservation {
         &self.rip
     }
 
+    /// This interface's hardware address, used to tell our own frames from the link's.
+    fn local_mac(&self) -> Option<String> {
+        crate::net::linklayer::interface_mac(&self.interface).map(|mac| {
+            mac.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+    }
+
     /// Stops capture and records the final frame count. Idempotent.
     pub fn stop(&self) {
         if self.stopped.swap(true, Ordering::Relaxed) {
@@ -292,8 +339,9 @@ impl crate::providers::ContinuousSource for PassiveObservation {
         let facts = PassiveObservation::drain(self);
         // Counted before conversion: a rejected datagram produces no evidence and would
         // otherwise leave no trace at all.
+        let local = self.local_mac();
         for fact in &facts {
-            self.rip.note(fact);
+            self.rip.note_with_local_mac(fact, local.as_deref());
         }
         let evidence = convert_unscoped(&facts, &self.interface);
         self.facts_accepted
@@ -306,8 +354,9 @@ impl crate::providers::ContinuousSource for PassiveObservation {
         // decoded between the two calls. Both counters are therefore final on return.
         self.stop();
         let facts = PassiveObservation::drain(self);
+        let local = self.local_mac();
         for fact in &facts {
-            self.rip.note(fact);
+            self.rip.note_with_local_mac(fact, local.as_deref());
         }
         let evidence = convert_unscoped(&facts, &self.interface);
         self.facts_accepted
@@ -497,9 +546,10 @@ fn convert(
             // this vantage observed, and each entry names a prefix outright -- which is why
             // these are among the few sources that can establish a network nobody here is
             // attached to.
-            // Counted by the tally and nothing more: a datagram that failed validation
-            // establishes no device and no network.
-            FrameFact::RoutingUpdateRejected { .. } => {}
+            // Counted by the tally and nothing more. A datagram that failed validation
+            // establishes nothing, and a request advertises nothing -- it asks a neighbour
+            // for its table, and the sender may well be this process.
+            FrameFact::RoutingUpdateRejected { .. } | FrameFact::RoutingRequest { .. } => {}
 
             // A routing control-plane packet, heard and never answered.
             FrameFact::ControlPlane {
@@ -1041,6 +1091,66 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn our_own_requests_are_named_as_ours_and_never_as_failures() {
+        // "13 datagrams failed validation" was a statement about this crate rather than
+        // about the link. The tally now says which were ours.
+        let tally = RipTally::default();
+        for _ in 0..13 {
+            tally.note_with_local_mac(
+                &FrameFact::RoutingRequest {
+                    sender_mac: "02:00:00:00:00:11".into(),
+                    protocol: "RIPv2",
+                },
+                Some("02:00:00:00:00:11"),
+            );
+        }
+
+        let described = tally.describe();
+        assert!(
+            described.starts_with("0 routing updates received"),
+            "{described}"
+        );
+        assert!(
+            described.contains("13 locally generated request(s) observed"),
+            "{described}"
+        );
+        assert!(
+            !described.contains("failed validation"),
+            "a valid request is not a failure: {described}"
+        );
+
+        // A request from another station is the link's, not ours.
+        let elsewhere = RipTally::default();
+        elsewhere.note_with_local_mac(
+            &FrameFact::RoutingRequest {
+                sender_mac: "02:00:00:00:00:99".into(),
+                protocol: "RIPv2",
+            },
+            Some("02:00:00:00:00:11"),
+        );
+        assert!(
+            elsewhere.describe().contains("1 request(s) from the link"),
+            "{}",
+            elsewhere.describe()
+        );
+
+        // A genuinely malformed datagram is still counted as one.
+        let broken = RipTally::default();
+        broken.note_with_local_mac(
+            &FrameFact::RoutingUpdateRejected {
+                sender_mac: "02:00:00:00:00:99".into(),
+                protocol: "RIPv2",
+            },
+            Some("02:00:00:00:00:11"),
+        );
+        assert!(
+            broken
+                .describe()
+                .contains("1 datagram(s) failed validation")
+        );
     }
 
     #[test]

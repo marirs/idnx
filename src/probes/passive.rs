@@ -109,6 +109,17 @@ pub enum FrameFact {
         sequences: Vec<u32>,
     },
 
+    /// A RIP *request*: a table solicitation, not an update.
+    ///
+    /// Counted apart from updates because it is neither an advertisement nor a failure. The
+    /// previous decoder accepted only responses, so every request on the link -- including
+    /// this crate's own, which the capture sees leaving -- was reported as a datagram that
+    /// failed validation.
+    RoutingRequest {
+        sender_mac: String,
+        protocol: &'static str,
+    },
+
     /// A datagram on a routing protocol's port that did not survive validation.
     ///
     /// Counted so silence can be told apart from noise. "No valid updates observed" means
@@ -384,14 +395,7 @@ fn decode_ipv4(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
     if src_port == 520 || dst_port == 520 {
         let mut source = [0u8; 4];
         source.copy_from_slice(&payload[12..16]);
-        facts.push(
-            decode_rip_v2(source_mac, Ipv4Addr::from(source), body).unwrap_or(
-                FrameFact::RoutingUpdateRejected {
-                    sender_mac: source_mac.to_string(),
-                    protocol: "RIPv2",
-                },
-            ),
-        );
+        facts.push(classify_rip(source_mac, Ipv4Addr::from(source), body));
         return;
     }
 
@@ -747,6 +751,34 @@ fn split_isis_prefixes(
     }
 
     (current, reported_only)
+}
+
+/// Sorts a datagram on UDP 520 into request, update or malformed.
+///
+/// A request is a valid RIP message that advertises nothing: it asks a neighbour for its
+/// table. Treating one as a failed update was how this crate's own active table requests --
+/// which the capture sees leaving the interface -- were reported as thirteen invalid
+/// datagrams on a link where nothing was wrong.
+fn classify_rip(source_mac: &str, sender: Ipv4Addr, body: &[u8]) -> FrameFact {
+    const REQUEST: u8 = 1;
+    const RESPONSE: u8 = 2;
+
+    match body.first() {
+        Some(&REQUEST) if body.len() >= 4 && body[1] == 2 => FrameFact::RoutingRequest {
+            sender_mac: source_mac.to_string(),
+            protocol: "RIPv2",
+        },
+        Some(&RESPONSE) => {
+            decode_rip_v2(source_mac, sender, body).unwrap_or(FrameFact::RoutingUpdateRejected {
+                sender_mac: source_mac.to_string(),
+                protocol: "RIPv2",
+            })
+        }
+        _ => FrameFact::RoutingUpdateRejected {
+            sender_mac: source_mac.to_string(),
+            protocol: "RIPv2",
+        },
+    }
 }
 
 /// Decodes a RIPv2 response heard on UDP 520.
@@ -1237,6 +1269,23 @@ mod tests {
                 assert_eq!(withdrawn[0].0.to_string(), "10.9.0.0/16");
             }
             other => panic!("expected a routing update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn our_own_table_request_is_a_request_and_never_a_failed_update() {
+        // The exact frame this crate transmits, put back through the decoder that watches
+        // the interface. Capture sees our own frames leaving, and the previous decoder --
+        // which accepted only responses -- reported every one of them as a datagram that
+        // failed validation. Thirteen "invalid" datagrams on the live run were ours.
+        let request = crate::probes::rip::table_request();
+        assert_eq!(request[0], 1, "the fixture must be a request");
+        assert_eq!(request[1], 2, "and a version 2 one");
+
+        let frame = udp_v4_frame([0x02, 0, 0, 0, 0, 0x11], [192, 168, 1, 119], 520, &request);
+        match decode_frame(&frame).first().expect("one fact") {
+            FrameFact::RoutingRequest { protocol, .. } => assert_eq!(*protocol, "RIPv2"),
+            other => panic!("a table request is not a failed update: {other:?}"),
         }
     }
 

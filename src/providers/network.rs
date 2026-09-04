@@ -913,24 +913,19 @@ impl DiscoveryProvider for RouterDiscoveryProvider {
                     // What the advertisement contained, counted by class. An RA with no
                     // options at all and one carrying prefixes are both "answered", and
                     // only the enumeration says which happened.
+                    // One self-contained line, not a header plus indented lines: the
+                    // engine joins a provider's notes with "; ", which turned a trailing
+                    // colon into "answered from fe80::1:;".
                     notes.push(format!(
-                        "router-discovery answered from {}:",
-                        advertisement.router
-                    ));
-                    notes.push(format!(
-                        "  PIO on-link: {}",
-                        advertisement.on_link_prefixes().count()
-                    ));
-                    notes.push(format!(
-                        "  PIO address-formation only: {}",
+                        "answered from {} with {} on-link PIO, {} address-formation-only \
+                         PIO, {} RIO route(s)",
+                        advertisement.router,
+                        advertisement.on_link_prefixes().count(),
                         advertisement
                             .prefixes
                             .iter()
                             .filter(|prefix| !prefix.on_link)
-                            .count()
-                    ));
-                    notes.push(format!(
-                        "  RIO routes: {}",
+                            .count(),
                         advertisement.usable_routes().count()
                     ));
                 }
@@ -1118,27 +1113,30 @@ impl DiscoveryProvider for DhcpInformProvider {
                     // nothing about what the answer contained, and an absent option 121 is
                     // exactly as much of a finding as a present one -- it is why no prefix
                     // beyond this link was disclosed.
-                    notes.push(format!("dhcp-inform answered from {}:", disclosure.server));
-                    notes.push(format!(
-                        "  option 1: {}",
-                        disclosure
-                            .subnet_mask
-                            .map(|mask| mask.to_string())
-                            .unwrap_or_else(|| "absent".to_string())
-                    ));
-                    notes.push(format!(
-                        "  option 3: {}",
-                        if disclosure.routers.is_empty() {
-                            "absent".to_string()
-                        } else {
+                    // One self-contained line: the engine joins notes with "; ", so a
+                    // trailing colon rendered as "answered from 192.168.1.1:;".
+                    let mut disclosed = vec![
+                        format!(
+                            "option 1 {}",
                             disclosure
-                                .routers
-                                .iter()
-                                .map(|router| router.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        }
-                    ));
+                                .subnet_mask
+                                .map(|mask| mask.to_string())
+                                .unwrap_or_else(|| "absent".to_string())
+                        ),
+                        format!(
+                            "option 3 {}",
+                            if disclosure.routers.is_empty() {
+                                "absent".to_string()
+                            } else {
+                                disclosure
+                                    .routers
+                                    .iter()
+                                    .map(|router| router.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            }
+                        ),
+                    ];
                     for option in [121u8, 249] {
                         let named: Vec<String> = disclosure
                             .classless_routes
@@ -1156,15 +1154,20 @@ impl DiscoveryProvider for DhcpInformProvider {
                                 )
                             })
                             .collect();
-                        notes.push(format!(
-                            "  option {option}: {}",
+                        disclosed.push(format!(
+                            "option {option} {}",
                             if named.is_empty() {
                                 "absent".to_string()
                             } else {
-                                named.join(", ")
+                                named.join(" ")
                             }
                         ));
                     }
+                    notes.push(format!(
+                        "answered from {} with {}",
+                        disclosure.server,
+                        disclosed.join(", ")
+                    ));
 
                     let server = DeviceKey::Address(IpAddr::V4(disclosure.server));
                     out.push(TopologyEvidence::new(

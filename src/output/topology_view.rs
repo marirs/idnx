@@ -844,6 +844,22 @@ fn scheduling_priority(tier: crate::providers::target::DeviceTier) -> &'static s
 /// Reports what was attempted against each device, not merely whether it produced
 /// evidence. "no response" answered neither of the two questions an operator actually has:
 /// was this device asked, and did it refuse or stay silent.
+/// How the graph classified a device, for the coverage report.
+///
+/// The scheduling tier is not a classification, and printing it alone let the coverage
+/// section say "priority: normal" about an interface the topology sections had established
+/// as forwarding. Two truths about one device must not read as a contradiction.
+fn classified_as(
+    report: &DiscoveryReport,
+    record: &crate::providers::target::DeviceCoverage,
+) -> Option<String> {
+    let node = report
+        .graph
+        .nodes()
+        .find(|node| node.id == NodeId::Device(record.device.clone()))?;
+    crate::topology::graph::categorize(node).map(|category| category.label().to_string())
+}
+
 fn render_device_coverage(report: &DiscoveryReport) {
     if report.coverage.is_empty() {
         return;
@@ -874,9 +890,14 @@ fn render_device_coverage(report: &DiscoveryReport) {
                 .unwrap_or(&record.device.to_string())
                 .cyan()
                 .bold(),
-            // The scheduling tier, not the device's role: a device the graph later scores
-            // as a router was rendered here as "[host]", contradicting the sections above.
-            format!("priority: {}", scheduling_priority(record.tier)).dimmed()
+            // What the graph concluded, with the scheduling tier beside it rather than in
+            // place of it: the tier decides queue order and nothing else.
+            match classified_as(report, record) {
+                Some(category) =>
+                    format!("{category}; queued {}", scheduling_priority(record.tier)),
+                None => format!("queued {}", scheduling_priority(record.tier)),
+            }
+            .dimmed()
         );
         if record.addresses.len() > 1 {
             println!(
