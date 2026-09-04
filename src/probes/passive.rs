@@ -82,6 +82,16 @@ pub enum FrameFact {
         withdrawn: Vec<(IpNet, Vec<u8>)>,
     },
 
+    /// A datagram on a routing protocol's port that did not survive validation.
+    ///
+    /// Counted so silence can be told apart from noise. "No valid updates observed" means
+    /// something different when nothing arrived on UDP 520 at all than when several
+    /// datagrams arrived and none of them parsed.
+    RoutingUpdateRejected {
+        sender_mac: String,
+        protocol: &'static str,
+    },
+
     /// An IPv6 router advertisement. Sending one is router behaviour by definition.
     RouterAdvertisement {
         router_mac: String,
@@ -297,9 +307,14 @@ fn decode_ipv4(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
     if src_port == 520 || dst_port == 520 {
         let mut source = [0u8; 4];
         source.copy_from_slice(&payload[12..16]);
-        if let Some(fact) = decode_rip_v2(source_mac, Ipv4Addr::from(source), body) {
-            facts.push(fact);
-        }
+        facts.push(
+            decode_rip_v2(source_mac, Ipv4Addr::from(source), body).unwrap_or(
+                FrameFact::RoutingUpdateRejected {
+                    sender_mac: source_mac.to_string(),
+                    protocol: "RIPv2",
+                },
+            ),
+        );
         return;
     }
 
@@ -435,9 +450,14 @@ fn decode_ipv6(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
             return;
         };
         if src_port == 521 || dst_port == 521 {
-            if let Some(fact) = decode_ripng(source_mac, source_address, &udp[8..]) {
-                facts.push(fact);
-            }
+            facts.push(
+                decode_ripng(source_mac, source_address, &udp[8..]).unwrap_or(
+                    FrameFact::RoutingUpdateRejected {
+                        sender_mac: source_mac.to_string(),
+                        protocol: "RIPng",
+                    },
+                ),
+            );
             return;
         }
     }
@@ -1062,7 +1082,14 @@ mod tests {
             0,
         ));
         let frame = udp_v4_frame([0x02, 0, 0, 0, 0, 0x11], [192, 168, 1, 1], 520, &body);
-        assert!(decode_frame(&frame).is_empty());
+        // Counted as a datagram that failed validation, which is not the same as silence.
+        assert!(matches!(
+            decode_frame(&frame).first(),
+            Some(FrameFact::RoutingUpdateRejected {
+                protocol: "RIPv2",
+                ..
+            })
+        ));
     }
 
     #[test]

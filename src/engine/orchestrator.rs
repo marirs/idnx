@@ -93,6 +93,11 @@ pub struct VisibilityReport {
     /// traffic on any link is not discovery evidence, so this second number separates "no
     /// discovery protocols on this link" from "the decoding path is broken".
     pub accepted_facts: Option<u64>,
+    /// What passive routing decoding saw on UDP 520/521.
+    ///
+    /// Reported because RIP silence and RIP never being decoded leave the graph identical,
+    /// and only one of them is a fact about the network.
+    pub routing_updates: Option<String>,
 }
 
 /// Result of a complete discovery run.
@@ -446,6 +451,7 @@ impl DiscoveryEngine {
                 )),
                 observed_frames: None,
                 accepted_facts: None,
+                routing_updates: None,
             },
             oversized_scopes: oversized,
             converged,

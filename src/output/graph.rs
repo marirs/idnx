@@ -553,6 +553,7 @@ mod tests {
                 unavailable: Vec::new(),
                 binding_mode: crate::net::socket::BindingMode::SourceAddress,
                 observed_frames: Some(7),
+                routing_updates: None,
                 accepted_facts: Some(3),
             },
             oversized_scopes: Vec::new(),

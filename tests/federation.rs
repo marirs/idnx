@@ -1261,6 +1261,7 @@ mod cross_realm_leaks {
                 binding_mode: idnx::net::socket::BindingMode::Unbound,
                 observed_frames: None,
                 accepted_facts: None,
+                routing_updates: None,
             },
             oversized_scopes: Vec::new(),
             converged: true,

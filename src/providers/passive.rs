@@ -51,7 +51,66 @@ pub struct PassiveObservation {
     /// topology evidence at all. Reporting both numbers distinguishes "the link carries no
     /// discovery protocols" from "the decoder is broken".
     facts_accepted: AtomicU64,
+    /// What the routing control plane produced, so its silence is reportable.
+    ///
+    /// Nothing else distinguishes "no router advertises RIP on this link" from "RIP was
+    /// never decoded". Both leave the graph identical.
+    rip: RipTally,
     stopped: AtomicBool,
+}
+
+/// Counts of what passive routing decoding saw.
+#[derive(Debug, Default)]
+pub struct RipTally {
+    /// Datagrams on UDP 520 or 521, valid or not.
+    pub datagrams: AtomicU64,
+    /// Datagrams that parsed as a complete, well-formed update.
+    pub updates: AtomicU64,
+    /// Reachable routes across those updates.
+    pub routes: AtomicU64,
+    /// Withdrawals (RIPv2 metric 16), which create no topology.
+    pub withdrawals: AtomicU64,
+}
+
+impl RipTally {
+    fn note(&self, fact: &FrameFact) {
+        match fact {
+            FrameFact::RoutingUpdate {
+                routes, withdrawn, ..
+            } => {
+                self.datagrams.fetch_add(1, Ordering::Relaxed);
+                self.updates.fetch_add(1, Ordering::Relaxed);
+                self.routes
+                    .fetch_add(routes.len() as u64, Ordering::Relaxed);
+                self.withdrawals
+                    .fetch_add(withdrawn.len() as u64, Ordering::Relaxed);
+            }
+            FrameFact::RoutingUpdateRejected { .. } => {
+                self.datagrams.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    /// One line for the coverage report, in the words the evidence supports.
+    pub fn describe(&self) -> String {
+        let datagrams = self.datagrams.load(Ordering::Relaxed);
+        let updates = self.updates.load(Ordering::Relaxed);
+        if datagrams == 0 {
+            return "no valid updates observed (0 datagrams on UDP 520/521)".to_string();
+        }
+        if updates == 0 {
+            return format!(
+                "no valid updates observed ({datagrams} datagram(s) on UDP 520/521, none \
+                 survived validation)"
+            );
+        }
+        format!(
+            "{updates} update(s) from {datagrams} datagram(s): {} route(s), {} withdrawal(s)",
+            self.routes.load(Ordering::Relaxed),
+            self.withdrawals.load(Ordering::Relaxed)
+        )
+    }
 }
 
 impl PassiveObservation {
@@ -81,6 +140,7 @@ impl PassiveObservation {
                 interface: interface.to_string(),
                 final_frames: AtomicU64::new(0),
                 facts_accepted: AtomicU64::new(0),
+                rip: RipTally::default(),
                 stopped: AtomicBool::new(false),
             },
             Err(err) => Self {
@@ -90,6 +150,7 @@ impl PassiveObservation {
                 interface: interface.to_string(),
                 final_frames: AtomicU64::new(0),
                 facts_accepted: AtomicU64::new(0),
+                rip: RipTally::default(),
                 stopped: AtomicBool::new(true),
             },
         }
@@ -138,8 +199,14 @@ impl PassiveObservation {
             interface: interface.to_string(),
             final_frames: AtomicU64::new(0),
             facts_accepted: AtomicU64::new(0),
+            rip: RipTally::default(),
             stopped: AtomicBool::new(true),
         }
+    }
+
+    /// What passive routing decoding saw, so its silence is reportable.
+    pub fn rip_tally(&self) -> &RipTally {
+        &self.rip
     }
 
     /// Stops capture and records the final frame count. Idempotent.
@@ -172,6 +239,11 @@ impl PassiveObservation {
 impl crate::providers::ContinuousSource for PassiveObservation {
     fn drain(&self) -> Vec<TopologyEvidence> {
         let facts = PassiveObservation::drain(self);
+        // Counted before conversion: a rejected datagram produces no evidence and would
+        // otherwise leave no trace at all.
+        for fact in &facts {
+            self.rip.note(fact);
+        }
         let evidence = convert_unscoped(&facts, &self.interface);
         self.facts_accepted
             .fetch_add(evidence.len() as u64, Ordering::Relaxed);
@@ -183,6 +255,9 @@ impl crate::providers::ContinuousSource for PassiveObservation {
         // decoded between the two calls. Both counters are therefore final on return.
         self.stop();
         let facts = PassiveObservation::drain(self);
+        for fact in &facts {
+            self.rip.note(fact);
+        }
         let evidence = convert_unscoped(&facts, &self.interface);
         self.facts_accepted
             .fetch_add(evidence.len() as u64, Ordering::Relaxed);
@@ -371,6 +446,10 @@ fn convert(
             // this vantage observed, and each entry names a prefix outright -- which is why
             // these are among the few sources that can establish a network nobody here is
             // attached to.
+            // Counted by the tally and nothing more: a datagram that failed validation
+            // establishes no device and no network.
+            FrameFact::RoutingUpdateRejected { .. } => {}
+
             FrameFact::RoutingUpdate {
                 sender_mac,
                 sender,
@@ -973,6 +1052,7 @@ mod tests {
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(0),
             facts_accepted: AtomicU64::new(0),
+            rip: RipTally::default(),
             stopped: AtomicBool::new(true),
         };
 
@@ -996,6 +1076,7 @@ mod tests {
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(11),
             facts_accepted: AtomicU64::new(0),
+            rip: RipTally::default(),
             stopped: AtomicBool::new(false),
         };
 
@@ -1021,6 +1102,7 @@ mod tests {
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(0),
             facts_accepted: AtomicU64::new(0),
+            rip: RipTally::default(),
             stopped: AtomicBool::new(false),
         };
 
@@ -1071,6 +1153,7 @@ mod tests {
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(0),
             facts_accepted: AtomicU64::new(0),
+            rip: RipTally::default(),
             stopped: AtomicBool::new(false),
         };
 
@@ -1101,6 +1184,7 @@ mod tests {
             interface: "test0".to_string(),
             final_frames: AtomicU64::new(0),
             facts_accepted: AtomicU64::new(0),
+            rip: RipTally::default(),
             stopped: AtomicBool::new(false),
         };
 

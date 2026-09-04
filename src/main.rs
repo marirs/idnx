@@ -212,11 +212,18 @@ async fn run() {
             .visibility
             .unavailable
             .push(format!("passive capture: {reason}"));
+        // Stated rather than left blank: RIP was not decoded here, which is a fact about
+        // this run and not about the link. Omitting the line would let an absent routing
+        // control plane and an absent decoder look identical.
+        report.visibility.routing_updates = Some(format!(
+            "not decoded: packet capture unavailable ({reason})"
+        ));
     } else {
         // Read only after the engine stopped capture, so both counts are final.
         debug_assert!(observation.is_stopped());
         report.visibility.observed_frames = Some(observation.frames_seen());
         report.visibility.accepted_facts = Some(observation.facts_accepted());
+        report.visibility.routing_updates = Some(observation.rip_tally().describe());
     }
 
     output::topology_view::render(&report, &start);

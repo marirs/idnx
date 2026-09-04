@@ -70,6 +70,17 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
         };
         println!("    {} {}", "Passive capture:".dimmed(), detail.dimmed());
     }
+
+    // The routing control plane gets its own line. A link where no router speaks RIP and a
+    // build where RIP was never decoded produce the same empty graph, and only the first is
+    // a statement about the network.
+    if let Some(routing) = &report.visibility.routing_updates {
+        println!(
+            "    {} {}",
+            "Passive RIPv2/RIPng:".dimmed(),
+            routing.dimmed()
+        );
+    }
 }
 
 /// A network's peer attribution, where it has one.
@@ -201,19 +212,31 @@ fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
 
     // Named from the provider runs, so the list is what actually ran rather than what the
     // build happens to contain.
-    let mut asked: Vec<&str> = report
+    let asked: Vec<&str> = report
         .scope_runs
         .iter()
         .flat_map(|scope| scope.runs.iter())
         .filter(|run| {
             matches!(
                 run.provider,
-                "dhcp-inform" | "passive-capture" | "snmp" | "kernel-routes" | "egress-path"
+                "dhcp-inform" | "snmp" | "kernel-routes" | "egress-path"
             )
         })
         .map(|run| run.provider)
         .collect();
-    asked.sort_unstable();
+    let mut asked: Vec<String> = asked.iter().map(|name| name.to_string()).collect();
+    // Passive routing decoding is a continuous source rather than a provider run, so it
+    // does not appear in the scope runs; leaving it out of this list would understate what
+    // was asked.
+    if report
+        .visibility
+        .routing_updates
+        .as_ref()
+        .is_some_and(|state| !state.starts_with("not decoded"))
+    {
+        asked.push("passive RIPv2/RIPng".to_string());
+    }
+    asked.sort();
     asked.dedup();
     if asked.is_empty() {
         return;

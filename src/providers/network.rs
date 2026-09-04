@@ -909,6 +909,32 @@ impl DiscoveryProvider for RouterDiscoveryProvider {
             let mut out = Vec::new();
 
             if let Some(advertisements) = outcome.result() {
+                for advertisement in &advertisements {
+                    // What the advertisement contained, counted by class. An RA with no
+                    // options at all and one carrying prefixes are both "answered", and
+                    // only the enumeration says which happened.
+                    notes.push(format!(
+                        "router-discovery answered from {}:",
+                        advertisement.router
+                    ));
+                    notes.push(format!(
+                        "  PIO on-link: {}",
+                        advertisement.on_link_prefixes().count()
+                    ));
+                    notes.push(format!(
+                        "  PIO address-formation only: {}",
+                        advertisement
+                            .prefixes
+                            .iter()
+                            .filter(|prefix| !prefix.on_link)
+                            .count()
+                    ));
+                    notes.push(format!(
+                        "  RIO routes: {}",
+                        advertisement.usable_routes().count()
+                    ));
+                }
+
                 for advertisement in advertisements {
                     // The router is keyed by its link-layer address when it disclosed one,
                     // and by its link-local address otherwise -- scoped to this vantage,
@@ -972,10 +998,6 @@ impl DiscoveryProvider for RouterDiscoveryProvider {
                             Confidence::Advertised,
                             vantage,
                         ));
-                        notes.push(format!(
-                            "{} advertises {network} on-link (valid {}s)",
-                            advertisement.router, prefix.valid_lifetime
-                        ));
                     }
 
                     // A prefix reachable through this router: the disclosure that extends
@@ -1005,11 +1027,6 @@ impl DiscoveryProvider for RouterDiscoveryProvider {
                                 route.lifetime
                             )),
                         );
-                        notes.push(format!(
-                            "{} advertises a route to {network} ({} preference)",
-                            advertisement.router,
-                            route.preference.label()
-                        ));
                     }
 
                     if advertisement.router_lifetime > 0 {
@@ -1097,6 +1114,58 @@ impl DiscoveryProvider for DhcpInformProvider {
 
             if let Some(disclosures) = outcome.result() {
                 for disclosure in disclosures {
+                    // Every option that was asked for, present or absent. "Answered" says
+                    // nothing about what the answer contained, and an absent option 121 is
+                    // exactly as much of a finding as a present one -- it is why no prefix
+                    // beyond this link was disclosed.
+                    notes.push(format!("dhcp-inform answered from {}:", disclosure.server));
+                    notes.push(format!(
+                        "  option 1: {}",
+                        disclosure
+                            .subnet_mask
+                            .map(|mask| mask.to_string())
+                            .unwrap_or_else(|| "absent".to_string())
+                    ));
+                    notes.push(format!(
+                        "  option 3: {}",
+                        if disclosure.routers.is_empty() {
+                            "absent".to_string()
+                        } else {
+                            disclosure
+                                .routers
+                                .iter()
+                                .map(|router| router.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    ));
+                    for option in [121u8, 249] {
+                        let named: Vec<String> = disclosure
+                            .classless_routes
+                            .iter()
+                            .filter(|route| route.option == option)
+                            .map(|route| {
+                                format!(
+                                    "{} via {}",
+                                    route.prefix,
+                                    if route.next_hop.is_unspecified() {
+                                        "this link".to_string()
+                                    } else {
+                                        route.next_hop.to_string()
+                                    }
+                                )
+                            })
+                            .collect();
+                        notes.push(format!(
+                            "  option {option}: {}",
+                            if named.is_empty() {
+                                "absent".to_string()
+                            } else {
+                                named.join(", ")
+                            }
+                        ));
+                    }
+
                     let server = DeviceKey::Address(IpAddr::V4(disclosure.server));
                     out.push(TopologyEvidence::new(
                         Fact::DeviceAddress {
@@ -1133,7 +1202,6 @@ impl DiscoveryProvider for DhcpInformProvider {
                             Confidence::Advertised,
                             vantage,
                         ));
-                        notes.push(format!("option 1 gives {vantage} the prefix {network}"));
                     }
 
                     // Option 3: devices that route, and nothing about what is behind them.
@@ -1225,15 +1293,6 @@ impl DiscoveryProvider for DhcpInformProvider {
                                 route.evidence()
                             )),
                         );
-                        notes.push(format!(
-                            "option {} names {network} via {}",
-                            route.option,
-                            if route.next_hop.is_unspecified() {
-                                "this link".to_string()
-                            } else {
-                                route.next_hop.to_string()
-                            }
-                        ));
                     }
                 }
             }
