@@ -432,21 +432,27 @@ fn convert(
                     );
                 }
 
-                // A withdrawal is a statement about a prefix, not a route to it: the sender
-                // is saying it can no longer reach a network that exists.
+                // A withdrawal creates nothing.
+                //
+                // Metric 16 says the sender can no longer reach the prefix. Emitting a
+                // Network for it would put a network into the map on the strength of an
+                // advertisement that it is gone, and a RoutesTo would name a path the
+                // sender has just disowned. The statement is kept against the device that
+                // made it -- it is real evidence about the router's table, and about a
+                // prefix that existed -- and it establishes no current topology.
                 for (prefix, raw) in withdrawn {
-                    out.push(
-                        TopologyEvidence::new(
-                            Fact::Network { prefix: *prefix },
-                            EvidenceSource::Rip,
-                            Confidence::Advertised,
-                            interface,
-                        )
-                        .with_detail(format!(
-                            "{protocol} withdrawal (metric 16), entry {}",
-                            hex(raw)
-                        )),
-                    );
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceDescription {
+                            device: device.clone(),
+                            text: format!(
+                                "withdrew {prefix} in a {protocol} update (metric 16), entry {}",
+                                hex(raw)
+                            ),
+                        },
+                        EvidenceSource::Rip,
+                        Confidence::Observed,
+                        interface,
+                    ));
                 }
             }
 
@@ -800,6 +806,59 @@ mod tests {
             &e.fact,
             Fact::DeviceRoleSignal {
                 signal: RoleSignal::DhcpRouter,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_withdrawal_creates_no_network_and_no_route() {
+        // Metric 16 says the sender can no longer reach the prefix. A Network built from it
+        // would put a network into the map on the strength of an advertisement that it is
+        // gone, and a RoutesTo would name a path the sender has just disowned. The
+        // statement is kept against the device that made it and establishes nothing else.
+        let gone: IpNet = "10.9.0.0/16".parse().unwrap();
+        let evidence = convert(
+            &[FrameFact::RoutingUpdate {
+                sender_mac: "02:00:00:00:00:11".into(),
+                sender: "192.168.1.1".parse().unwrap(),
+                protocol: "RIPv2",
+                routes: Vec::new(),
+                withdrawn: vec![(gone, vec![0x00, 0x02, 0x00, 0x00])],
+            }],
+            "test0",
+            &ctx(),
+        );
+
+        assert!(
+            !evidence
+                .iter()
+                .any(|e| matches!(e.fact, Fact::Network { .. })),
+            "a withdrawn prefix must not become a current network"
+        );
+        assert!(
+            !evidence
+                .iter()
+                .any(|e| matches!(e.fact, Fact::RoutesTo { .. })),
+            "and must not become a route to reach it"
+        );
+
+        // The evidence is retained, against the router that stated it.
+        let described = evidence
+            .iter()
+            .find_map(|e| match &e.fact {
+                Fact::DeviceDescription { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the withdrawal is recorded");
+        assert!(described.contains("withdrew 10.9.0.0/16"), "{described}");
+        assert!(described.contains("metric 16"), "{described}");
+
+        // Advertising a table at all is still observed router behaviour.
+        assert!(evidence.iter().any(|e| matches!(
+            e.fact,
+            Fact::DeviceRoleSignal {
+                signal: RoleSignal::RipRouteAdvertisement,
                 ..
             }
         )));

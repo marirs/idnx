@@ -59,7 +59,7 @@ impl DeviceCategory {
 /// Read from the rendered role signal, which is what a node carries; the typed weights live
 /// on the graph. The signal is only emitted for an interface that answered a TTL-limited
 /// probe, so it is behaviour this run observed rather than anything inferred.
-fn forwards_traffic(node: &Node) -> bool {
+pub fn forwards_traffic(node: &Node) -> bool {
     let observed = crate::topology::evidence::RoleSignal::ObservedForwarding.describe();
     node.role_signals.iter().any(|signal| *signal == observed)
 }

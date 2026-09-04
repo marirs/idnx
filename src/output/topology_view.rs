@@ -219,6 +219,14 @@ fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
         return;
     }
 
+    // Named so the absence is attributable. "No prefix disclosed" is a statement about
+    // what every implemented credential-free mechanism returned, and it is not a statement
+    // that there is nothing beyond this link -- the forwarding boundaries above are still
+    // on the map with their far sides unresolved.
+    let boundaries = report
+        .graph
+        .devices_in(DeviceCategory::ForwardingInterface)
+        .len();
     println!(
         "  {} {}",
         "IPv4 beyond this link:".dimmed(),
@@ -237,6 +245,17 @@ fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
         )
         .dimmed()
     );
+    if boundaries > 0 {
+        println!(
+            "  {} {}",
+            "".dimmed(),
+            format!(
+                "{boundaries} forwarding boundary/boundaries were found; their downstream \
+                 IPv4 prefixes remain unresolved"
+            )
+            .yellow()
+        );
+    }
 }
 
 fn render_infrastructure(graph: &TopologyGraph, vantage: &str) {
@@ -340,6 +359,7 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
     }
 
     // Networks this device serves, with the relationship that established it.
+    let mut serves = 0usize;
     for edge in graph.edges() {
         if edge.from != node.id {
             continue;
@@ -349,6 +369,7 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
             Relationship::GatewayFor | Relationship::RoutesTo
         ) && let NodeId::Network(net, _) = &edge.to
         {
+            serves += 1;
             println!(
                 "  │     └── {} {} [{}]",
                 edge.relationship.label().dimmed(),
@@ -356,6 +377,21 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
                 edge.confidence.label().dimmed()
             );
         }
+    }
+
+    // A boundary whose far side is unknown stays on the map and says so.
+    //
+    // This device forwards -- that is established -- and nothing disclosed a prefix behind
+    // it. Rendering it without this line would let a discovered forwarding boundary read as
+    // a finished branch of the topology, which is the difference between "there is nothing
+    // there" and "nothing told us what is there".
+    if serves == 0 && crate::topology::graph::forwards_traffic(node) {
+        println!(
+            "  │     {}",
+            "downstream prefixes unresolved: no source disclosed a network behind this \
+             interface"
+                .yellow()
+        );
     }
 }
 
