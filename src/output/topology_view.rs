@@ -135,6 +135,8 @@ fn render_networks(report: &DiscoveryReport) {
         }
     }
 
+    render_prefix_disclosure(report, &physical);
+
     // Virtualisation plumbing is shown separately and never as cascaded physical topology.
     if !virtual_nets.is_empty() {
         println!(
@@ -171,6 +173,70 @@ fn render_networks(report: &DiscoveryReport) {
             );
         }
     }
+}
+
+/// Which mechanisms could have disclosed an IPv4 prefix beyond this link, and whether any
+/// did.
+///
+/// An IPv4 network this machine is not attached to can only arrive one way: something told
+/// us about it. DHCP option 121/249, a RIPv2 advertisement, an authenticated read-only
+/// routing source, or another response carrying a prefix outright. When none of them
+/// disclosed anything, the honest report names what was asked rather than leaving an empty
+/// section that reads as "there is nothing there".
+fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
+    let attached: Vec<&NetworkRef> = physical
+        .iter()
+        .filter(|net| {
+            net.prefix.addr().is_ipv4() && !report.graph.interfaces_for_network(net).is_empty()
+        })
+        .collect();
+    let routed = physical.iter().any(|net| {
+        net.prefix.addr().is_ipv4() && report.graph.interfaces_for_network(net).is_empty()
+    });
+    if routed {
+        // Something did disclose a network beyond this link; it is already listed above
+        // with the relationship that established it.
+        return;
+    }
+
+    // Named from the provider runs, so the list is what actually ran rather than what the
+    // build happens to contain.
+    let mut asked: Vec<&str> = report
+        .scope_runs
+        .iter()
+        .flat_map(|scope| scope.runs.iter())
+        .filter(|run| {
+            matches!(
+                run.provider,
+                "dhcp-inform" | "passive-capture" | "snmp" | "kernel-routes" | "egress-path"
+            )
+        })
+        .map(|run| run.provider)
+        .collect();
+    asked.sort_unstable();
+    asked.dedup();
+    if asked.is_empty() {
+        return;
+    }
+
+    println!(
+        "  {} {}",
+        "IPv4 beyond this link:".dimmed(),
+        format!(
+            "no prefix was disclosed by {} (attached: {})",
+            asked.join(", "),
+            if attached.is_empty() {
+                "none".to_string()
+            } else {
+                attached
+                    .iter()
+                    .map(|net| net.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        )
+        .dimmed()
+    );
 }
 
 fn render_infrastructure(graph: &TopologyGraph, vantage: &str) {

@@ -10,7 +10,9 @@
 //! nothing about its prefix. Broadcast traffic isolated behind another router's boundary
 //! never reaches this capture point at all.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use ipnet::{IpNet, Ipv6Net};
 
 /// Ethernet and LLC constants.
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -61,6 +63,23 @@ pub enum FrameFact {
         routers: Vec<Ipv4Addr>,
         /// Option 121 classless static routes, as (destination, prefix length, next hop).
         classless_routes: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
+    },
+
+    /// A routing update heard on the link: RIPv2 on UDP 520, RIPng on UDP 521.
+    ///
+    /// The sender is advertising reachability, which is router behaviour observed rather
+    /// than claimed, and each entry names a prefix outright. Withdrawals are carried too --
+    /// a metric of 16 (RIPv2) says the sender can no longer reach the prefix, which is a
+    /// statement about the network and not a route to record.
+    RoutingUpdate {
+        sender_mac: String,
+        sender: IpAddr,
+        /// "RIPv2" or "RIPng", so the two are never conflated in the evidence trail.
+        protocol: &'static str,
+        /// Reachable prefixes, each with everything the entry stated.
+        routes: Vec<AdvertisedRoute>,
+        /// Prefixes the sender withdrew, with the same entry bytes.
+        withdrawn: Vec<(IpNet, Vec<u8>)>,
     },
 
     /// An IPv6 router advertisement. Sending one is router behaviour by definition.
@@ -271,6 +290,19 @@ fn decode_ipv4(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
         return;
     }
 
+    // RIPv2 responses carry prefixes and masks outright, which is why they are worth
+    // decoding passively: a router advertising a table names networks nobody here is
+    // attached to. RIPv1 is deliberately not accepted -- it carries no mask, and deriving
+    // one from the address class would be inventing a prefix nobody advertised.
+    if src_port == 520 || dst_port == 520 {
+        let mut source = [0u8; 4];
+        source.copy_from_slice(&payload[12..16]);
+        if let Some(fact) = decode_rip_v2(source_mac, Ipv4Addr::from(source), body) {
+            facts.push(fact);
+        }
+        return;
+    }
+
     // MikroTik neighbour beacons are broadcast on UDP 5678.
     if (src_port == 5678 || dst_port == 5678)
         && let Some(n) = crate::probes::mndp::parse_mndp_packet(body)
@@ -391,13 +423,29 @@ fn decode_ipv6(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
     if payload.len() < 40 {
         return;
     }
+    let mut src = [0u8; 16];
+    src.copy_from_slice(&payload[8..24]);
+    let source_address = Ipv6Addr::from(src);
+
+    // RIPng rides UDP 521. Decoded before the ICMPv6 branch because it is not ICMPv6 at
+    // all, and the next-header check below would discard it.
+    if payload[6] == 17 && payload.len() >= 48 {
+        let udp = &payload[40..];
+        let (Some(src_port), Some(dst_port)) = (read_u16(udp, 0), read_u16(udp, 2)) else {
+            return;
+        };
+        if src_port == 521 || dst_port == 521 {
+            if let Some(fact) = decode_ripng(source_mac, source_address, &udp[8..]) {
+                facts.push(fact);
+            }
+            return;
+        }
+    }
+
     // Only ICMPv6 carries the neighbour and router discovery messages.
     if payload[6] != 58 {
         return;
     }
-    let mut src = [0u8; 16];
-    src.copy_from_slice(&payload[8..24]);
-    let source_address = Ipv6Addr::from(src);
 
     let icmp = &payload[40..];
     if icmp.len() < 4 {
@@ -504,6 +552,120 @@ pub fn decode_ra_prefixes(icmp: &[u8]) -> Vec<(Ipv6Addr, u8)> {
         i += opt_len;
     }
     prefixes
+}
+
+/// One advertised route, with the fields that make it traceable: where to send traffic,
+/// what it cost the advertiser, the tag it carried, and the exact entry bytes.
+pub type AdvertisedRoute = (IpNet, Option<IpAddr>, u32, u16, Vec<u8>);
+
+/// Decodes a RIPv2 response heard on UDP 520.
+///
+/// Reuses the unicast probe's parser, so a table heard passively and a table returned to a
+/// direct request are held to exactly the same standard: version 2 only, a header plus
+/// whole 20-byte entries, a zero reserved field, contiguous masks, and metrics inside
+/// 1..=16. A metric of 16 is an advertisement of unreachability and is kept apart from the
+/// routes rather than dropped -- withdrawing a prefix says the prefix exists.
+fn decode_rip_v2(source_mac: &str, sender: Ipv4Addr, body: &[u8]) -> Option<FrameFact> {
+    let entries = crate::probes::rip::parse_response(body)?;
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut routes = Vec::new();
+    let mut withdrawn = Vec::new();
+    for entry in entries {
+        if entry.is_reachable() {
+            routes.push((
+                entry.prefix,
+                entry.next_hop,
+                entry.metric,
+                entry.tag,
+                entry.raw_entry,
+            ));
+        } else {
+            withdrawn.push((entry.prefix, entry.raw_entry));
+        }
+    }
+
+    Some(FrameFact::RoutingUpdate {
+        sender_mac: source_mac.to_string(),
+        sender: IpAddr::V4(sender),
+        protocol: "RIPv2",
+        routes,
+        withdrawn,
+    })
+}
+
+/// Decodes a RIPng response heard on UDP 521 (RFC 2080).
+///
+/// Entries are twenty bytes: a 16-byte prefix, a two-byte route tag, a prefix length and a
+/// metric. Two encodings are not routes and are treated as such -- a metric of 255 is a
+/// next-hop entry that applies to the entries following it, and a metric of 16 withdraws
+/// the prefix.
+fn decode_ripng(source_mac: &str, sender: Ipv6Addr, body: &[u8]) -> Option<FrameFact> {
+    const RESPONSE: u8 = 2;
+    const NEXT_HOP_METRIC: u8 = 0xff;
+    const INFINITY: u8 = 16;
+
+    if body.len() < 4 || body[0] != RESPONSE || body[1] != 1 {
+        return None;
+    }
+    // RFC 2080: the two bytes after the version are reserved and must be zero.
+    if body[2] != 0 || body[3] != 0 {
+        return None;
+    }
+    let entries = &body[4..];
+    if entries.is_empty() || !entries.len().is_multiple_of(20) {
+        return None;
+    }
+
+    let mut routes = Vec::new();
+    let mut withdrawn = Vec::new();
+    // A next-hop entry applies to every route table entry that follows it, until another
+    // one replaces it (RFC 2080 §2.1.1).
+    let mut next_hop: Option<IpAddr> = None;
+
+    for entry in entries.as_chunks::<20>().0 {
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(&entry[..16]);
+        let address = Ipv6Addr::from(raw);
+        let tag = u16::from_be_bytes([entry[16], entry[17]]);
+        let prefix_len = entry[18];
+        let metric = entry[19];
+
+        if metric == NEXT_HOP_METRIC {
+            // Not a route: it names where to send traffic for what follows. The tag and
+            // prefix length must be zero for it to be one at all.
+            if tag == 0 && prefix_len == 0 {
+                next_hop = (!address.is_unspecified()).then_some(IpAddr::V6(address));
+            }
+            continue;
+        }
+        if prefix_len > 128 || metric == 0 || metric > INFINITY {
+            continue;
+        }
+        let Ok(prefix) = Ipv6Net::new(address, prefix_len) else {
+            continue;
+        };
+        let prefix = IpNet::V6(prefix.trunc());
+
+        if metric == INFINITY {
+            withdrawn.push((prefix, entry.to_vec()));
+        } else {
+            routes.push((prefix, next_hop, metric as u32, tag, entry.to_vec()));
+        }
+    }
+
+    if routes.is_empty() && withdrawn.is_empty() {
+        return None;
+    }
+    Some(FrameFact::RoutingUpdate {
+        sender_mac: source_mac.to_string(),
+        sender: IpAddr::V6(sender),
+        protocol: "RIPng",
+        routes,
+        withdrawn,
+    })
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -800,6 +962,169 @@ mod tests {
                 assert_eq!(*router_address, Some(src));
             }
             other => panic!("expected an RA, got {:?}", other),
+        }
+    }
+
+    /// A RIPv2 response entry: AFI, tag, address, mask, next hop, metric.
+    fn rip_entry(
+        address: [u8; 4],
+        mask: [u8; 4],
+        next_hop: [u8; 4],
+        metric: u32,
+        tag: u16,
+    ) -> Vec<u8> {
+        let mut entry = vec![0, 2];
+        entry.extend_from_slice(&tag.to_be_bytes());
+        entry.extend_from_slice(&address);
+        entry.extend_from_slice(&mask);
+        entry.extend_from_slice(&next_hop);
+        entry.extend_from_slice(&metric.to_be_bytes());
+        entry
+    }
+
+    /// Wraps a UDP payload in IPv4 and Ethernet headers.
+    fn udp_v4_frame(src_mac: [u8; 6], src_ip: [u8; 4], port: u16, body: &[u8]) -> Vec<u8> {
+        let mut ip = vec![0x45, 0, 0, 0];
+        ip.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+        ip.extend_from_slice(&src_ip);
+        ip.extend_from_slice(&[224, 0, 0, 9]); // the RIPv2 multicast group
+        let mut udp = Vec::new();
+        udp.extend_from_slice(&port.to_be_bytes());
+        udp.extend_from_slice(&port.to_be_bytes());
+        udp.extend_from_slice(&((body.len() + 8) as u16).to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(body);
+        ip.extend_from_slice(&udp);
+
+        let mut frame = eth([0x01, 0, 0x5e, 0, 0, 9], src_mac, ETHERTYPE_IPV4);
+        frame.extend_from_slice(&ip);
+        frame
+    }
+
+    #[test]
+    fn a_ripv2_response_on_the_wire_names_prefixes_and_their_withdrawals() {
+        // The reason this is worth decoding passively: a router advertising its table names
+        // networks nobody here is attached to, and it does so unprompted.
+        let mut body = vec![2, 2, 0, 0]; // response, version 2, reserved
+        body.extend_from_slice(&rip_entry(
+            [192, 168, 51, 0],
+            [255, 255, 255, 0],
+            [0, 0, 0, 0],
+            2,
+            7,
+        ));
+        body.extend_from_slice(&rip_entry(
+            [10, 9, 0, 0],
+            [255, 255, 0, 0],
+            [0, 0, 0, 0],
+            16,
+            0,
+        ));
+
+        let frame = udp_v4_frame([0x02, 0, 0, 0, 0, 0x11], [192, 168, 1, 1], 520, &body);
+        let facts = decode_frame(&frame);
+
+        match facts.first().expect("a routing update") {
+            FrameFact::RoutingUpdate {
+                sender,
+                protocol,
+                routes,
+                withdrawn,
+                ..
+            } => {
+                assert_eq!(*protocol, "RIPv2");
+                assert_eq!(*sender, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].0.to_string(), "192.168.51.0/24");
+                assert_eq!(routes[0].2, 2, "the metric is carried, not flattened");
+                assert_eq!(routes[0].3, 7, "so is the route tag");
+                assert_eq!(routes[0].4.len(), 20, "and the exact entry bytes");
+
+                // Metric 16 withdraws the prefix. It is a statement about a network that
+                // exists, kept apart from the routes rather than dropped.
+                assert_eq!(withdrawn.len(), 1);
+                assert_eq!(withdrawn[0].0.to_string(), "10.9.0.0/16");
+            }
+            other => panic!("expected a routing update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ripv1_message_establishes_nothing() {
+        // Version 1 carries no mask, and deriving one from the address class would be
+        // inventing a prefix nobody advertised.
+        let mut body = vec![2, 1, 0, 0];
+        body.extend_from_slice(&rip_entry(
+            [192, 168, 51, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            2,
+            0,
+        ));
+        let frame = udp_v4_frame([0x02, 0, 0, 0, 0, 0x11], [192, 168, 1, 1], 520, &body);
+        assert!(decode_frame(&frame).is_empty());
+    }
+
+    #[test]
+    fn a_ripng_next_hop_entry_is_not_a_route() {
+        // RFC 2080 §2.1.1: metric 255 marks a next-hop entry that applies to the entries
+        // after it. Reading it as a route would put ::/0 into the graph with a metric of
+        // 255 attached to nothing.
+        let mut body = vec![2, 1, 0, 0];
+        let mut next_hop = Vec::new();
+        next_hop.extend_from_slice(&"fe80::1".parse::<Ipv6Addr>().unwrap().octets());
+        next_hop.extend_from_slice(&[0, 0]); // tag zero
+        next_hop.push(0); // prefix length zero
+        next_hop.push(0xff); // the next-hop metric
+        body.extend_from_slice(&next_hop);
+
+        let mut route = Vec::new();
+        route.extend_from_slice(&"2001:db8:51::".parse::<Ipv6Addr>().unwrap().octets());
+        route.extend_from_slice(&[0, 3]); // tag
+        route.push(48); // prefix length
+        route.push(4); // metric
+        body.extend_from_slice(&route);
+
+        let mut ip = vec![0x60, 0, 0, 0];
+        ip.extend_from_slice(&((body.len() + 8) as u16).to_be_bytes());
+        ip.push(17); // UDP
+        ip.push(255);
+        let src: Ipv6Addr = "fe80::2".parse().unwrap();
+        ip.extend_from_slice(&src.octets());
+        ip.extend_from_slice(&"ff02::9".parse::<Ipv6Addr>().unwrap().octets());
+        ip.extend_from_slice(&521u16.to_be_bytes());
+        ip.extend_from_slice(&521u16.to_be_bytes());
+        ip.extend_from_slice(&((body.len() + 8) as u16).to_be_bytes());
+        ip.extend_from_slice(&[0, 0]);
+        ip.extend_from_slice(&body);
+
+        let mut frame = eth(
+            [0x33, 0x33, 0, 0, 0, 9],
+            [0x02, 0, 0, 0, 0, 0x22],
+            ETHERTYPE_IPV6,
+        );
+        frame.extend_from_slice(&ip);
+
+        match decode_frame(&frame).first().expect("a routing update") {
+            FrameFact::RoutingUpdate {
+                protocol,
+                routes,
+                withdrawn,
+                ..
+            } => {
+                assert_eq!(*protocol, "RIPng");
+                assert!(withdrawn.is_empty());
+                assert_eq!(routes.len(), 1, "the next-hop entry is not itself a route");
+                assert_eq!(routes[0].0.to_string(), "2001:db8:51::/48");
+                assert_eq!(
+                    routes[0].1,
+                    Some(IpAddr::V6("fe80::1".parse().unwrap())),
+                    "it names where the routes after it are reached through"
+                );
+                assert_eq!(routes[0].2, 4);
+                assert_eq!(routes[0].3, 3);
+            }
+            other => panic!("expected a routing update, got {other:?}"),
         }
     }
 

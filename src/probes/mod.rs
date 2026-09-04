@@ -3,6 +3,7 @@ pub mod arp;
 pub mod asus;
 pub mod attempt;
 pub mod cdp;
+pub mod dhcp_inform;
 pub mod dns;
 pub mod http;
 pub mod lldp;

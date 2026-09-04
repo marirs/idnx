@@ -1041,6 +1041,212 @@ impl DiscoveryProvider for RouterDiscoveryProvider {
     }
 }
 
+/// DHCPINFORM: the operator's own description of this link, from the server that holds it.
+///
+/// Runs once for the selected IPv4 vantage. An INFORM asks about the address this client
+/// already has, so it is asked once per link and never per device -- and it claims no lease,
+/// so the server's bookkeeping and this host's configuration are both untouched. Nothing
+/// received is applied.
+///
+/// What each option may establish is the whole point:
+///
+///   * Option 1 (mask) creates exactly one network: this interface's own prefix, from the
+///     mask combined with an address this machine holds.
+///   * Option 3 (routers) creates devices. A router's address says nothing about the
+///     prefixes behind it, and a /24 drawn around one would be invented.
+///   * Options 121 and 249 create routed prefixes and the relationships to reach them,
+///     because they carry prefix lengths and next hops outright.
+pub struct DhcpInformProvider;
+
+impl DiscoveryProvider for DhcpInformProvider {
+    fn name(&self) -> &'static str {
+        "dhcp-inform"
+    }
+
+    fn applies(&self, context: &DiscoveryContext) -> bool {
+        context.target.is_none() && context.scope.is_none()
+    }
+
+    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let vantage = &context.vantage.interface;
+            let Ok(local) = crate::net::interface::get_interface_by_name(vantage) else {
+                return ProviderOutput::not_applicable(format!(
+                    "{vantage} has no IPv4 address, and an INFORM asks about one this client \
+                     already holds"
+                ));
+            };
+            let Some(mac) = crate::net::linklayer::interface_mac(vantage) else {
+                return ProviderOutput::not_applicable(format!(
+                    "{vantage} has no hardware address to identify this client by"
+                ));
+            };
+
+            let outcome = crate::probes::dhcp_inform::ask(
+                vantage,
+                &context.binding,
+                local.ip,
+                mac,
+                context.timeout.max(Duration::from_millis(2000)),
+            )
+            .await;
+
+            let attempted = outcome.transmitted();
+            let mut notes = vec![outcome.describe(self.name())];
+            let mut out = Vec::new();
+
+            if let Some(disclosures) = outcome.result() {
+                for disclosure in disclosures {
+                    let server = DeviceKey::Address(IpAddr::V4(disclosure.server));
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceAddress {
+                            device: server.clone(),
+                            address: IpAddr::V4(disclosure.server),
+                        },
+                        EvidenceSource::DhcpLease,
+                        Confidence::Observed,
+                        vantage,
+                    ));
+
+                    // Option 1, and only for this interface's own address.
+                    if let Some(prefix) = disclosure.attached_prefix(local.ip) {
+                        let network = IpNet::V4(prefix);
+                        out.push(
+                            TopologyEvidence::new(
+                                Fact::Network { prefix: network },
+                                EvidenceSource::DhcpLease,
+                                Confidence::Advertised,
+                                vantage,
+                            )
+                            .with_detail(format!(
+                                "DHCP option 1 mask {} applied to {}",
+                                disclosure.subnet_mask.expect("a prefix came from a mask"),
+                                local.ip
+                            )),
+                        );
+                        out.push(TopologyEvidence::new(
+                            Fact::InterfaceNetwork {
+                                interface: vantage.clone(),
+                                prefix: network,
+                            },
+                            EvidenceSource::DhcpLease,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                        notes.push(format!("option 1 gives {vantage} the prefix {network}"));
+                    }
+
+                    // Option 3: devices that route, and nothing about what is behind them.
+                    let superseded = disclosure.classless_routes_supersede_router_option();
+                    for router in &disclosure.routers {
+                        let device = DeviceKey::Address(IpAddr::V4(*router));
+                        out.push(TopologyEvidence::new(
+                            Fact::DeviceAddress {
+                                device: device.clone(),
+                                address: IpAddr::V4(*router),
+                            },
+                            EvidenceSource::DhcpLease,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                        out.push(
+                            TopologyEvidence::new(
+                                Fact::DeviceRoleSignal {
+                                    device,
+                                    signal: RoleSignal::DhcpRouter,
+                                },
+                                EvidenceSource::DhcpLease,
+                                Confidence::Advertised,
+                                vantage,
+                            )
+                            .with_detail(if superseded {
+                                // RFC 3442 §6: a client receiving both MUST ignore the
+                                // router option, so this router is named but is not the
+                                // effective default.
+                                "named in DHCP option 3, superseded by the classless static \
+                                 routes in option 121/249"
+                                    .to_string()
+                            } else {
+                                "named as a router in DHCP option 3".to_string()
+                            }),
+                        );
+                    }
+                    if superseded {
+                        notes.push(
+                            "option 3 is not the effective default route: RFC 3442 gives the \
+                             classless static routes precedence"
+                                .to_string(),
+                        );
+                    }
+
+                    // Options 121 and 249: prefixes with next hops, stated outright.
+                    for route in &disclosure.classless_routes {
+                        let network = IpNet::V4(route.prefix);
+                        let next_hop = IpAddr::V4(route.next_hop);
+                        // The device the route points at, which is the next hop when there
+                        // is one and the server itself when the destination is on-link.
+                        let via = if route.next_hop.is_unspecified() {
+                            server.clone()
+                        } else {
+                            DeviceKey::Address(next_hop)
+                        };
+
+                        if !route.is_default() {
+                            out.push(
+                                TopologyEvidence::new(
+                                    Fact::Network { prefix: network },
+                                    EvidenceSource::DhcpLease,
+                                    Confidence::Advertised,
+                                    vantage,
+                                )
+                                .with_detail(format!(
+                                    "DHCP option {} entry {}",
+                                    route.option,
+                                    route.evidence()
+                                )),
+                            );
+                        }
+                        out.push(
+                            TopologyEvidence::new(
+                                Fact::RoutesTo {
+                                    device: via,
+                                    network,
+                                    next_hop: (!route.next_hop.is_unspecified())
+                                        .then_some(next_hop),
+                                },
+                                EvidenceSource::DhcpLease,
+                                Confidence::Advertised,
+                                vantage,
+                            )
+                            .with_detail(format!(
+                                "DHCP option {} from {}, entry {}",
+                                route.option,
+                                disclosure.server,
+                                route.evidence()
+                            )),
+                        );
+                        notes.push(format!(
+                            "option {} names {network} via {}",
+                            route.option,
+                            if route.next_hop.is_unspecified() {
+                                "this link".to_string()
+                            } else {
+                                route.next_hop.to_string()
+                            }
+                        ));
+                    }
+                }
+            }
+
+            ProviderOutput {
+                evidence: out,
+                notes,
+                attempted,
+            }
+        })
+    }
+}
+
 /// Active IPv6 liveness confirmation on the attached link.
 ///
 /// There is no IPv6 host sweep and there cannot be one, so the addresses come from what

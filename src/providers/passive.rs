@@ -367,6 +367,89 @@ fn convert(
                 ));
             }
 
+            // A routing update heard on the link. Advertising a table is router behaviour
+            // this vantage observed, and each entry names a prefix outright -- which is why
+            // these are among the few sources that can establish a network nobody here is
+            // attached to.
+            FrameFact::RoutingUpdate {
+                sender_mac,
+                sender,
+                protocol,
+                routes,
+                withdrawn,
+            } => {
+                let device = DeviceKey::mac(sender_mac);
+                out.push(TopologyEvidence::new(
+                    Fact::DeviceAddress {
+                        device: device.clone(),
+                        address: *sender,
+                    },
+                    EvidenceSource::Rip,
+                    Confidence::Observed,
+                    interface,
+                ));
+                out.push(
+                    TopologyEvidence::new(
+                        Fact::DeviceRoleSignal {
+                            device: device.clone(),
+                            signal: RoleSignal::RipRouteAdvertisement,
+                        },
+                        EvidenceSource::Rip,
+                        Confidence::Observed,
+                        interface,
+                    )
+                    .with_detail(format!("advertised a {protocol} table on this link")),
+                );
+
+                for (prefix, next_hop, metric, tag, raw) in routes {
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::Network { prefix: *prefix },
+                            EvidenceSource::Rip,
+                            Confidence::Advertised,
+                            interface,
+                        )
+                        .with_detail(format!("{protocol} entry {}", hex(raw))),
+                    );
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::RoutesTo {
+                                device: device.clone(),
+                                network: *prefix,
+                                // Zero means "via me", which the sender's own address
+                                // already says; carrying it as a next hop would name a
+                                // device that does not exist.
+                                next_hop: next_hop.or(Some(*sender)),
+                            },
+                            EvidenceSource::Rip,
+                            Confidence::Advertised,
+                            interface,
+                        )
+                        .with_detail(format!(
+                            "{protocol} metric {metric}, tag {tag}, entry {}",
+                            hex(raw)
+                        )),
+                    );
+                }
+
+                // A withdrawal is a statement about a prefix, not a route to it: the sender
+                // is saying it can no longer reach a network that exists.
+                for (prefix, raw) in withdrawn {
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::Network { prefix: *prefix },
+                            EvidenceSource::Rip,
+                            Confidence::Advertised,
+                            interface,
+                        )
+                        .with_detail(format!(
+                            "{protocol} withdrawal (metric 16), entry {}",
+                            hex(raw)
+                        )),
+                    );
+                }
+            }
+
             FrameFact::RouterAdvertisement {
                 router_mac,
                 router_address,
@@ -615,6 +698,15 @@ fn in_scope(context: &DiscoveryContext, address: &IpAddr) -> bool {
         Some(scope) => scope.contains(address),
         None => true,
     }
+}
+
+/// Entry bytes as hex, so a prefix can always be traced to the field that stated it.
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]

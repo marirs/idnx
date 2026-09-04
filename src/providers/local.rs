@@ -448,6 +448,9 @@ pub fn local_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         // Seed-time, because a router's disclosures describe this link and may name
         // networks beyond it -- which is what puts new scopes into the traversal.
         Box::new(crate::providers::network::RouterDiscoveryProvider),
+        // The IPv4 counterpart: option 121 is one of the few mechanisms that can name a
+        // prefix this machine is not attached to.
+        Box::new(crate::providers::network::DhcpInformProvider),
     ]
 }
 
