@@ -69,6 +69,12 @@ pub enum FrameFact {
         router_address: Option<Ipv6Addr>,
         /// Prefix Information Options. These are the router's assertions, not observations.
         prefixes: Vec<(Ipv6Addr, u8)>,
+        /// Route Information Options (RFC 4191): prefixes reachable *through* this router.
+        ///
+        /// Carried because they are the only passive evidence that names a network beyond
+        /// this link. Decoded by the same parser the solicited path uses, so an unsolicited
+        /// advertisement discloses exactly as much as a solicited one.
+        routes: Vec<(Ipv6Addr, u8, u32)>,
     },
 
     /// An IPv6 neighbour's address binding, from a neighbour solicitation or advertisement.
@@ -401,11 +407,45 @@ fn decode_ipv6(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
     match icmp[0] {
         // Router Advertisement.
         134 => {
-            let prefixes = decode_ra_prefixes(icmp);
+            let mut destination = [0u8; 16];
+            destination.copy_from_slice(&payload[24..40]);
+            // Hop limit and destination come from the IPv6 header of the captured frame,
+            // which is what lets the shared parser apply the same checks here: hop limit
+            // 255 and a checksum over the real pseudo-header.
+            let parsed = crate::probes::ra::parse_advertisement(
+                icmp,
+                source_address,
+                Ipv6Addr::from(destination),
+                payload[7],
+            );
+
+            let (prefixes, routes) = match &parsed {
+                Some(advertisement) => (
+                    advertisement
+                        .on_link_prefixes()
+                        .map(|prefix| (prefix.prefix.addr(), prefix.prefix.prefix_len()))
+                        .collect(),
+                    advertisement
+                        .usable_routes()
+                        .map(|route| {
+                            (
+                                route.prefix.addr(),
+                                route.prefix.prefix_len(),
+                                route.lifetime,
+                            )
+                        })
+                        .collect(),
+                ),
+                // An advertisement that fails validation is not repaired into a weaker one:
+                // the frame is recorded as router behaviour and discloses no prefix.
+                None => (Vec::new(), Vec::new()),
+            };
+
             facts.push(FrameFact::RouterAdvertisement {
                 router_mac: source_mac.to_string(),
                 router_address: Some(source_address),
                 prefixes,
+                routes,
             });
         }
         // Neighbour Solicitation.

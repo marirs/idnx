@@ -11,6 +11,7 @@ pub mod natpmp;
 pub mod ndp;
 pub mod passive;
 pub mod path;
+pub mod ra;
 pub mod rip;
 pub mod smb;
 pub mod snmp;

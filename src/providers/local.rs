@@ -445,6 +445,9 @@ pub fn local_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         // Runs after the cache read, and deliberately so: it re-asks what the cache
         // remembers, and a validated answer takes the address from a stale entry.
         Box::new(crate::providers::network::NdpLivenessProvider),
+        // Seed-time, because a router's disclosures describe this link and may name
+        // networks beyond it -- which is what puts new scopes into the traversal.
+        Box::new(crate::providers::network::RouterDiscoveryProvider),
     ]
 }
 

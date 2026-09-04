@@ -762,7 +762,9 @@ impl DiscoveryProvider for ArpLivenessProvider {
                 // egress path; nothing on this machine can say whether it was modulated
                 // onto the medium, and a wireless vantage is a reason to read the
                 // observation carefully rather than a reason to stop asking.
-                if context.vantage.kind == crate::providers::VantageKind::Wireless {
+                // Only where something was actually attempted: on an unprivileged run
+                // nothing was sent, and the medium is not the question.
+                if attempted && context.vantage.kind == crate::providers::VantageKind::Wireless {
                     notes.push(
                         "note: this vantage is a wireless station; an observed outbound \
                          request proves it reached the local egress path, and only a capture \
@@ -864,6 +866,178 @@ fn describe_resolution(resolution: &crate::probes::arp::ArpResolution) -> String
         ArpResolution::Skip { reason } => {
             format!("no ARP resolution attempted here: {reason}")
         }
+    }
+}
+
+/// Router discovery: soliciting advertisements and recording what they disclose.
+///
+/// The first provider that can establish a network nobody here is attached to. Everything
+/// before it works outward from addresses this machine already holds, so it can only ever
+/// find the link it is standing on. A Route Information option names a prefix reachable
+/// *through* the router, which is how a cascaded subnet becomes visible without guessing at
+/// one.
+///
+/// Every fact is the router's own claim and is recorded as advertised. What is verified is
+/// that the claim came from a router on this link: hop limit 255, a checksum over the real
+/// pseudo-header, a link-local source, and arrival on the interface we solicited from.
+pub struct RouterDiscoveryProvider;
+
+impl DiscoveryProvider for RouterDiscoveryProvider {
+    fn name(&self) -> &'static str {
+        "router-discovery"
+    }
+
+    fn applies(&self, context: &DiscoveryContext) -> bool {
+        // Link-scoped: the solicitation goes to ff02::2 and describes this link only.
+        context.target.is_none() && context.scope.is_none()
+    }
+
+    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let vantage = &context.vantage.interface;
+            let outcome = crate::probes::ra::solicit(
+                vantage,
+                context.vantage.index,
+                // Routers answer a solicitation quickly, but RFC 4861 lets them delay up to
+                // half a second, and several routers answer independently.
+                context.timeout.max(Duration::from_millis(2000)),
+            )
+            .await;
+
+            let attempted = outcome.transmitted();
+            let mut notes = vec![outcome.describe(self.name())];
+            let mut out = Vec::new();
+
+            if let Some(advertisements) = outcome.result() {
+                for advertisement in advertisements {
+                    // The router is keyed by its link-layer address when it disclosed one,
+                    // and by its link-local address otherwise -- scoped to this vantage,
+                    // since fe80:: addresses name different devices on different links.
+                    let device = match advertisement.mac_text() {
+                        Some(mac) => DeviceKey::mac(&mac),
+                        None => DeviceKey::scoped_address(
+                            IpAddr::V6(advertisement.router),
+                            Some(vantage.as_str()),
+                        ),
+                    };
+
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceAddress {
+                            device: device.clone(),
+                            address: IpAddr::V6(advertisement.router),
+                        },
+                        EvidenceSource::RouterAdvertisement,
+                        Confidence::Observed,
+                        vantage,
+                    ));
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::DeviceRoleSignal {
+                                device: device.clone(),
+                                signal: RoleSignal::RouterAdvertisement,
+                            },
+                            EvidenceSource::RouterAdvertisement,
+                            Confidence::Observed,
+                            vantage,
+                        )
+                        .with_detail("answered a router solicitation"),
+                    );
+
+                    // A prefix the router says is on this link. The L flag is what makes it
+                    // a statement about the link; without it the router is saying only that
+                    // addresses may be formed from the prefix, which attaches nothing.
+                    for prefix in advertisement.on_link_prefixes() {
+                        let network = IpNet::V6(prefix.prefix);
+                        out.push(TopologyEvidence::new(
+                            Fact::Network { prefix: network },
+                            EvidenceSource::RouterAdvertisement,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                        out.push(TopologyEvidence::new(
+                            Fact::InterfaceNetwork {
+                                interface: vantage.clone(),
+                                prefix: network,
+                            },
+                            EvidenceSource::RouterAdvertisement,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                        out.push(TopologyEvidence::new(
+                            Fact::AttachedTo {
+                                device: device.clone(),
+                                network,
+                            },
+                            EvidenceSource::RouterAdvertisement,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                        notes.push(format!(
+                            "{} advertises {network} on-link (valid {}s)",
+                            advertisement.router, prefix.valid_lifetime
+                        ));
+                    }
+
+                    // A prefix reachable through this router: the disclosure that extends
+                    // the map past this link.
+                    for route in advertisement.usable_routes() {
+                        let network = IpNet::V6(route.prefix);
+                        out.push(TopologyEvidence::new(
+                            Fact::Network { prefix: network },
+                            EvidenceSource::RouterAdvertisement,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                        out.push(
+                            TopologyEvidence::new(
+                                Fact::RoutesTo {
+                                    device: device.clone(),
+                                    network,
+                                    next_hop: Some(IpAddr::V6(advertisement.router)),
+                                },
+                                EvidenceSource::RouterAdvertisement,
+                                Confidence::Advertised,
+                                vantage,
+                            )
+                            .with_detail(format!(
+                                "route information option, {} preference, {}s",
+                                route.preference.label(),
+                                route.lifetime
+                            )),
+                        );
+                        notes.push(format!(
+                            "{} advertises a route to {network} ({} preference)",
+                            advertisement.router,
+                            route.preference.label()
+                        ));
+                    }
+
+                    if advertisement.router_lifetime > 0 {
+                        out.push(
+                            TopologyEvidence::new(
+                                Fact::DeviceRoleSignal {
+                                    device,
+                                    signal: RoleSignal::DefaultGateway,
+                                },
+                                EvidenceSource::RouterAdvertisement,
+                                Confidence::Advertised,
+                                vantage,
+                            )
+                            .with_detail(format!(
+                                "offers itself as a default router for {}s",
+                                advertisement.router_lifetime
+                            )),
+                        );
+                    }
+                }
+            }
+
+            ProviderOutput {
+                evidence: out,
+                notes,
+                attempted,
+            }
+        })
     }
 }
 

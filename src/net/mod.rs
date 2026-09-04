@@ -2,6 +2,7 @@ pub mod arp;
 pub mod capture;
 pub mod dns;
 pub mod endpoint;
+pub mod icmpv6;
 pub mod interface;
 pub mod ipv6;
 pub mod link_speed;

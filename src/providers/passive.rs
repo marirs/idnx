@@ -371,6 +371,7 @@ fn convert(
                 router_mac,
                 router_address,
                 prefixes,
+                routes,
             } => {
                 let device = DeviceKey::mac(router_mac);
 
@@ -424,6 +425,38 @@ fn convert(
                         Confidence::Advertised,
                         interface,
                     ));
+                }
+
+                // A Route Information Option names a network reachable through this router
+                // rather than one on this link -- the only passive evidence that extends the
+                // map past the segment we are standing on.
+                for (prefix, len, lifetime) in routes {
+                    let Ok(net) = Ipv6Net::new(*prefix, *len) else {
+                        continue;
+                    };
+                    let network = IpNet::V6(net.trunc());
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::Network { prefix: network },
+                            EvidenceSource::RouterAdvertisement,
+                            Confidence::Advertised,
+                            interface,
+                        )
+                        .with_detail("RA Route Information Option"),
+                    );
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::RoutesTo {
+                                device: device.clone(),
+                                network,
+                                next_hop: router_address.map(IpAddr::V6),
+                            },
+                            EvidenceSource::RouterAdvertisement,
+                            Confidence::Advertised,
+                            interface,
+                        )
+                        .with_detail(format!("route information option, {lifetime}s")),
+                    );
                 }
             }
 
@@ -681,6 +714,52 @@ mod tests {
     }
 
     #[test]
+    fn an_advertised_route_creates_a_network_this_machine_is_not_attached_to() {
+        // The disclosure that extends the map. A Route Information Option names a prefix
+        // reachable *through* the router, which no sweep of the local address space could
+        // ever reach -- and it is the router's claim, so it is recorded as advertised.
+        let beyond: std::net::Ipv6Addr = "2001:db8:51::".parse().unwrap();
+        let evidence = convert(
+            &[FrameFact::RouterAdvertisement {
+                router_mac: "c0:f6:ec:84:b9:0b".into(),
+                router_address: Some("fe80::1".parse().unwrap()),
+                prefixes: Vec::new(),
+                routes: vec![(beyond, 48, 1800)],
+            }],
+            "test0",
+            &ctx(),
+        );
+
+        let network = evidence
+            .iter()
+            .find(|e| matches!(e.fact, Fact::Network { .. }))
+            .expect("the route names a network");
+        assert_eq!(network.confidence, Confidence::Advertised);
+        assert!(matches!(
+            network.fact,
+            Fact::Network { prefix } if prefix.to_string() == "2001:db8:51::/48"
+        ));
+
+        // Reachable through the router, not attached to it: the relationship a route
+        // establishes is not the one a prefix on this link would.
+        let route = evidence
+            .iter()
+            .find(|e| matches!(e.fact, Fact::RoutesTo { .. }))
+            .expect("the router is named as the way there");
+        assert_eq!(route.confidence, Confidence::Advertised);
+        assert!(matches!(
+            &route.fact,
+            Fact::RoutesTo { next_hop, .. } if *next_hop == Some("fe80::1".parse().unwrap())
+        ));
+        assert!(
+            !evidence
+                .iter()
+                .any(|e| matches!(e.fact, Fact::AttachedTo { .. })),
+            "a routed prefix is not one this vantage is attached to"
+        );
+    }
+
+    #[test]
     fn ra_prefix_is_advertised_while_sending_the_ra_is_observed() {
         let prefix: std::net::Ipv6Addr = "2001:db8::".parse().unwrap();
         let evidence = convert(
@@ -688,6 +767,7 @@ mod tests {
                 router_mac: "c0:f6:ec:84:b9:0b".into(),
                 router_address: Some("fe80::1".parse().unwrap()),
                 prefixes: vec![(prefix, 64)],
+                routes: Vec::new(),
             }],
             "test0",
             &ctx(),
