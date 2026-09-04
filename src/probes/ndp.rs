@@ -146,6 +146,34 @@ pub fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, message: &[u8]) 
     !(sum as u16)
 }
 
+/// Whether a message is even a candidate answer to one of `solicited`.
+///
+/// A raw ICMPv6 socket receives everything the protocol carries: router advertisements,
+/// echo replies, other stations' neighbour solicitations, redirects. None of those are
+/// failed answers to this question, and counting them as such would report dozens of
+/// "replies that failed validation" on a link where nothing answered at all.
+///
+/// The arrival interface is part of the test. Neighbour discovery describes one link, and a
+/// message that reached a different interface describes a different one.
+pub fn is_candidate_advertisement(
+    message: &[u8],
+    arrived_on: u32,
+    selected_interface: u32,
+    solicited: &[Ipv6Addr],
+) -> bool {
+    if arrived_on != selected_interface {
+        return false;
+    }
+    if message.len() < 24 || message[0] != NEIGHBOR_ADVERTISEMENT || message[1] != 0 {
+        return false;
+    }
+    let Ok(octets) = <[u8; 16]>::try_from(&message[8..24]) else {
+        return false;
+    };
+    let target = Ipv6Addr::from(octets);
+    solicited.contains(&target)
+}
+
 /// Validates an advertisement as the answer to `query`.
 ///
 /// `hop_limit` and `destination` come from the receiving socket's ancillary data, not from
@@ -231,8 +259,10 @@ pub async fn confirm_liveness(
     budget: Duration,
 ) -> NdpOutcome {
     let link_local = (target.segments()[0] & 0xffc0) == 0xfe80;
+    // Not applicable, not unavailable: the probe works here, this address is not one it
+    // can answer for.
     if !link_local && !on_link.is_some_and(|net| net.contains(&target)) {
-        return AttemptOutcome::unavailable(format!(
+        return AttemptOutcome::not_applicable(format!(
             "{target} is not on this link; neighbour discovery resolves nothing beyond it"
         ));
     }
@@ -259,6 +289,7 @@ pub async fn confirm_liveness(
         }
 
         let deadline = Instant::now() + budget;
+        let solicited = [target];
         let mut rejected = 0usize;
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -266,7 +297,15 @@ pub async fn confirm_liveness(
                 Some(received) => received,
                 None => continue,
             };
-            rejected += 1;
+            // Unrelated ICMPv6 is ignored, not counted as a failed answer.
+            if !is_candidate_advertisement(
+                &received.message,
+                received.interface_index,
+                scope_index,
+                &solicited,
+            ) {
+                continue;
+            }
             if let Some(advertisement) = parse_advertisement(
                 &received.message,
                 received.source,
@@ -279,6 +318,7 @@ pub async fn confirm_liveness(
                     result: advertisement,
                 };
             }
+            rejected += 1;
         }
 
         if rejected > 0 {
@@ -300,12 +340,197 @@ pub async fn confirm_liveness(
     })
 }
 
+/// What one neighbour sweep asked and what answered.
+#[derive(Debug, Clone, Default)]
+pub struct NdpSweep {
+    pub asked: Vec<Ipv6Addr>,
+    pub advertisements: Vec<NdpAdvertisement>,
+}
+
+impl NdpSweep {
+    /// Addresses that were solicited and did not answer within the budget.
+    pub fn unconfirmed(&self) -> Vec<Ipv6Addr> {
+        self.asked
+            .iter()
+            .filter(|address| {
+                !self
+                    .advertisements
+                    .iter()
+                    .any(|found| found.address == **address)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Addresses that more than one station advertised for, with every link-layer address
+    /// that did. Kept rather than resolved, for the same reason as the ARP case.
+    pub fn contested(&self) -> Vec<(Ipv6Addr, Vec<Option<[u8; 6]>>)> {
+        let mut grouped: Vec<(Ipv6Addr, Vec<Option<[u8; 6]>>)> = Vec::new();
+        for found in &self.advertisements {
+            match grouped.iter_mut().find(|(addr, _)| *addr == found.address) {
+                Some((_, macs)) => macs.push(found.mac),
+                None => grouped.push((found.address, vec![found.mac])),
+            }
+        }
+        grouped.retain(|(_, macs)| macs.len() > 1);
+        grouped
+    }
+}
+
+/// The outcome of one neighbour sweep.
+pub type NdpSweepOutcome = AttemptOutcome<NdpSweep>;
+
+/// Solicits every named on-link address over one socket.
+///
+/// Addresses come from the caller -- there is no IPv6 host sweep, and inventing one would
+/// mean enumerating a space that cannot be enumerated. In practice these are the addresses
+/// something already reported, re-asked so the answer is current rather than remembered.
+pub async fn sweep_liveness(
+    interface: &str,
+    scope_index: u32,
+    on_link: Option<Ipv6Net>,
+    targets: Vec<Ipv6Addr>,
+    budget: Duration,
+) -> NdpSweepOutcome {
+    let reachable: Vec<Ipv6Addr> = targets
+        .into_iter()
+        .filter(|address| {
+            let link_local = (address.segments()[0] & 0xffc0) == 0xfe80;
+            link_local || on_link.is_some_and(|net| net.contains(address))
+        })
+        .collect();
+    if reachable.is_empty() {
+        // Not applicable rather than unavailable: neighbour discovery works here, there was
+        // simply nothing on this link to ask about.
+        return AttemptOutcome::not_applicable(
+            "no on-link address to solicit; neighbour discovery resolves nothing beyond the link"
+                .to_string(),
+        );
+    }
+
+    let interface = interface.to_string();
+    tokio::task::spawn_blocking(move || {
+        let sender_mac = match interface_mac(&interface) {
+            Some(mac) => mac,
+            None => {
+                return AttemptOutcome::not_sent(format!(
+                    "{interface} has no hardware address to send from"
+                ));
+            }
+        };
+        let socket = match IcmpV6Socket::open(scope_index) {
+            Ok(socket) => socket,
+            Err(reason) => return AttemptOutcome::unavailable(reason),
+        };
+
+        // Only solicitations that actually left may correlate an advertisement. Validating
+        // against every query built would let an unsolicited announcement confirm an
+        // address this run never asked about.
+        let mut sent_queries: Vec<NdpQuery> = Vec::with_capacity(reachable.len());
+        let mut refused = None;
+        for target in &reachable {
+            let query = NdpQuery {
+                sender_mac,
+                target: *target,
+            };
+            let destination = solicited_node_multicast(query.target);
+            match socket.send_to(&query.solicitation(), destination, scope_index) {
+                Ok(()) => sent_queries.push(query),
+                Err(reason) => {
+                    refused = Some(reason);
+                    break;
+                }
+            }
+        }
+        if sent_queries.is_empty() {
+            return AttemptOutcome::not_sent(
+                refused.unwrap_or_else(|| "no solicitation could be transmitted".to_string()),
+            );
+        }
+        let asked: Vec<Ipv6Addr> = sent_queries.iter().map(|q| q.target).collect();
+
+        let sent = format!(
+            "ICMPv6 neighbour solicitation for {} address(es)",
+            asked.len()
+        );
+        let deadline = Instant::now() + budget;
+        let mut advertisements: Vec<NdpAdvertisement> = Vec::new();
+        let mut rejected = 0usize;
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(received) = socket.recv(remaining) else {
+                continue;
+            };
+            // Router advertisements, echo replies and other stations' solicitations all
+            // arrive on this socket and none of them are failed answers to this question.
+            if !is_candidate_advertisement(
+                &received.message,
+                received.interface_index,
+                scope_index,
+                &asked,
+            ) {
+                continue;
+            }
+
+            let matched = sent_queries.iter().find_map(|query| {
+                parse_advertisement(
+                    &received.message,
+                    received.source,
+                    received.destination,
+                    received.hop_limit,
+                    query,
+                )
+            });
+            match matched {
+                Some(found) => {
+                    // Deduplicated by (address, link-layer address). Collapsing on the
+                    // address alone discarded a second station advertising for it, which is
+                    // the conflict worth reporting rather than resolving.
+                    if !advertisements
+                        .iter()
+                        .any(|seen| seen.address == found.address && seen.mac == found.mac)
+                    {
+                        advertisements.push(found);
+                    }
+                }
+                None => rejected += 1,
+            }
+        }
+
+        if !advertisements.is_empty() {
+            return AttemptOutcome::Answered {
+                sent,
+                result: NdpSweep {
+                    asked,
+                    advertisements,
+                },
+            };
+        }
+        if rejected > 0 {
+            return AttemptOutcome::InvalidResponse { sent, rejected };
+        }
+        AttemptOutcome::NoResponse { sent }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        AttemptOutcome::not_sent(format!(
+            "the neighbour sweep task did not complete: {error}"
+        ))
+    })
+}
+
 /// One ICMPv6 message with the header facts the kernel reports alongside it.
 struct ReceivedMessage {
     message: Vec<u8>,
     source: Ipv6Addr,
     destination: Ipv6Addr,
     hop_limit: u8,
+    /// Interface the message arrived on, from `IPV6_PKTINFO`.
+    ///
+    /// A raw ICMPv6 socket is not bound to one link, so this is the only thing that says
+    /// the answer describes the link we asked on.
+    interface_index: u32,
 }
 
 /// A raw ICMPv6 socket pinned to one interface.
@@ -313,12 +538,16 @@ struct IcmpV6Socket {
     fd: libc::c_int,
 }
 
+#[cfg(unix)]
 impl Drop for IcmpV6Socket {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
     }
 }
 
+/// Unix only: a raw ICMPv6 socket is not reachable on Windows without a driver, and the
+/// non-unix `open` below refuses rather than letting a caller believe it listened.
+#[cfg(unix)]
 impl IcmpV6Socket {
     /// Opens the socket and asks the kernel for the two header fields validation needs.
     fn open(scope_index: u32) -> Result<Self, String> {
@@ -437,6 +666,7 @@ impl IcmpV6Socket {
 
         let mut hop_limit = None;
         let mut destination = None;
+        let mut arrived_on = None;
         let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&header) };
         while !cmsg.is_null() {
             let entry = unsafe { &*cmsg };
@@ -449,6 +679,7 @@ impl IcmpV6Socket {
                     let info =
                         unsafe { std::ptr::read_unaligned(data as *const libc::in6_pktinfo) };
                     destination = Some(Ipv6Addr::from(info.ipi6_addr.s6_addr));
+                    arrived_on = Some(info.ipi6_ifindex);
                 }
             }
             cmsg = unsafe { libc::CMSG_NXTHDR(&header, cmsg) };
@@ -461,7 +692,24 @@ impl IcmpV6Socket {
             source: Ipv6Addr::from(from.sin6_addr.s6_addr),
             destination: destination?,
             hop_limit: hop_limit?,
+            interface_index: arrived_on?,
         })
+    }
+}
+
+/// The same surface where raw ICMPv6 cannot be opened at all.
+#[cfg(not(unix))]
+impl IcmpV6Socket {
+    fn open(_scope_index: u32) -> Result<Self, String> {
+        Err("raw ICMPv6 access is not implemented on this platform".to_string())
+    }
+
+    fn send_to(&self, _message: &[u8], _destination: Ipv6Addr, _scope: u32) -> Result<(), String> {
+        Err("raw ICMPv6 access is not implemented on this platform".to_string())
+    }
+
+    fn recv(&self, _limit: Duration) -> Option<ReceivedMessage> {
+        None
     }
 }
 
@@ -602,6 +850,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_sweep_separates_what_was_solicited_from_what_answered() {
+        let sweep = NdpSweep {
+            asked: vec![TARGET, US],
+            advertisements: vec![NdpAdvertisement {
+                address: US,
+                from: US,
+                mac: None,
+                router: false,
+                raw: Vec::new(),
+            }],
+        };
+        assert_eq!(sweep.unconfirmed(), vec![TARGET]);
+    }
+
+    /// Live check of the whole privileged path: socket options, solicitation, and an
+    /// advertisement that passes hop-limit, checksum, target and solicited-flag validation.
+    /// Ignored by default because it needs root and a real neighbour.
+    #[tokio::test]
+    #[ignore = "needs root and a live on-link IPv6 neighbour"]
+    // Resolving the interface index goes through libc, which is unix-only here; the probe
+    // itself refuses on other platforms anyway.
+    #[cfg(unix)]
+    async fn ndp_probe_live() {
+        let interface = std::env::var("IDNX_NDP_INTERFACE").expect("IDNX_NDP_INTERFACE");
+        let target: Ipv6Addr = std::env::var("IDNX_NDP_TARGET")
+            .expect("IDNX_NDP_TARGET")
+            .parse()
+            .expect("an IPv6 address");
+        let scope = std::ffi::CString::new(interface.clone()).expect("an interface name");
+        let index = unsafe { libc::if_nametoindex(scope.as_ptr()) };
+        assert_ne!(index, 0, "{interface} has no kernel index");
+
+        let outcome =
+            confirm_liveness(&interface, index, None, target, Duration::from_millis(2000)).await;
+        println!("{}", outcome.describe("ndp"));
+        match outcome {
+            AttemptOutcome::Answered { result, .. } => {
+                assert_eq!(result.address, target);
+                println!(
+                    "{} is at {} (router={})",
+                    result.address,
+                    result.mac_text().unwrap_or_else(|| "unstated".to_string()),
+                    result.router
+                );
+            }
+            other => panic!("no validated advertisement: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_with_nothing_on_the_link_to_solicit_sends_nothing() {
+        let outcome = sweep_liveness(
+            "en0",
+            1,
+            Some("2001:db8::/64".parse().unwrap()),
+            vec!["2001:db8:1::5".parse().unwrap()],
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(outcome, AttemptOutcome::NotApplicable { .. }));
+        assert!(!outcome.transmitted());
+    }
+
     #[tokio::test]
     async fn an_address_off_the_link_is_refused_instead_of_solicited() {
         let outcome = confirm_liveness(
@@ -612,7 +924,7 @@ mod tests {
             Duration::from_millis(10),
         )
         .await;
-        assert!(matches!(outcome, AttemptOutcome::Unavailable { .. }));
+        assert!(matches!(outcome, AttemptOutcome::NotApplicable { .. }));
         assert!(!outcome.transmitted());
     }
 }

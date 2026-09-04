@@ -442,6 +442,9 @@ pub fn local_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         Box::new(KernelRouteProvider),
         Box::new(DhcpLeaseProvider),
         Box::new(NeighborCacheProvider),
+        // Runs after the cache read, and deliberately so: it re-asks what the cache
+        // remembers, and a validated answer takes the address from a stale entry.
+        Box::new(crate::providers::network::NdpLivenessProvider),
     ]
 }
 

@@ -53,11 +53,24 @@ pub struct ProviderOutput {
 }
 
 impl ProviderOutput {
-    /// Nothing was attempted, for the stated reason.
+    /// Nothing was attempted because the provider could not run here.
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             evidence: Vec::new(),
-            notes: vec![reason.into()],
+            notes: vec![format!("unavailable: {}", reason.into())],
+            attempted: false,
+        }
+    }
+
+    /// Nothing was attempted because there was nothing here to ask.
+    ///
+    /// Kept apart from `unavailable`, which says the provider cannot run on this machine.
+    /// "No cached IPv6 neighbour to solicit" is a statement about the link and must not be
+    /// rendered as neighbour discovery being unusable.
+    pub fn not_applicable(reason: impl Into<String>) -> Self {
+        Self {
+            evidence: Vec::new(),
+            notes: vec![format!("not applicable: {}", reason.into())],
             attempted: false,
         }
     }

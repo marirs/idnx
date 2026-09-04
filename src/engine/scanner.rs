@@ -378,6 +378,9 @@ pub async fn scan_subnet(
         timeout_duration,
         progress_bar,
         true,
+        // This entry point has no vantage to check raw access against, so it keeps the
+        // indirect provocation. It is not on the engine's path.
+        true,
     )
     .await
 }
@@ -392,13 +395,22 @@ pub async fn scan_subnet_ext(
     timeout_duration: Duration,
     progress_bar: Option<ProgressBar>,
     enable_ipv6: bool,
+    provoke_kernel_arp: bool,
 ) -> ScanSummary {
     let start_time = Instant::now();
     let hosts: Vec<Ipv4Addr> = cidr.hosts().collect();
     let total_hosts = hosts.len();
 
-    // 1. Trigger kernel-level ARP broadcast sweep for local subnets
-    trigger_kernel_arp_sweep(cidr, channel).await;
+    // 1. Populate the neighbour table, unless a validated raw ARP sweep already asked.
+    //
+    // This trick -- sending UDP datagrams to every address so the kernel broadcasts ARP on
+    // our behalf -- resolves the same addresses the raw sweep does, and all it can report
+    // afterwards is what the cache remembers. Running both doubles the broadcast traffic
+    // and yields two accounts of one link. The caller decides which runs; when raw access
+    // is available this is skipped, and the fallback is labelled where it is chosen.
+    if provoke_kernel_arp {
+        trigger_kernel_arp_sweep(cidr, channel).await;
+    }
 
     // 2. Read system ARP table to find all live L2 devices
     let arp_entries = read_system_arp_table(interface_filter);

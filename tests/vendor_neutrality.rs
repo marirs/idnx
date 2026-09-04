@@ -279,7 +279,14 @@ fn an_ipv6_only_neighbour_is_queued_with_a_reachable_endpoint() {
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].endpoints.len(), 1);
     assert_eq!(queue[0].endpoints[0].to_string(), "fd00:1234::aa");
-    assert!(queue[0].confirmed_live, "an NDP entry proves liveness");
+    assert!(
+        queue[0].worth_full_interrogation,
+        "an NDP cache entry is reason enough to interrogate the device"
+    );
+    assert!(
+        !idnx::engine::enrich::currently_live(EvidenceSource::NdpCache),
+        "a cache entry records what was learned once, so it cannot claim the host is live now"
+    );
 }
 
 /// Open ports alone must not create a DNS, management or router capability.

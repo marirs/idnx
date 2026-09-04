@@ -100,6 +100,18 @@ fn link_address(addr: *const libc::sockaddr) -> Option<[u8; 6]> {
     Some(mac)
 }
 
+/// Whether raw link-layer access is available here, and why not when it is not.
+///
+/// Exists so that exactly one ARP sweep runs per network. The validated raw sweep and the
+/// scanner's indirect trick of sending UDP datagrams to provoke the kernel's own ARP both
+/// resolve the same addresses; running both doubles the broadcast traffic and produces two
+/// accounts of the same link, one of which is only a cache read. This predicate decides
+/// which one runs, and it answers by opening a channel rather than by guessing from the
+/// platform or the effective uid.
+pub fn raw_link_status(interface: &str) -> Result<(), String> {
+    LinkChannel::open(interface).map(|_| ())
+}
+
 /// A raw link-layer channel pinned to one interface.
 ///
 /// Pinned deliberately: an ARP request that leaves through a different link resolves a
@@ -114,6 +126,7 @@ pub struct LinkChannel {
     bpf_framing: bool,
 }
 
+#[cfg(unix)]
 impl Drop for LinkChannel {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
@@ -266,7 +279,13 @@ impl LinkChannel {
 
         Ok(channel)
     }
+}
 
+/// The parts that touch file descriptors. Unix only, because raw link-layer access is:
+/// there is no equivalent on Windows without a third-party driver, and pretending otherwise
+/// would mean a probe that reports silence it never listened for.
+#[cfg(unix)]
+impl LinkChannel {
     /// Transmits one complete frame, link header included.
     pub fn send(&self, frame: &[u8]) -> Result<(), String> {
         let written =
@@ -385,6 +404,29 @@ impl LinkChannel {
         }
 
         frames
+    }
+}
+
+/// The same surface where raw frames cannot be reached at all.
+///
+/// `open` already refuses on these platforms, so nothing here can be called with a live
+/// channel; the bodies exist so the rest of the crate compiles unchanged and so that no
+/// caller silently loses the honest failure.
+#[cfg(not(unix))]
+impl LinkChannel {
+    pub fn send(&self, _frame: &[u8]) -> Result<(), String> {
+        Err("raw link-layer access is not implemented on this platform".to_string())
+    }
+
+    pub fn read_until<T>(
+        &self,
+        _deadline: Instant,
+        _accept: impl FnMut(&[u8]) -> Option<T>,
+    ) -> ReadResult<T> {
+        ReadResult {
+            found: None,
+            frames_seen: 0,
+        }
     }
 }
 

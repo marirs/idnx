@@ -598,11 +598,30 @@ mod tests {
         );
 
         // A provider's own account displaces both, verbatim.
-        let stated = ProviderOutput::unavailable("broadcast:asus unavailable: framing unverified");
+        let stated = ProviderOutput {
+            notes: vec!["broadcast:asus unavailable: framing unverified".to_string()],
+            ..Default::default()
+        };
         assert_eq!(
             run_note(&stated, "no response").as_deref(),
             Some("broadcast:asus unavailable: framing unverified")
         );
+
+        // "Cannot run here" and "nothing here to ask" stay distinguishable, and neither is
+        // reported as the network having been asked.
+        let cannot = ProviderOutput::unavailable("raw ICMPv6 needs root");
+        assert_eq!(
+            run_note(&cannot, "no response").as_deref(),
+            Some("unavailable: raw ICMPv6 needs root")
+        );
+        assert!(!cannot.attempted);
+
+        let nothing_to_ask = ProviderOutput::not_applicable("no IPv6 neighbour on this link");
+        assert_eq!(
+            run_note(&nothing_to_ask, "no response").as_deref(),
+            Some("not applicable: no IPv6 neighbour on this link")
+        );
+        assert!(!nothing_to_ask.attempted);
     }
 
     /// A continuous source that yields evidence only at the very end, standing in for a

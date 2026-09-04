@@ -14,6 +14,13 @@
 pub enum AttemptOutcome<T> {
     /// Nothing was sent: the protocol, platform support or privilege is missing.
     Unavailable { reason: String },
+    /// Nothing to ask. The probe works here; there was no candidate for it.
+    ///
+    /// Distinct from `Unavailable` because they mean opposite things to an operator. "No
+    /// cached IPv6 neighbour to solicit" reports on this link; "raw ICMPv6 needs root"
+    /// reports on this machine, and rendering the first as the second says neighbour
+    /// discovery is unusable when it is merely unused.
+    NotApplicable { reason: String },
     /// Transmission failed locally: no socket, no binding, no packet on the wire.
     NotSent { reason: String },
     /// A verified request went out and nothing came back.
@@ -33,6 +40,12 @@ impl<T> AttemptOutcome<T> {
 
     pub fn not_sent(reason: impl Into<String>) -> Self {
         AttemptOutcome::NotSent {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn not_applicable(reason: impl Into<String>) -> Self {
+        AttemptOutcome::NotApplicable {
             reason: reason.into(),
         }
     }
@@ -64,6 +77,9 @@ impl<T> AttemptOutcome<T> {
     pub fn describe(&self, probe: &str) -> String {
         match self {
             AttemptOutcome::Unavailable { reason } => format!("{probe} unavailable: {reason}"),
+            AttemptOutcome::NotApplicable { reason } => {
+                format!("{probe} not applicable: {reason}")
+            }
             AttemptOutcome::NotSent { reason } => format!("{probe} not sent: {reason}"),
             AttemptOutcome::NoResponse { sent } => format!("{probe} no response ({sent})"),
             AttemptOutcome::InvalidResponse { sent, rejected } => {
@@ -83,6 +99,7 @@ mod tests {
         let sent = "UDP 9999".to_string();
         let cases: Vec<AttemptOutcome<u8>> = vec![
             AttemptOutcome::unavailable("framing unverified"),
+            AttemptOutcome::not_applicable("no candidate on this link"),
             AttemptOutcome::not_sent("no IPv4 source address"),
             AttemptOutcome::NoResponse { sent: sent.clone() },
             AttemptOutcome::InvalidResponse {
@@ -99,15 +116,16 @@ mod tests {
             }
         }
         assert!(described[0].contains("unavailable"));
-        assert!(described[1].contains("not sent"));
-        assert!(described[2].contains("no response"));
-        assert!(described[3].contains("failed validation"));
-        assert!(described[4].contains("answered"));
+        assert!(described[1].contains("not applicable"));
+        assert!(described[2].contains("not sent"));
+        assert!(described[3].contains("no response"));
+        assert!(described[4].contains("failed validation"));
+        assert!(described[5].contains("answered"));
 
-        // Only the two states that put a request on the wire may be read as the network
-        // having been asked.
+        // Only the states that put a request on the wire may be read as the network having
+        // been asked. "Nothing to ask" and "cannot ask here" are not silence.
         let transmitted: Vec<bool> = cases.iter().map(|c| c.transmitted()).collect();
-        assert_eq!(transmitted, vec![false, false, true, true, true]);
+        assert_eq!(transmitted, vec![false, false, false, true, true, true]);
 
         for case in cases {
             let answered = matches!(case, AttemptOutcome::Answered { .. });

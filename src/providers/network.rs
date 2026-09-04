@@ -548,12 +548,25 @@ impl DiscoveryProvider for HostEnrichmentProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(crate::providers::attempted(async move {
+        Box::pin(async move {
             let mut out = Vec::new();
             let Some(IpNet::V4(scope)) = context.scope else {
-                return out;
+                return ProviderOutput::default();
             };
             let vantage = &context.vantage.interface;
+
+            // Exactly one ARP sweep per network. Where raw access exists, arp-liveness has
+            // already asked and validated the answers, so provoking the kernel to ask the
+            // same addresses again would only double the broadcast traffic and add a cache
+            // read on top of a set of confirmed replies.
+            let raw = crate::net::linklayer::raw_link_status(vantage);
+            let mut notes = vec![match &raw {
+                Ok(()) => "ARP resolution left to arp-liveness (validated raw sweep)".to_string(),
+                Err(reason) => format!(
+                    "fallback: kernel-triggered ARP provocation, and its results are cache \
+                     reads rather than fresh confirmations ({reason})"
+                ),
+            }];
 
             let summary = crate::engine::scanner::scan_subnet_ext(
                 scope,
@@ -563,8 +576,10 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                 context.timeout,
                 None,
                 true,
+                raw.is_err(),
             )
             .await;
+            let summary_hosts = summary.active_hosts.len();
 
             for host in summary.active_hosts {
                 // Prefer the MAC as identity so a host merges with whatever the neighbour
@@ -654,8 +669,288 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                 // combination promoted ordinary hosts on the strength of two open ports.
             }
 
-            out
-        }))
+            notes.push(format!("{} host(s) answered something", summary_hosts));
+            ProviderOutput {
+                evidence: out,
+                notes,
+                attempted: true,
+            }
+        })
+    }
+}
+
+/// Active liveness confirmation on the attached link.
+///
+/// Everything else that establishes a device is either a memory (the kernel's neighbour
+/// cache, which keeps entries long after the host is gone) or a side effect of some other
+/// probe. This asks the question directly and validates the answer against it, which is the
+/// only way to say a station was answering at the moment it was asked.
+///
+/// It runs only for the prefix this interface is actually attached to. ARP resolves nothing
+/// beyond the link, and broadcasting for an off-link address would record whichever router
+/// proxied as that address's own hardware identity.
+pub struct ArpLivenessProvider {
+    pub max_enumerable_hosts: usize,
+}
+
+impl Default for ArpLivenessProvider {
+    fn default() -> Self {
+        Self {
+            max_enumerable_hosts: crate::engine::orchestrator::Budget::default()
+                .max_enumerable_hosts,
+        }
+    }
+}
+
+impl DiscoveryProvider for ArpLivenessProvider {
+    fn name(&self) -> &'static str {
+        "arp-liveness"
+    }
+
+    fn applies(&self, context: &DiscoveryContext) -> bool {
+        context.target.is_none()
+            && context.scope.is_some_and(|scope| {
+                matches!(scope, IpNet::V4(_))
+                    && crate::engine::orchestrator::enumerable_host_count(&scope)
+                        <= self.max_enumerable_hosts
+            })
+    }
+
+    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let Some(IpNet::V4(scope)) = context.scope else {
+                return ProviderOutput::default();
+            };
+            let vantage = &context.vantage.interface;
+
+            // The interface's own address is both the sender field and the proof that this
+            // prefix is on-link. Without it there is nothing to put in the request.
+            let attached = match crate::net::interface::get_interface_by_name(vantage) {
+                Ok(local) if local.cidr == scope.trunc() => local,
+                Ok(local) => {
+                    return ProviderOutput::not_applicable(format!(
+                        "{scope} is not the prefix {vantage} is attached to ({}); ARP resolves \
+                         nothing beyond the link",
+                        local.cidr
+                    ));
+                }
+                Err(reason) => {
+                    return ProviderOutput::unavailable(format!(
+                        "{vantage} has no IPv4 address to ask from: {reason}"
+                    ));
+                }
+            };
+
+            let targets: Vec<std::net::Ipv4Addr> = scope.hosts().collect();
+            let outcome = crate::probes::arp::sweep_liveness(
+                vantage,
+                scope.trunc(),
+                attached.ip,
+                targets,
+                context.timeout.max(Duration::from_millis(1500)),
+            )
+            .await;
+
+            let attempted = outcome.transmitted();
+            let mut notes = vec![outcome.describe(self.name())];
+            let mut out = Vec::new();
+
+            if let Some(sweep) = outcome.result() {
+                notes.push(format!(
+                    "{} reply/replies from {} asked; the other {} are not confirmed, which is \
+                     not the same as absent",
+                    sweep.replies.len(),
+                    sweep.asked.len(),
+                    sweep.unconfirmed().len()
+                ));
+                for (address, macs) in sweep.contested() {
+                    let answering: Vec<String> = macs
+                        .iter()
+                        .map(|mac| {
+                            mac.iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(":")
+                        })
+                        .collect();
+                    notes.push(format!(
+                        "{address} was answered for by {} stations ({}); neither is recorded \
+                         as holding it",
+                        answering.len(),
+                        answering.join(", ")
+                    ));
+                }
+
+                for reply in sweep.replies {
+                    let device = DeviceKey::mac(&reply.mac_text());
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceAddress {
+                            device: device.clone(),
+                            address: IpAddr::V4(reply.address),
+                        },
+                        EvidenceSource::ArpProbe,
+                        Confidence::Observed,
+                        vantage,
+                    ));
+
+                    // Descriptive only. A manufacturer never establishes a role.
+                    if let Some(vendor) = crate::net::arp::lookup_vendor(&reply.mac_text()) {
+                        out.push(TopologyEvidence::new(
+                            Fact::DeviceVendor { device, vendor },
+                            EvidenceSource::ArpProbe,
+                            Confidence::Observed,
+                            vantage,
+                        ));
+                    }
+
+                    // A tag seen on a frame we received is a tag that exists in this
+                    // switched domain. It never becomes a network on its own.
+                    if let Some(id) = reply.vlan {
+                        out.push(TopologyEvidence::new(
+                            Fact::Vlan { id },
+                            EvidenceSource::ArpProbe,
+                            Confidence::Observed,
+                            vantage,
+                        ));
+                    }
+                }
+            }
+
+            ProviderOutput {
+                evidence: out,
+                notes,
+                attempted,
+            }
+        })
+    }
+}
+
+/// Active IPv6 liveness confirmation on the attached link.
+///
+/// There is no IPv6 host sweep and there cannot be one, so the addresses come from what
+/// something already reported -- the kernel's neighbour cache for this interface. Re-asking
+/// is the point: a cache entry says a MAC was learned at some time, and this says whether
+/// the station is answering for the address now, with the reply validated against the
+/// question.
+pub struct NdpLivenessProvider;
+
+impl DiscoveryProvider for NdpLivenessProvider {
+    fn name(&self) -> &'static str {
+        "ndp-liveness"
+    }
+
+    fn applies(&self, context: &DiscoveryContext) -> bool {
+        // Seed-time only: the candidates are link-scoped, not scope-scoped, and soliciting
+        // them again for every discovered network would repeat the same work.
+        context.target.is_none() && context.scope.is_none()
+    }
+
+    fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            let vantage = &context.vantage.interface;
+            let known: Vec<std::net::Ipv6Addr> =
+                crate::net::ipv6::harvest_ndp_cache(Some(vantage.as_str()))
+                    .await
+                    .into_iter()
+                    .map(|entry| entry.ip)
+                    .collect();
+            if known.is_empty() {
+                // Not applicable: neighbour discovery is available here, nothing on this
+                // link has been reported to solicit. Calling that "unavailable" would say
+                // the platform cannot do it.
+                return ProviderOutput::not_applicable(
+                    "no IPv6 neighbour has been reported on this link to solicit".to_string(),
+                );
+            }
+
+            let outcome = crate::probes::ndp::sweep_liveness(
+                vantage,
+                context.vantage.index,
+                None,
+                known,
+                context.timeout.max(Duration::from_millis(1500)),
+            )
+            .await;
+
+            let attempted = outcome.transmitted();
+            let mut notes = vec![outcome.describe(self.name())];
+            let mut out = Vec::new();
+
+            if let Some(sweep) = outcome.result() {
+                notes.push(format!(
+                    "{} advertisement(s) from {} solicited; the other {} are not confirmed, \
+                     which is not the same as absent",
+                    sweep.advertisements.len(),
+                    sweep.asked.len(),
+                    sweep.unconfirmed().len()
+                ));
+                for (address, macs) in sweep.contested() {
+                    notes.push(format!(
+                        "{address} was advertised for by {} stations; neither is recorded as \
+                         holding it",
+                        macs.len()
+                    ));
+                }
+
+                for found in sweep.advertisements {
+                    // Without a link-layer option there is no identity to key on, and the
+                    // address alone is what we already had. The zone is the vantage: a
+                    // link-local address belongs to this link and no other.
+                    let device = match found.mac {
+                        Some(_) => {
+                            DeviceKey::mac(&found.mac_text().expect("a MAC that was just matched"))
+                        }
+                        None => DeviceKey::scoped_address(
+                            IpAddr::V6(found.address),
+                            Some(vantage.as_str()),
+                        ),
+                    };
+                    out.push(TopologyEvidence::new(
+                        Fact::DeviceAddress {
+                            device: device.clone(),
+                            address: IpAddr::V6(found.address),
+                        },
+                        EvidenceSource::NdpProbe,
+                        Confidence::Observed,
+                        vantage,
+                    ));
+
+                    if let Some(mac) = found.mac_text()
+                        && let Some(vendor) = crate::net::arp::lookup_vendor(&mac)
+                    {
+                        out.push(TopologyEvidence::new(
+                            Fact::DeviceVendor {
+                                device: device.clone(),
+                                vendor,
+                            },
+                            EvidenceSource::NdpProbe,
+                            Confidence::Observed,
+                            vantage,
+                        ));
+                    }
+
+                    // The R flag is the sender's own claim about itself, recorded as
+                    // advertised rather than observed: nothing here saw it forward a packet.
+                    if found.router {
+                        out.push(TopologyEvidence::new(
+                            Fact::DeviceRoleSignal {
+                                device,
+                                signal: RoleSignal::RouterAdvertisement,
+                            },
+                            EvidenceSource::NdpProbe,
+                            Confidence::Advertised,
+                            vantage,
+                        ));
+                    }
+                }
+            }
+
+            ProviderOutput {
+                evidence: out,
+                notes,
+                attempted,
+            }
+        })
     }
 }
 
@@ -667,6 +962,7 @@ pub fn network_providers() -> Vec<Box<dyn DiscoveryProvider>> {
         Box::new(VendorDiscoveryProvider),
         Box::new(PathDiscoveryProvider),
         Box::new(SnmpProvider),
+        Box::new(ArpLivenessProvider::default()),
         Box::new(HostEnrichmentProvider::default()),
     ]
 }
@@ -697,6 +993,56 @@ mod tests {
         let names: Vec<&str> = network_providers().iter().map(|p| p.name()).collect();
         assert!(!names.contains(&"lldp-cdp"));
         assert!(!names.contains(&"passive-capture"));
+    }
+
+    #[tokio::test]
+    async fn arp_liveness_refuses_a_prefix_this_interface_is_not_attached_to() {
+        // ARP resolves nothing beyond the link. Sweeping a routed network anyway would
+        // record whichever router proxied as each address's own hardware identity -- and
+        // reporting the silence as "no response" would blame the hosts for it.
+        let scoped = ctx(VantageKind::Wired, true).for_scope("10.99.0.0/24".parse().unwrap());
+        let provider = ArpLivenessProvider::default();
+        assert!(provider.applies(&scoped));
+
+        let produced = provider.discover(&scoped).await;
+        assert!(produced.evidence.is_empty());
+        assert!(!produced.attempted, "nothing may be sent off-link");
+        assert_eq!(produced.notes.len(), 1);
+        assert!(
+            produced.notes[0].contains("no IPv4 address") || produced.notes[0].contains("attached"),
+            "{:?}",
+            produced.notes
+        );
+    }
+
+    #[test]
+    fn arp_liveness_never_sweeps_a_network_too_large_to_enumerate() {
+        let provider = ArpLivenessProvider::default();
+        let huge = ctx(VantageKind::Wired, true).for_scope("10.0.0.0/8".parse().unwrap());
+        assert!(!provider.applies(&huge));
+
+        // IPv6 host space is never enumerated; those neighbours arrive from solicitation.
+        let v6 = ctx(VantageKind::Wired, true).for_scope("2001:db8::/64".parse().unwrap());
+        assert!(!provider.applies(&v6));
+    }
+
+    #[test]
+    fn liveness_providers_are_registered_where_their_evidence_is_link_scoped() {
+        // The ARP sweep belongs to a network scope; the neighbour solicitation belongs to
+        // the seed pass, because its candidates come from the link and not from a prefix.
+        let scoped: Vec<&str> = network_providers().iter().map(|p| p.name()).collect();
+        assert!(scoped.contains(&"arp-liveness"));
+
+        let seeded: Vec<&str> = crate::providers::local::local_providers()
+            .iter()
+            .map(|p| p.name())
+            .collect();
+        assert!(seeded.contains(&"ndp-liveness"));
+        assert!(
+            seeded.iter().position(|name| *name == "neighbor-cache")
+                < seeded.iter().position(|name| *name == "ndp-liveness"),
+            "the cache is read first so a validated answer can displace a stale entry"
+        );
     }
 
     #[test]

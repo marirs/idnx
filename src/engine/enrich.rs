@@ -118,17 +118,23 @@ pub async fn enrich_devices(
 
 /// Evidence sources that establish a device is alive.
 ///
-/// A neighbour entry, a captured frame, an ICMP reply or any TCP response all prove the
-/// device exists and responds on this link. That is what makes full exploration worthwhile
-/// even when the cheap port set is silent.
-fn proves_liveness(source: EvidenceSource) -> bool {
+/// A validated ARP or neighbour-discovery reply proves it outright: the station answered
+/// for that address at the moment it was asked. A captured frame, an ICMP reply or any TCP
+/// response prove it equally well. A neighbour *cache* entry is weaker -- it records what
+/// was learned at some point, and the kernel keeps it long after the host is gone -- but it
+/// is retained here because this decides how much work a device is worth, not what is
+/// reported about it.
+pub fn currently_live(source: EvidenceSource) -> bool {
     matches!(
         source,
-        EvidenceSource::ArpCache
-            | EvidenceSource::NdpCache
+        // Asked now, answer validated against the question.
+        EvidenceSource::ArpProbe
+            | EvidenceSource::NdpProbe
+            // Correlated ICMP, and a TCP response or RST: both require the host to have
+            // put a packet on the wire during this run.
             | EvidenceSource::IcmpProbe
             | EvidenceSource::TcpProbe
-            | EvidenceSource::DhcpLease
+            // A frame captured during this run, or a protocol reply parsed from one.
             | EvidenceSource::Mdns
             | EvidenceSource::Nbns
             | EvidenceSource::Llmnr
@@ -138,12 +144,28 @@ fn proves_liveness(source: EvidenceSource) -> bool {
             | EvidenceSource::Cdp
             | EvidenceSource::Stp
             | EvidenceSource::RouterAdvertisement
+            | EvidenceSource::Rip
+            // Validated application responses.
             | EvidenceSource::Snmp
             | EvidenceSource::VendorDiscovery
             | EvidenceSource::NatPmp
             | EvidenceSource::AiProtocol
             | EvidenceSource::Mcp
     )
+}
+
+/// Whether a device is worth interrogating.
+///
+/// A looser bar than [`currently_live`] on purpose: this decides how much work to spend,
+/// and a device the kernel remembers is worth a knock even though nothing has heard from
+/// it during this run. A DHCP lease qualifies for the same reason -- the server recorded
+/// the host at some point, which is a reason to ask and not a claim that it is answering.
+fn worth_interrogating(source: EvidenceSource) -> bool {
+    currently_live(source)
+        || matches!(
+            source,
+            EvidenceSource::ArpCache | EvidenceSource::NdpCache | EvidenceSource::DhcpLease
+        )
 }
 
 /// Orders every probeable address a device has, most preferred first.
@@ -273,7 +295,10 @@ pub fn queue_from_graph(
                 descriptions: node.descriptions.iter().cloned().collect(),
             },
             discovery_sources: node.evidence_sources(),
-            confirmed_live: node.provenance.iter().any(|p| proves_liveness(p.source)),
+            worth_full_interrogation: node
+                .provenance
+                .iter()
+                .any(|p| worth_interrogating(p.source)),
         });
     }
 
@@ -479,19 +504,44 @@ mod tests {
     }
 
     #[test]
-    fn an_arp_discovered_device_counts_as_confirmed_live() {
-        // Liveness is what earns full exploration. A live host whose only service sits on
-        // a stage 2 port was otherwise probed on seventeen ports and declared silent.
+    fn a_remembered_device_earns_interrogation_without_being_called_live() {
+        // Two different questions, and conflating them was the defect. A cache entry is a
+        // reason to knock -- a host whose only service sits on a stage 2 port was otherwise
+        // probed on seventeen ports and declared silent -- but the kernel keeps that entry
+        // long after the host is gone, so it can never support "currently live".
         let mut graph = TopologyGraph::new();
         device(&mut graph, "02:00:5e:00:00:0d", "10.9.0.13");
 
         let queue = queue_from_graph(&graph, &HashSet::new(), VANTAGE, VANTAGE_INDEX);
-        assert!(queue[0].confirmed_live);
-        assert!(proves_liveness(EvidenceSource::NdpCache));
-        assert!(proves_liveness(EvidenceSource::IcmpProbe));
-        assert!(proves_liveness(EvidenceSource::TcpProbe));
+        assert!(queue[0].worth_full_interrogation);
+
+        for remembered in [
+            EvidenceSource::ArpCache,
+            EvidenceSource::NdpCache,
+            EvidenceSource::DhcpLease,
+        ] {
+            assert!(worth_interrogating(remembered));
+            assert!(
+                !currently_live(remembered),
+                "{remembered:?} records what was learned once, not what is answering now"
+            );
+        }
+
+        // Asked during this run, and the answer was validated against the question.
+        for fresh in [
+            EvidenceSource::ArpProbe,
+            EvidenceSource::NdpProbe,
+            EvidenceSource::IcmpProbe,
+            EvidenceSource::TcpProbe,
+            EvidenceSource::Snmp,
+        ] {
+            assert!(currently_live(fresh));
+            assert!(worth_interrogating(fresh));
+        }
+
         // A kernel route names a next hop that may not have answered anything.
-        assert!(!proves_liveness(EvidenceSource::KernelRoute));
+        assert!(!currently_live(EvidenceSource::KernelRoute));
+        assert!(!worth_interrogating(EvidenceSource::KernelRoute));
     }
 
     #[test]

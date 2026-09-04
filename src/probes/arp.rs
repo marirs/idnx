@@ -101,6 +101,38 @@ impl ArpReply {
 /// The outcome of one ARP attempt.
 pub type ArpOutcome = AttemptOutcome<ArpReply>;
 
+/// Whether a frame is even a candidate answer: an ARP reply addressed to this station.
+///
+/// Separated from validation so the two are counted apart. Every link carries traffic that
+/// was never an answer to anything we asked, and counting all of it as "failed validation"
+/// would report a thousand rejections on an idle network. A frame that reaches this bar and
+/// then fails [`parse_arp_reply`] is the interesting case: something answered us about the
+/// wrong address.
+///
+/// Takes the hardware address rather than a query, because every condition it tests is the
+/// same for all of them. Testing it per query counted one frame once for each address in
+/// the sweep, so a single stray reply on a /24 was reported as 254 failed validations.
+pub fn is_candidate_reply(frame: &[u8], sender_mac: &[u8; 6]) -> bool {
+    if frame.len() < 22 || frame[0..6] != *sender_mac {
+        return false;
+    }
+    let mut offset = 12;
+    let mut ethertype = u16::from_be_bytes([frame[offset], frame[offset + 1]]);
+    if ethertype == ETHERTYPE_VLAN {
+        if frame.len() < offset + 12 {
+            return false;
+        }
+        offset += 4;
+        ethertype = u16::from_be_bytes([frame[offset], frame[offset + 1]]);
+    }
+    if ethertype != ETHERTYPE_ARP {
+        return false;
+    }
+    frame
+        .get(offset + 8..offset + 10)
+        .is_some_and(|op| u16::from_be_bytes([op[0], op[1]]) == OPERATION_REPLY)
+}
+
 /// Validates a frame as the answer to `query`.
 ///
 /// Every field is checked against what was asked: the sender must be the address we asked
@@ -192,13 +224,15 @@ pub async fn confirm_liveness(
     target_ip: Ipv4Addr,
     budget: Duration,
 ) -> ArpOutcome {
+    // Not applicable, not unavailable: ARP works here, this address is simply not
+    // something it can answer for.
     if !network.contains(&target_ip) {
-        return AttemptOutcome::unavailable(format!(
+        return AttemptOutcome::not_applicable(format!(
             "{target_ip} is not on {network}; ARP is link-scoped and resolves nothing beyond it"
         ));
     }
     if target_ip == sender_ip {
-        return AttemptOutcome::unavailable(
+        return AttemptOutcome::not_applicable(
             "the target is this interface's own address; a station does not ARP for itself"
                 .to_string(),
         );
@@ -233,17 +267,24 @@ pub async fn confirm_liveness(
         }
 
         let deadline = Instant::now() + budget;
-        let read = channel.read_until(deadline, |frame| parse_arp_reply(frame, &query));
+        let mut candidates = 0usize;
+        let read = channel.read_until(deadline, |frame| {
+            if is_candidate_reply(frame, &query.sender_mac) {
+                candidates += 1;
+            }
+            parse_arp_reply(frame, &query)
+        });
+
         match read.found {
             Some(reply) => AttemptOutcome::Answered {
                 sent: query.describe(),
                 result: reply,
             },
-            // Frames were seen and none of them answered this question. Reported apart from
-            // silence because it says the channel is working and the host is not answering.
-            None if read.frames_seen > 0 => AttemptOutcome::InvalidResponse {
+            // Something replied to us about an address we did not ask about. Reported apart
+            // from silence: it says the channel works and the answer did not correlate.
+            None if candidates > 0 => AttemptOutcome::InvalidResponse {
                 sent: query.describe(),
-                rejected: read.frames_seen,
+                rejected: candidates,
             },
             None => AttemptOutcome::NoResponse {
                 sent: query.describe(),
@@ -254,6 +295,171 @@ pub async fn confirm_liveness(
 
     joined.unwrap_or_else(|error| {
         AttemptOutcome::not_sent(format!("the ARP probe task did not complete: {error}"))
+    })
+}
+
+/// What one sweep asked and what answered.
+///
+/// The asked list is kept because it is the only thing that makes an absence meaningful: an
+/// address that was never asked about and one that was asked and stayed quiet are different
+/// facts, and neither of them says the host is offline.
+#[derive(Debug, Clone, Default)]
+pub struct ArpSweep {
+    pub asked: Vec<Ipv4Addr>,
+    pub replies: Vec<ArpReply>,
+}
+
+impl ArpSweep {
+    /// Addresses that were asked and did not answer within the budget.
+    pub fn unconfirmed(&self) -> Vec<Ipv4Addr> {
+        self.asked
+            .iter()
+            .filter(|address| !self.replies.iter().any(|reply| reply.address == **address))
+            .copied()
+            .collect()
+    }
+
+    /// Addresses that more than one station answered for, with every hardware address that
+    /// did.
+    ///
+    /// Kept rather than resolved. Two validated replies for one address is a real finding --
+    /// a duplicate assignment, a failover pair mid-transition, or someone spoofing -- and
+    /// picking whichever arrived first would report a device identity that is at best half
+    /// the truth.
+    pub fn contested(&self) -> Vec<(Ipv4Addr, Vec<[u8; 6]>)> {
+        let mut grouped: Vec<(Ipv4Addr, Vec<[u8; 6]>)> = Vec::new();
+        for reply in &self.replies {
+            match grouped.iter_mut().find(|(addr, _)| *addr == reply.address) {
+                Some((_, macs)) => macs.push(reply.mac),
+                None => grouped.push((reply.address, vec![reply.mac])),
+            }
+        }
+        grouped.retain(|(_, macs)| macs.len() > 1);
+        grouped
+    }
+}
+
+/// The outcome of one sweep.
+pub type ArpSweepOutcome = AttemptOutcome<ArpSweep>;
+
+/// Asks every named on-link address to identify itself, over one channel.
+///
+/// One channel rather than one per address: opening a BPF device per target would spend
+/// the entire budget on setup, and the replies all arrive on the same link anyway. Requests
+/// go out first and the read follows, so a fast neighbour is not missed while later
+/// requests are still being written.
+pub async fn sweep_liveness(
+    interface: &str,
+    network: Ipv4Net,
+    sender_ip: Ipv4Addr,
+    targets: Vec<Ipv4Addr>,
+    budget: Duration,
+) -> ArpSweepOutcome {
+    let on_link: Vec<Ipv4Addr> = targets
+        .into_iter()
+        .filter(|address| network.contains(address) && *address != sender_ip)
+        .collect();
+    if on_link.is_empty() {
+        return AttemptOutcome::not_applicable(format!(
+            "no address to ask on {network}; ARP is link-scoped and resolves nothing beyond it"
+        ));
+    }
+
+    let interface = interface.to_string();
+    tokio::task::spawn_blocking(move || {
+        let sender_mac = match interface_mac(&interface) {
+            Some(mac) => mac,
+            None => {
+                return AttemptOutcome::not_sent(format!(
+                    "{interface} has no hardware address to send from"
+                ));
+            }
+        };
+        let channel = match LinkChannel::open(&interface) {
+            Ok(channel) => channel,
+            Err(reason) => return AttemptOutcome::unavailable(reason),
+        };
+
+        // Only queries whose request actually reached the wire may correlate a reply.
+        //
+        // Building every query and validating against all of them would accept an
+        // unsolicited announcement for an address whose request was never sent -- and
+        // record it as a confirmation obtained by asking.
+        let mut sent_queries: Vec<ArpQuery> = Vec::with_capacity(on_link.len());
+        let mut refused = None;
+        for target_ip in &on_link {
+            let query = ArpQuery {
+                sender_mac,
+                sender_ip,
+                target_ip: *target_ip,
+            };
+            match channel.send(&query.request_frame()) {
+                Ok(()) => sent_queries.push(query),
+                // Keep the first reason and stop: a channel that has started refusing
+                // writes will refuse the rest, and reporting 254 identical failures buries
+                // the one fact that matters.
+                Err(reason) => {
+                    refused = Some(reason);
+                    break;
+                }
+            }
+        }
+        if sent_queries.is_empty() {
+            return AttemptOutcome::not_sent(
+                refused.unwrap_or_else(|| "no request could be transmitted".to_string()),
+            );
+        }
+        let asked: Vec<Ipv4Addr> = sent_queries.iter().map(|q| q.target_ip).collect();
+
+        let sent = format!("ARP who-has {} address(es) on {network}", asked.len());
+        let deadline = Instant::now() + budget;
+        let mut replies: Vec<ArpReply> = Vec::new();
+        let mut candidates = 0usize;
+
+        // Never returns Some, so the read runs to the deadline and collects every answer.
+        channel.read_until(deadline, |frame| -> Option<()> {
+            // Counted once per frame, before any correlation: whether a frame is an ARP
+            // reply addressed to this station does not depend on which address we asked
+            // about, and testing it inside the query loop counted one stray reply once per
+            // target in the sweep.
+            if is_candidate_reply(frame, &sender_mac) {
+                candidates += 1;
+            }
+
+            for query in &sent_queries {
+                // Deduplicated by (address, hardware address), not by address alone.
+                // Collapsing on the address discarded the second station answering for it,
+                // which is exactly the conflict worth reporting.
+                if let Some(reply) = parse_arp_reply(frame, query)
+                    && !replies
+                        .iter()
+                        .any(|seen| seen.address == reply.address && seen.mac == reply.mac)
+                {
+                    replies.push(reply);
+                }
+            }
+            None
+        });
+
+        if !replies.is_empty() {
+            return AttemptOutcome::Answered {
+                sent,
+                result: ArpSweep { asked, replies },
+            };
+        }
+        // Candidates were counted against every query, so a reply addressed to us about an
+        // address nobody asked for is the only way to reach this without an answer.
+        if candidates > 0 {
+            return AttemptOutcome::InvalidResponse {
+                sent,
+                rejected: candidates,
+            };
+        }
+        AttemptOutcome::NoResponse { sent }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        AttemptOutcome::not_sent(format!("the ARP sweep task did not complete: {error}"))
     })
 }
 
@@ -424,6 +630,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_candidate_frame_is_recognised_once_regardless_of_how_many_addresses_were_asked() {
+        // The test is on the hardware address alone, which is what makes the count per
+        // frame. Keying it to a query counted one stray reply once per target, so a single
+        // frame on a /24 sweep was reported as 254 failed validations.
+        let query = query();
+        let stray = {
+            let mut frame = reply_frame(&query, [0x74, 0x12, 0x13, 0x14, 0x75, 0xdc]);
+            frame[28..32].copy_from_slice(&[192, 168, 1, 99]); // about an address nobody asked for
+            frame
+        };
+        assert!(is_candidate_reply(&stray, &query.sender_mac));
+        assert!(
+            parse_arp_reply(&stray, &query).is_none(),
+            "a candidate that fails correlation is what makes it worth counting"
+        );
+
+        // Addressed to another station, so not a candidate at all.
+        let mut elsewhere = stray.clone();
+        elsewhere[0] = 0x06;
+        assert!(!is_candidate_reply(&elsewhere, &query.sender_mac));
+
+        // Our own request, looped back: a request is never a candidate reply.
+        assert!(!is_candidate_reply(
+            &query.request_frame(),
+            &query.sender_mac
+        ));
+    }
+
+    #[test]
+    fn a_sweep_separates_what_was_asked_from_what_answered() {
+        // The distinction that makes an absence meaningful: an address nobody asked about
+        // and one that was asked and stayed quiet are different facts.
+        let sweep = ArpSweep {
+            asked: vec![
+                Ipv4Addr::new(192, 168, 1, 1),
+                Ipv4Addr::new(192, 168, 1, 2),
+                Ipv4Addr::new(192, 168, 1, 3),
+            ],
+            replies: vec![ArpReply {
+                address: Ipv4Addr::new(192, 168, 1, 2),
+                mac: [0x74, 0x12, 0x13, 0x14, 0x75, 0xdc],
+                vlan: None,
+                raw: Vec::new(),
+            }],
+        };
+        assert_eq!(
+            sweep.unconfirmed(),
+            vec![Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_with_nothing_on_the_link_to_ask_sends_nothing() {
+        let outcome = sweep_liveness(
+            "en0",
+            "192.168.1.0/24".parse().unwrap(),
+            Ipv4Addr::new(192, 168, 1, 10),
+            vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 10)],
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(outcome, AttemptOutcome::NotApplicable { .. }));
+        assert!(!outcome.transmitted());
+    }
+
     #[tokio::test]
     async fn an_address_off_the_link_is_refused_instead_of_broadcast() {
         // ARP resolves nothing beyond the link. Broadcasting anyway would record whichever
@@ -436,7 +708,7 @@ mod tests {
             Duration::from_millis(10),
         )
         .await;
-        assert!(matches!(outcome, AttemptOutcome::Unavailable { .. }));
+        assert!(matches!(outcome, AttemptOutcome::NotApplicable { .. }));
         assert!(!outcome.transmitted());
     }
 }

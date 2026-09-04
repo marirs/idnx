@@ -115,11 +115,15 @@ pub struct InterrogationTarget {
     pub known: crate::providers::vendor::DeviceFingerprint,
     /// How the device became known.
     pub discovery_sources: Vec<String>,
-    /// Whether liveness is already established -- an ARP or NDP entry, a captured frame, an
-    /// ICMP reply, or any TCP response. A live device is explored in full even when its
-    /// stage 1 ports are all silent, because a device whose only service is on a stage 2
-    /// port would otherwise be missed entirely.
-    pub confirmed_live: bool,
+    /// Whether the device has earned a full interrogation -- something answered for it
+    /// during this run, or the kernel or a DHCP server remembers it. Such a device is
+    /// explored in full even when its stage 1 ports are all silent, because one whose only
+    /// service is on a stage 2 port would otherwise be missed entirely.
+    ///
+    /// Deliberately *not* a liveness claim: a remembered device passes this bar and is
+    /// still not currently live. `engine::enrich::currently_live` is what decides that, and
+    /// it is what the report renders.
+    pub worth_full_interrogation: bool,
 }
 
 /// What was probed at one address, and what answered.
@@ -365,7 +369,7 @@ pub async fn interrogate_device(
     // entry, a captured frame, an ICMP reply, a TCP response -- and not only for one that
     // answered a stage 1 port. A live host whose single service sits on 8728 or 32400 was
     // otherwise probed on seventeen ports and declared silent.
-    let broaden = target.confirmed_live || !open_ports.is_empty();
+    let broaden = target.worth_full_interrogation || !open_ports.is_empty();
     if broaden {
         primary_coverage.stages_run = 2;
         primary_coverage.tcp_attempted += STAGE_TWO_PORTS.len();
@@ -1186,7 +1190,7 @@ mod tests {
                 endpoints: Vec::new(),
                 known: Default::default(),
                 discovery_sources: Vec::new(),
-                confirmed_live: true,
+                worth_full_interrogation: true,
             },
             &ctx(),
         )

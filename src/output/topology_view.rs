@@ -235,6 +235,32 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
             safe::all(node.capabilities.iter()).join(", ").green()
         );
     }
+    // Liveness and role, stated rather than implied.
+    //
+    // A device rendered with no qualifier read as though its presence and its function had
+    // both been established. Neither may be inferred from the other, and neither may be
+    // inferred from the manufacturer or from where the scheduler put it in the queue.
+    println!(
+        "  │     {} · {}",
+        liveness_label(node),
+        role_label(node).dimmed()
+    );
+    for address in &node.contested_addresses {
+        // Two stations answered for this address and both answers validated. Naming one of
+        // them as its holder would report a device identity that is half the truth.
+        println!(
+            "  │     {} {}",
+            "contested:".yellow(),
+            format!("{address} is also answered for by another station").yellow()
+        );
+    }
+    for (address, holder) in &node.superseded_addresses {
+        println!(
+            "  │     {} {}",
+            "reassigned:".dimmed(),
+            format!("{address} now answers as {}", safe::text(holder)).dimmed()
+        );
+    }
     render_peer_origin(node, "  │     ");
     for signal in &node.role_signals {
         println!("  │     • {}", safe::text(signal).dimmed());
@@ -258,6 +284,52 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
             );
         }
     }
+}
+
+/// Whether anything answered for this device during this run, and on what basis.
+///
+/// Three states, because two of them were previously indistinguishable. A validated reply
+/// to a request we sent says the device is answering now. A neighbour-cache or DHCP entry
+/// says only that something learned of it once -- the kernel keeps such entries long after
+/// a host is gone. Anything else says nothing about presence at all, and none of the three
+/// ever means "offline": silence is not confirmation of absence.
+fn liveness_label(node: &crate::topology::graph::Node) -> colored::ColoredString {
+    let mut fresh: Vec<&'static str> = node
+        .provenance
+        .iter()
+        .filter(|p| crate::engine::enrich::currently_live(p.source))
+        .map(|p| p.source.label())
+        .collect();
+    fresh.sort_unstable();
+    fresh.dedup();
+    if !fresh.is_empty() {
+        return format!("currently live ({})", fresh.join(", ")).green();
+    }
+
+    let remembered = node.provenance.iter().any(|p| {
+        matches!(
+            p.source,
+            crate::topology::evidence::EvidenceSource::ArpCache
+                | crate::topology::evidence::EvidenceSource::NdpCache
+                | crate::topology::evidence::EvidenceSource::DhcpLease
+        )
+    });
+    if remembered {
+        return "cache-only, liveness not confirmed".yellow();
+    }
+    "liveness not confirmed".dimmed()
+}
+
+/// Whether the device's role rests on evidence, or on nothing at all.
+///
+/// "role unconfirmed" is the honest rendering for a device with no behavioural signal.
+/// Without it, a host appearing under a heading implied that its manufacturer, or the
+/// order the scheduler happened to reach it in, had established what it is.
+fn role_label(node: &crate::topology::graph::Node) -> String {
+    if node.role_signals.is_empty() {
+        return "role unconfirmed".to_string();
+    }
+    format!("role confirmed by {} signal(s)", node.role_signals.len())
 }
 
 /// A device's addresses for display, routable first, link-local addresses scoped.
@@ -711,6 +783,57 @@ fn render_device_coverage(report: &DiscoveryReport) {
     }
 }
 
+/// Whether a note describes work that never reached the device.
+fn never_asked(note: &str) -> bool {
+    note.contains("unavailable")
+        || note.contains("not applicable")
+        || note.contains("not attempted")
+        || note.contains("not sent")
+}
+
+/// What did not finish asking this pivot, or `None` when everything applicable did.
+///
+/// Both halves matter. A provider that reported itself unavailable never put a question to
+/// the device, and so did a vendor adapter that was selected and has no implementation --
+/// and the adapter outcomes live beside the device's coverage rather than in its provider
+/// runs. With either outstanding, "disclosed nothing" would be our gap reported as their
+/// silence.
+fn incomplete_for_pivot(
+    pivot: &crate::engine::orchestrator::PivotRun,
+    report: &DiscoveryReport,
+) -> Option<String> {
+    let address = pivot.address.to_string();
+    let adapters: Vec<String> = report
+        .coverage
+        .iter()
+        .filter(|record| record.addresses.iter().any(|a| *a == address))
+        .flat_map(|record| record.adapter_outcomes.clone())
+        .collect();
+    unfinished_work(&pivot.runs, &adapters)
+}
+
+/// The named work that never reached the device, from provider runs and adapter outcomes.
+fn unfinished_work(
+    runs: &[crate::providers::ProviderRun],
+    adapter_outcomes: &[String],
+) -> Option<String> {
+    let mut unfinished: Vec<String> = runs
+        .iter()
+        .filter(|run| run.note.as_deref().is_some_and(never_asked))
+        .map(|run| run.provider.to_string())
+        .collect();
+    unfinished.extend(
+        adapter_outcomes
+            .iter()
+            .filter(|outcome| never_asked(outcome))
+            .cloned(),
+    );
+
+    unfinished.sort();
+    unfinished.dedup();
+    (!unfinished.is_empty()).then(|| unfinished.join("; "))
+}
+
 fn render_coverage(report: &DiscoveryReport) {
     println!("\n{}", "Discovery coverage".bold());
 
@@ -743,7 +866,18 @@ fn render_coverage(report: &DiscoveryReport) {
             println!("    {:<18} {}", run.provider, outcome.dimmed());
         }
         if pivot.networks_learned.is_empty() {
-            println!("    {}", "networks learned: none".dimmed());
+            // "None" is a conclusion, and it can only be drawn once everything applicable
+            // actually ran. Where a provider was unavailable or never transmitted, the
+            // honest statement is that the interrogation is incomplete -- otherwise an
+            // operator reads a gap in our coverage as a fact about their network.
+            match incomplete_for_pivot(pivot, report) {
+                None => println!("    {}", "networks disclosed: none".dimmed()),
+                Some(unfinished) => println!(
+                    "    {} {}",
+                    "no network established; interrogation incomplete".yellow(),
+                    format!("({unfinished})").dimmed()
+                ),
+            }
         } else {
             let list: Vec<String> = pivot
                 .networks_learned
@@ -870,4 +1004,158 @@ fn grade_counts_edges(graph: &TopologyGraph) -> GradeCounts {
         c.tally(edge.confidence);
     }
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::ProviderRun;
+    use crate::topology::TopologyEvidence;
+    use crate::topology::evidence::{Confidence, EvidenceSource, Fact, RoleSignal};
+
+    fn note(provider: &'static str, note: &str) -> ProviderRun {
+        ProviderRun {
+            provider,
+            evidence_count: 0,
+            note: Some(note.to_string()),
+        }
+    }
+
+    fn absorb(graph: &mut TopologyGraph, fact: Fact, source: EvidenceSource) {
+        graph.absorb(TopologyEvidence::new(
+            fact,
+            source,
+            Confidence::Observed,
+            "test0",
+        ));
+    }
+
+    fn node_for<'a>(graph: &'a TopologyGraph, key: &DeviceKey) -> &'a crate::topology::Node {
+        graph
+            .nodes()
+            .find(|node| node.id == NodeId::Device(key.clone()))
+            .expect("the device exists")
+    }
+
+    #[test]
+    fn nothing_disclosed_reads_as_incomplete_until_every_applicable_source_has_asked() {
+        // "Disclosed nothing" is a claim about the device. It may only be made once every
+        // applicable source actually put a question to it; otherwise our own gap is being
+        // reported as their silence.
+        let finished = [
+            note("device-enrichment", "3 stage(s), 0/79 tcp responsive"),
+            note("snmp", "no response"),
+        ];
+        assert_eq!(unfinished_work(&finished, &[]), None);
+
+        // A provider that could not run here.
+        let blocked = [note("arp-liveness", "unavailable: needs root")];
+        assert_eq!(
+            unfinished_work(&blocked, &[]).as_deref(),
+            Some("arp-liveness")
+        );
+
+        // Nothing on this link to ask is equally not an answer from the device.
+        let nothing_to_ask = [note(
+            "ndp-liveness",
+            "not applicable: no neighbour reported",
+        )];
+        assert!(unfinished_work(&nothing_to_ask, &[]).is_some());
+
+        // A selected adapter with no implementation never sent a packet either, and its
+        // outcome lives beside the device's coverage rather than in the provider runs.
+        let adapters = vec!["vendor:asus unavailable: framing unverified".to_string()];
+        assert_eq!(
+            unfinished_work(&finished, &adapters).as_deref(),
+            Some("vendor:asus unavailable: framing unverified")
+        );
+
+        // An adapter that ran and heard nothing leaves the account complete.
+        let answered = vec!["vendor:mikrotik no response (8728/tcp)".to_string()];
+        assert_eq!(unfinished_work(&finished, &answered), None);
+    }
+
+    #[test]
+    fn a_device_is_never_rendered_as_live_on_a_remembered_entry() {
+        let mut graph = TopologyGraph::new();
+
+        // Remembered by the kernel, and nothing has answered during this run.
+        let remembered = DeviceKey::mac("02:00:5e:00:00:11");
+        absorb(
+            &mut graph,
+            Fact::DeviceAddress {
+                device: remembered.clone(),
+                address: "10.7.0.1".parse().unwrap(),
+            },
+            EvidenceSource::ArpCache,
+        );
+        let rendered = liveness_label(node_for(&graph, &remembered)).to_string();
+        assert!(rendered.contains("cache-only"), "{rendered}");
+        assert!(!rendered.contains("currently live"), "{rendered}");
+
+        // Answered a request we sent and validated.
+        let answering = DeviceKey::mac("02:00:5e:00:00:12");
+        absorb(
+            &mut graph,
+            Fact::DeviceAddress {
+                device: answering.clone(),
+                address: "10.7.0.2".parse().unwrap(),
+            },
+            EvidenceSource::ArpProbe,
+        );
+        assert!(
+            liveness_label(node_for(&graph, &answering))
+                .to_string()
+                .contains("currently live")
+        );
+
+        // Named by a route, which says nothing about whether it is answering.
+        let routed = DeviceKey::Address("10.7.0.3".parse().unwrap());
+        absorb(
+            &mut graph,
+            Fact::DeviceAddress {
+                device: routed.clone(),
+                address: "10.7.0.3".parse().unwrap(),
+            },
+            EvidenceSource::KernelRoute,
+        );
+        let rendered = liveness_label(node_for(&graph, &routed)).to_string();
+        assert!(rendered.contains("not confirmed"), "{rendered}");
+        assert!(!rendered.contains("cache-only"), "{rendered}");
+    }
+
+    #[test]
+    fn a_device_with_no_behavioural_signal_renders_as_role_unconfirmed() {
+        // Neither the manufacturer nor the scheduler's ordering establishes what a device
+        // is; without a behavioural signal the honest rendering says so.
+        let mut graph = TopologyGraph::new();
+        let key = DeviceKey::mac("02:00:5e:00:00:13");
+        absorb(
+            &mut graph,
+            Fact::DeviceAddress {
+                device: key.clone(),
+                address: "10.7.0.4".parse().unwrap(),
+            },
+            EvidenceSource::ArpProbe,
+        );
+        absorb(
+            &mut graph,
+            Fact::DeviceVendor {
+                device: key.clone(),
+                vendor: "ASUSTek COMPUTER INC.".to_string(),
+            },
+            EvidenceSource::ArpProbe,
+        );
+        assert_eq!(role_label(node_for(&graph, &key)), "role unconfirmed");
+
+        absorb(
+            &mut graph,
+            Fact::DeviceRoleSignal {
+                device: key.clone(),
+                signal: RoleSignal::ObservedForwarding,
+            },
+            EvidenceSource::IcmpProbe,
+        );
+        assert!(role_label(node_for(&graph, &key)).contains("role confirmed"));
+    }
 }

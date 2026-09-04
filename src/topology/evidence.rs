@@ -69,6 +69,13 @@ pub enum EvidenceSource {
     DhcpLease,
     ArpCache,
     NdpCache,
+    /// An ARP request we sent, whose reply was validated against it.
+    ///
+    /// Distinct from the cache because it says something the cache cannot: the station
+    /// answered for that address at the moment we asked.
+    ArpProbe,
+    /// A neighbour solicitation we sent, whose advertisement was validated against it.
+    NdpProbe,
     IcmpProbe,
     TcpProbe,
     Mdns,
@@ -104,6 +111,8 @@ impl EvidenceSource {
             EvidenceSource::DhcpLease => "DHCP lease",
             EvidenceSource::ArpCache => "ARP cache",
             EvidenceSource::NdpCache => "NDP cache",
+            EvidenceSource::ArpProbe => "ARP probe",
+            EvidenceSource::NdpProbe => "neighbour solicitation",
             EvidenceSource::IcmpProbe => "ICMP probe",
             EvidenceSource::TcpProbe => "TCP probe",
             EvidenceSource::Mdns => "mDNS",
@@ -130,7 +139,11 @@ impl EvidenceSource {
     pub fn needs_privilege(&self) -> bool {
         matches!(
             self,
-            EvidenceSource::Lldp | EvidenceSource::Cdp | EvidenceSource::Stp
+            EvidenceSource::Lldp
+                | EvidenceSource::Cdp
+                | EvidenceSource::Stp
+                | EvidenceSource::ArpProbe
+                | EvidenceSource::NdpProbe
         )
     }
 }

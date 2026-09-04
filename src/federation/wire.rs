@@ -673,6 +673,8 @@ wire_names!(
     DhcpLease => "dhcp_lease",
     ArpCache => "arp_cache",
     NdpCache => "ndp_cache",
+    ArpProbe => "arp_probe",
+    NdpProbe => "ndp_probe",
     IcmpProbe => "icmp_probe",
     TcpProbe => "tcp_probe",
     Mdns => "mdns",

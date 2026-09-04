@@ -366,6 +366,19 @@ pub struct Node {
     /// Which addresses were observed remotely, so reachability can be decided per address
     /// rather than per device.
     address_provenance: Vec<(IpAddr, bool)>,
+    /// Addresses another equally current claim also answered for.
+    ///
+    /// The node keeps the address -- it did answer for it -- and so does the other
+    /// claimant. Neither is presented as its owner.
+    pub contested_addresses: BTreeSet<IpAddr>,
+    /// Addresses this node used to hold, and the identity that holds each one now.
+    ///
+    /// Recorded rather than merged. When an active probe answers for an address with a
+    /// different hardware address than the cache remembered, the two are not one device
+    /// that changed: they are two devices, and one of them has moved on or gone. Merging
+    /// them would invent a machine with both identities; deleting the old node would lose
+    /// everything else that was learned about it.
+    pub superseded_addresses: BTreeSet<(IpAddr, String)>,
 }
 
 impl Node {
@@ -383,7 +396,19 @@ impl Node {
             confidence,
             provenance: Vec::new(),
             address_provenance: Vec::new(),
+            contested_addresses: BTreeSet::new(),
+            superseded_addresses: BTreeSet::new(),
         }
+    }
+
+    /// Hands an address over to the identity that now answers for it.
+    ///
+    /// The node keeps everything else it had; only the claim on this address goes.
+    fn supersede_address(&mut self, address: IpAddr, holder: String) {
+        self.addresses.remove(&address);
+        self.address_provenance
+            .retain(|(existing, _)| *existing != address);
+        self.superseded_addresses.insert((address, holder));
     }
 
     /// Records how an address of this node came to be known.
@@ -613,6 +638,15 @@ pub struct TopologyGraph {
     /// services attached to the first peer's device. Globally unique addresses resolve to
     /// the local domain, so a host two peers both see still has one owner.
     address_owner: HashMap<(IpAddr, Option<String>, Realm), DeviceKey>,
+    /// How each address binding was established, so a remembered one never displaces a
+    /// freshly confirmed one.
+    address_binding: HashMap<(IpAddr, Option<String>, Realm), EvidenceSource>,
+    /// Addresses that two or more equally current claims answered for, and who answered.
+    ///
+    /// These have no entry in `address_owner`: resolving such an address to one device
+    /// would mean choosing between two validated replies on nothing better than arrival
+    /// order. Everything that answered is kept, and the dispute is reported.
+    contested_addresses: HashMap<(IpAddr, Option<String>, Realm), BTreeSet<DeviceKey>>,
     /// VLAN IDs seen without any prefix-bearing evidence.
     /// VLANs seen with no prefix evidence, each in the domain that saw the tag.
     ///
@@ -628,6 +662,49 @@ pub struct TopologyGraph {
     /// Structured role signals per device. Kept separate from `Node::role_signals`, which
     /// holds only rendered strings, so scoring operates on typed values.
     role_weights: HashMap<NodeId, BTreeSet<RoleSignal>>,
+}
+
+/// How current an address binding is, by how it was established.
+///
+/// Not a trust ranking. A validated ARP or neighbour-discovery reply is the only evidence
+/// that says a station answered for an address *now*; every other source, the kernel's
+/// neighbour cache included, reports something learned at an unknown earlier time. So a
+/// remembered binding never displaces a freshly confirmed one, and a fresh one always
+/// displaces a remembered one.
+fn binding_freshness(source: EvidenceSource) -> u8 {
+    match source {
+        EvidenceSource::ArpProbe | EvidenceSource::NdpProbe => FRESHNESS_CONFIRMED,
+        _ => 1,
+    }
+}
+
+/// The rank of a claim backed by a validated reply to a request we sent in this run.
+const FRESHNESS_CONFIRMED: u8 = 2;
+
+/// What happens when a second identity claims an address that is already held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressClaim {
+    /// Nobody else holds it, or the same identity is re-stating a claim.
+    Uncontested,
+    /// This claim is newer than the one on file, which is set aside.
+    Supersedes,
+    /// A newer claim already holds the address; this one is set aside instead.
+    Superseded,
+    /// A hardware identity replacing an address-only placeholder for the same device.
+    Refines,
+    /// An address-only placeholder arriving after the hardware identity for it.
+    Refined,
+    /// Two equally current claims. The address is left unowned and both are recorded.
+    Contested,
+}
+
+/// Names an identity for the record of a superseded address.
+fn describe_key(key: &DeviceKey) -> String {
+    match key {
+        DeviceKey::Mac(mac) => mac.clone(),
+        DeviceKey::Address(address) => address.to_string(),
+        DeviceKey::ScopedAddress(address, zone) => format!("{address}%{zone}"),
+    }
 }
 
 impl TopologyGraph {
@@ -991,6 +1068,24 @@ impl TopologyGraph {
             .map(|_| owner)
     }
 
+    /// Addresses more than one station answered for, each with every claimant, sorted so
+    /// the report is stable across runs.
+    ///
+    /// Reported rather than resolved. An operator seeing two hardware addresses answering
+    /// for one IP is looking at a duplicate assignment, a failover pair mid-transition or a
+    /// spoofer, and which of those it is cannot be decided from here.
+    pub fn contested_addresses(&self) -> Vec<(IpAddr, Vec<DeviceKey>)> {
+        let mut disputes: Vec<(IpAddr, Vec<DeviceKey>)> = self
+            .contested_addresses
+            .iter()
+            .map(|((address, _, _), claimants)| {
+                (*address, claimants.iter().cloned().collect::<Vec<_>>())
+            })
+            .collect();
+        disputes.sort_by_key(|(address, _)| *address);
+        disputes
+    }
+
     /// Folds one piece of evidence into the graph.
     /// Absorbs one piece of evidence, in the domain it was observed in.
     pub fn absorb(&mut self, ev: TopologyEvidence) {
@@ -1047,11 +1142,123 @@ impl TopologyGraph {
                 } else {
                     None
                 };
-                self.address_owner
-                    .insert((address, zone, address_realm(&address, &realm)), key);
-                if let Some(node) = self.nodes.get_mut(&id) {
-                    node.addresses.insert(address);
-                    node.note_address(address, !realm.is_local());
+                let slot = (address, zone, address_realm(&address, &realm));
+
+                // A dispute does not end because a later claim arrives.
+                //
+                // Withdrawing ownership left the slot empty, so the next claim -- the same
+                // station repeating itself, a cache read, or a third station -- found no
+                // holder and took it. That handed the address to whoever spoke last, which
+                // is the arbitrary choice the conflict exists to avoid. Once contested in a
+                // run, the address stays unowned and later claimants only join the dispute.
+                if let Some(claimants) = self.contested_addresses.get_mut(&slot) {
+                    claimants.insert(key.clone());
+                    if let Some(node) = self.nodes.get_mut(&id) {
+                        node.addresses.insert(address);
+                        node.note_address(address, !realm.is_local());
+                        node.contested_addresses.insert(address);
+                    }
+                    return;
+                }
+
+                let held_by = self.address_owner.get(&slot).cloned();
+                let held_since = self.address_binding.get(&slot).copied();
+                let claim = binding_freshness(ev.source);
+
+                // Three ways two identities can claim one address, and they are three
+                // different findings. None of them merges the two: a reply naming a
+                // different hardware address than another source did means the address
+                // moved or is disputed, never that one machine holds both identities.
+                let resolution = match &held_by {
+                    None => AddressClaim::Uncontested,
+                    Some(previous) if *previous == key => AddressClaim::Uncontested,
+                    // One identity names hardware and the other only an address: that is
+                    // the same device described twice, not two devices disputing an
+                    // address. The hardware identity takes the binding and
+                    // `merge_address_identities` folds the placeholder into it; recording
+                    // either as superseded would report a handover that never happened.
+                    Some(previous)
+                        if matches!(previous, DeviceKey::Mac(_))
+                            != matches!(key, DeviceKey::Mac(_)) =>
+                    {
+                        if matches!(key, DeviceKey::Mac(_)) {
+                            AddressClaim::Refines
+                        } else {
+                            AddressClaim::Refined
+                        }
+                    }
+                    Some(_) => {
+                        let held = held_since.map(binding_freshness).unwrap_or(0);
+                        if claim > held {
+                            // Something answered just now; what another source remembered
+                            // is out of date for this address.
+                            AddressClaim::Supersedes
+                        } else if claim < held {
+                            AddressClaim::Superseded
+                        } else if claim >= FRESHNESS_CONFIRMED {
+                            // Both stations answered, both answers validated. Choosing
+                            // between them by arrival order would report a device identity
+                            // that is at best half the truth, so the address is left
+                            // unowned and both claimants keep it.
+                            AddressClaim::Contested
+                        } else {
+                            // Two remembered claims of equal standing: the first stays,
+                            // and nothing here is fresh enough to displace it.
+                            AddressClaim::Superseded
+                        }
+                    }
+                };
+
+                match resolution {
+                    AddressClaim::Uncontested
+                    | AddressClaim::Supersedes
+                    | AddressClaim::Refines => {
+                        if resolution == AddressClaim::Supersedes
+                            && let Some(previous) = held_by
+                            && let Some(node) = self.nodes.get_mut(&NodeId::Device(previous))
+                        {
+                            node.supersede_address(address, describe_key(&key));
+                        }
+                        self.address_owner.insert(slot.clone(), key);
+                        self.address_binding.insert(slot, ev.source);
+                        if let Some(node) = self.nodes.get_mut(&id) {
+                            node.addresses.insert(address);
+                            node.note_address(address, !realm.is_local());
+                        }
+                    }
+                    AddressClaim::Superseded => {
+                        if let Some(previous) = held_by
+                            && let Some(node) = self.nodes.get_mut(&id)
+                        {
+                            node.supersede_address(address, describe_key(&previous));
+                        }
+                    }
+                    // The hardware identity already holds it. This node keeps the address
+                    // so its own evidence is not lost, and the merge pass folds the two.
+                    AddressClaim::Refined => {
+                        if let Some(node) = self.nodes.get_mut(&id) {
+                            node.addresses.insert(address);
+                            node.note_address(address, !realm.is_local());
+                        }
+                    }
+                    AddressClaim::Contested => {
+                        // Ownership is withdrawn rather than reassigned, so nothing
+                        // downstream resolves this address to a single device.
+                        let previous = held_by.expect("a contested claim has a prior holder");
+                        self.address_owner.remove(&slot);
+                        self.address_binding.remove(&slot);
+                        self.contested_addresses
+                            .entry(slot)
+                            .or_default()
+                            .extend([previous.clone(), key.clone()]);
+                        for claimant in [previous, key] {
+                            if let Some(node) = self.nodes.get_mut(&NodeId::Device(claimant)) {
+                                node.addresses.insert(address);
+                                node.note_address(address, !realm.is_local());
+                                node.contested_addresses.insert(address);
+                            }
+                        }
+                    }
                 }
             }
             Fact::DeviceHostname { device, hostname } => {
@@ -1678,6 +1885,212 @@ mod tests {
 
     fn ev(fact: Fact, source: EvidenceSource, confidence: Confidence) -> TopologyEvidence {
         TopologyEvidence::new(fact, source, confidence, "test")
+    }
+
+    #[test]
+    fn a_fresh_reply_takes_an_address_from_a_stale_cache_entry_without_merging() {
+        // The case: the kernel remembers 10.9.0.5 at one MAC, and an ARP reply we validated
+        // just now names another. They are two devices, and one of them has moved on or
+        // gone. Merging them would invent a machine holding both identities.
+        let address: IpAddr = "10.9.0.5".parse().unwrap();
+        let remembered = DeviceKey::mac("02:00:5e:00:00:01");
+        let answering = DeviceKey::mac("02:00:5e:00:00:02");
+
+        let mut g = TopologyGraph::new();
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: remembered.clone(),
+                address,
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: answering.clone(),
+                address,
+            },
+            EvidenceSource::ArpProbe,
+            Confidence::Observed,
+        ));
+
+        assert_eq!(g.device_for_address(&address), Some(&answering));
+
+        let stale = g
+            .nodes()
+            .find(|node| node.id == NodeId::Device(remembered.clone()))
+            .expect("the remembered device is kept, not deleted");
+        assert!(
+            !stale.addresses.contains(&address),
+            "the stale entry must stop claiming an address that answered elsewhere"
+        );
+        assert!(
+            stale
+                .superseded_addresses
+                .contains(&(address, "02:00:5e:00:00:02".to_string())),
+            "the replacement is recorded, naming who answers for it now"
+        );
+
+        let fresh = g
+            .nodes()
+            .find(|node| node.id == NodeId::Device(answering.clone()))
+            .expect("the answering device exists in its own right");
+        assert!(fresh.addresses.contains(&address));
+        assert!(fresh.superseded_addresses.is_empty());
+    }
+
+    #[test]
+    fn a_remembered_binding_never_displaces_a_freshly_confirmed_one() {
+        // Provider order is not a guarantee. A cache read that lands after the probe must
+        // not hand the address back to whatever the kernel still remembers.
+        let address: IpAddr = "10.9.0.6".parse().unwrap();
+        let answering = DeviceKey::mac("02:00:5e:00:00:03");
+        let remembered = DeviceKey::mac("02:00:5e:00:00:04");
+
+        let mut g = TopologyGraph::new();
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: answering.clone(),
+                address,
+            },
+            EvidenceSource::ArpProbe,
+            Confidence::Observed,
+        ));
+        g.absorb(ev(
+            Fact::DeviceAddress {
+                device: remembered.clone(),
+                address,
+            },
+            EvidenceSource::ArpCache,
+            Confidence::Observed,
+        ));
+
+        assert_eq!(g.device_for_address(&address), Some(&answering));
+        let late = g
+            .nodes()
+            .find(|node| node.id == NodeId::Device(remembered.clone()))
+            .expect("the cached device still exists");
+        assert!(!late.addresses.contains(&address));
+        assert!(
+            late.superseded_addresses
+                .contains(&(address, "02:00:5e:00:00:03".to_string()))
+        );
+    }
+
+    #[test]
+    fn two_validated_replies_for_one_address_are_a_conflict_not_a_winner() {
+        // Both stations answered, both answers were validated. Choosing between them by
+        // arrival order would report a device identity that is at best half the truth --
+        // and this is exactly the shape of a duplicate assignment, a failover pair
+        // mid-transition, or a spoofer.
+        let address: IpAddr = "10.9.0.7".parse().unwrap();
+        let first = DeviceKey::mac("02:00:5e:00:00:05");
+        let second = DeviceKey::mac("02:00:5e:00:00:06");
+
+        let mut g = TopologyGraph::new();
+        for claimant in [&first, &second] {
+            g.absorb(ev(
+                Fact::DeviceAddress {
+                    device: claimant.clone(),
+                    address,
+                },
+                EvidenceSource::ArpProbe,
+                Confidence::Observed,
+            ));
+        }
+
+        assert_eq!(
+            g.device_for_address(&address),
+            None,
+            "a contested address must not resolve to either claimant"
+        );
+
+        let disputes = g.contested_addresses();
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].0, address);
+        assert_eq!(disputes[0].1, vec![first.clone(), second.clone()]);
+
+        // Both keep the address and neither is marked as having lost it.
+        for claimant in [first, second] {
+            let node = g
+                .nodes()
+                .find(|node| node.id == NodeId::Device(claimant.clone()))
+                .expect("both claimants exist in their own right");
+            assert!(node.addresses.contains(&address));
+            assert!(node.contested_addresses.contains(&address));
+            assert!(node.superseded_addresses.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_contested_address_stays_unowned_whoever_claims_it_next() {
+        // Withdrawing ownership on a conflict left the slot empty, so the next claim of any
+        // kind found no holder and took it -- handing the address to whoever spoke last,
+        // which is exactly the arbitrary choice the conflict exists to avoid.
+        let address: IpAddr = "10.9.0.8".parse().unwrap();
+        let a = DeviceKey::mac("02:00:5e:00:00:0a");
+        let b = DeviceKey::mac("02:00:5e:00:00:0b");
+        let c = DeviceKey::mac("02:00:5e:00:00:0c");
+
+        let claim = |g: &mut TopologyGraph, device: &DeviceKey, source| {
+            g.absorb(ev(
+                Fact::DeviceAddress {
+                    device: device.clone(),
+                    address,
+                },
+                source,
+                Confidence::Observed,
+            ));
+        };
+
+        // Every follow-up an operator's link can produce after two stations answered.
+        let follow_ups: [(&str, DeviceKey, EvidenceSource); 3] = [
+            // The first claimant repeats itself on a later sweep.
+            ("a fresh repeat", a.clone(), EvidenceSource::ArpProbe),
+            // A cache read lands after the dispute.
+            ("a stale cache entry", a.clone(), EvidenceSource::ArpCache),
+            // A third station answers for the same address.
+            ("a third claimant", c.clone(), EvidenceSource::ArpProbe),
+        ];
+
+        for (what, device, source) in follow_ups {
+            let mut g = TopologyGraph::new();
+            claim(&mut g, &a, EvidenceSource::ArpProbe);
+            claim(&mut g, &b, EvidenceSource::ArpProbe);
+            claim(&mut g, &device, source);
+
+            assert_eq!(
+                g.device_for_address(&address),
+                None,
+                "{what} must not take a contested address"
+            );
+
+            let disputes = g.contested_addresses();
+            assert_eq!(disputes.len(), 1, "{what}");
+            assert_eq!(disputes[0].0, address);
+            assert!(
+                disputes[0].1.contains(&a) && disputes[0].1.contains(&b),
+                "{what}: both original claimants stay on the record: {:?}",
+                disputes[0].1
+            );
+            // A later claimant joins the dispute rather than settling it.
+            assert!(disputes[0].1.contains(&device), "{what}");
+            assert_eq!(
+                disputes[0].1.len(),
+                if device == c { 3 } else { 2 },
+                "{what}"
+            );
+
+            for claimant in &disputes[0].1 {
+                let node = g
+                    .nodes()
+                    .find(|node| node.id == NodeId::Device(claimant.clone()))
+                    .expect("every claimant exists in its own right");
+                assert!(node.addresses.contains(&address), "{what}");
+                assert!(node.contested_addresses.contains(&address), "{what}");
+                assert!(node.superseded_addresses.is_empty(), "{what}");
+            }
+        }
     }
 
     #[test]
