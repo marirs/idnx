@@ -299,6 +299,82 @@ impl DeviceCoverage {
     }
 }
 
+/// Turns one page-stated prefix into topology, or records why it was not.
+///
+/// A prefix in a page is not a network. Only one the page labelled as its own addressing
+/// may become one, and what it becomes depends on which label: an interface address with a
+/// mask proves attachment, a routing-table entry proves routing, and neither implies the
+/// other. Everything else is reported as a candidate and left alone -- that is where a
+/// documentation literal, a script variable and a firewall rule end up, and promoting one
+/// would fabricate exactly the topology this tool must not invent.
+///
+/// Shared by the root document and the bounded audit so that reading more pages cannot
+/// quietly mean believing more of them.
+#[allow(clippy::too_many_arguments)]
+fn promote_http_prefix(
+    candidate: &crate::probes::http::PrefixCandidate,
+    source: &str,
+    port: u16,
+    device: &DeviceKey,
+    vantage: &str,
+    out: &mut Vec<TopologyEvidence>,
+    coverage: &mut DeviceCoverage,
+) {
+    if !candidate.semantics.establishes_network() {
+        coverage.protocols_confirmed.push(format!(
+            "http/{port} prefix candidate {} not promoted ({})",
+            candidate.prefix,
+            candidate.semantics.label()
+        ));
+        return;
+    }
+
+    coverage.protocols_confirmed.push(format!(
+        "http/{port} stated {} as {}",
+        candidate.prefix,
+        candidate.semantics.label()
+    ));
+    let origin = format!("stated on {source} -- {}", candidate.evidence());
+
+    out.push(
+        TopologyEvidence::new(
+            Fact::Network {
+                prefix: candidate.prefix,
+            },
+            EvidenceSource::TcpProbe,
+            // The device said it. Nothing here observed the network.
+            Confidence::Advertised,
+            vantage,
+        )
+        .with_detail(origin.clone()),
+    );
+
+    let relationship = match candidate.semantics {
+        // An interface address and mask says the device is on that network. It says
+        // nothing whatever about what it routes.
+        crate::probes::http::PrefixSemantics::InterfaceAddress => Fact::AttachedTo {
+            device: device.clone(),
+            network: candidate.prefix,
+        },
+        // Only an explicit routing-table entry establishes routing.
+        crate::probes::http::PrefixSemantics::RouteDestination => Fact::RoutesTo {
+            device: device.clone(),
+            network: candidate.prefix,
+            next_hop: None,
+        },
+        crate::probes::http::PrefixSemantics::Unlabelled => return,
+    };
+    out.push(
+        TopologyEvidence::new(
+            relationship,
+            EvidenceSource::TcpProbe,
+            Confidence::Advertised,
+            vantage,
+        )
+        .with_detail(origin),
+    );
+}
+
 /// Interrogates one device across every applicable protocol and address family.
 pub async fn interrogate_device(
     target: &InterrogationTarget,
@@ -417,6 +493,7 @@ pub async fn interrogate_device(
                 timeout,
                 vantage,
                 &mut coverage,
+                target.tier,
             )
             .await,
         );
@@ -571,6 +648,11 @@ async fn confirm_protocols(
     timeout: Duration,
     vantage: &str,
     coverage: &mut DeviceCoverage,
+    // Why this device is being interrogated. The bounded management audit runs only for a
+    // device whose infrastructure behaviour is already established: reading a dozen pages
+    // off every host on a link would be a scan, and off a confirmed router it is the last
+    // credential-free place a prefix can come from.
+    tier: DeviceTier,
 ) -> Vec<TopologyEvidence> {
     let address = target.address;
     // Identification reads need a longer window than a port probe. A banner arrives after
@@ -819,65 +901,57 @@ async fn confirm_protocols(
         // candidate and left alone -- that is where a documentation literal ends up, and
         // promoting one would fabricate exactly the topology this tool must not invent.
         for candidate in &identity.prefixes {
-            if !candidate.semantics.establishes_network() {
-                coverage.protocols_confirmed.push(format!(
-                    "http/{port} prefix candidate {} not promoted ({})",
-                    candidate.prefix,
-                    candidate.semantics.label()
-                ));
-                continue;
-            }
-
-            coverage.protocols_confirmed.push(format!(
-                "http/{port} stated {} as {}",
-                candidate.prefix,
-                candidate.semantics.label()
-            ));
-
-            let origin = format!(
-                "stated on http://{}:{port} -- {}",
-                target.host_literal(),
-                candidate.evidence()
-            );
-
-            out.push(
-                TopologyEvidence::new(
-                    Fact::Network {
-                        prefix: candidate.prefix,
-                    },
-                    EvidenceSource::TcpProbe,
-                    // The device said it. Nothing here observed the network.
-                    Confidence::Advertised,
-                    vantage,
-                )
-                .with_detail(origin.clone()),
-            );
-
-            let relationship = match candidate.semantics {
-                // An interface address and mask says the device is on that network. It
-                // says nothing whatever about what it routes.
-                crate::probes::http::PrefixSemantics::InterfaceAddress => Fact::AttachedTo {
-                    device: device.clone(),
-                    network: candidate.prefix,
-                },
-                // Only an explicit routing-table entry establishes routing.
-                crate::probes::http::PrefixSemantics::RouteDestination => Fact::RoutesTo {
-                    device: device.clone(),
-                    network: candidate.prefix,
-                    next_hop: None,
-                },
-                crate::probes::http::PrefixSemantics::Unlabelled => continue,
-            };
-            out.push(
-                TopologyEvidence::new(
-                    relationship,
-                    EvidenceSource::TcpProbe,
-                    Confidence::Advertised,
-                    vantage,
-                )
-                .with_detail(origin),
+            promote_http_prefix(
+                candidate,
+                &format!("http://{}:{port}/", target.host_literal()),
+                port,
+                device,
+                vantage,
+                &mut out,
+                coverage,
             );
         }
+
+        // A management surface that answered, on a device whose forwarding behaviour is
+        // already established, is the last credential-free place a prefix can come from.
+        // Bounded hard: same origin, twelve requests, depth one, read-only paths only.
+        if matches!(tier, DeviceTier::EstablishedPivot) {
+            let audit = crate::probes::management::audit(
+                target,
+                port,
+                &identity,
+                binding,
+                identify_timeout,
+            )
+            .await;
+
+            for (path, outcome) in &audit.attempted {
+                coverage
+                    .protocols_confirmed
+                    .push(format!("http/{port} audit {path}: {}", outcome.label()));
+            }
+            if audit.budget_exhausted {
+                coverage.protocols_confirmed.push(format!(
+                    "http/{port} audit stopped at the {}-request budget",
+                    crate::probes::management::REQUEST_BUDGET
+                ));
+            }
+
+            // The audit reads more pages; it does not lower the bar for what a page must
+            // say. Every candidate goes through the same gate as the root document's.
+            for candidate in &audit.candidates {
+                promote_http_prefix(
+                    candidate,
+                    &format!("http://{}:{port} (audited)", target.host_literal()),
+                    port,
+                    device,
+                    vantage,
+                    &mut out,
+                    coverage,
+                );
+            }
+        }
+
         if identity.requires_authentication() {
             coverage.auth_required.push(port);
         }

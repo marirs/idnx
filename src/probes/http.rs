@@ -44,6 +44,12 @@ pub struct HttpIdentity {
     /// Tracked apart from `redirect_target`, which the final response clears -- so a
     /// successfully followed redirect was being reported as though none had happened.
     pub redirect_chain: Vec<String>,
+    /// Links the document published, as written.
+    ///
+    /// Kept so a bounded audit can read what the device offers rather than guessing at
+    /// paths. They are raw attribute values here: whether any of them is same-origin, and
+    /// whether it is read-only, is decided by the caller and not by this parser.
+    pub links: Vec<String>,
     /// A redirect that was not followed, and why.
     ///
     /// An HTTPS target is the common case: same origin includes the scheme, and following
@@ -643,6 +649,10 @@ pub fn parse_http_identity(response: &str) -> Option<HttpIdentity> {
     }
 
     identity.title = extract_title(response);
+    identity.links = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| document_links(body))
+        .unwrap_or_default();
     // Only the body: a header value is never a topology statement, and scanning them would
     // read a Content-Security-Policy or a cookie path as addressing.
     identity.prefixes = response
@@ -650,6 +660,43 @@ pub fn parse_http_identity(response: &str) -> Option<HttpIdentity> {
         .map(|(_, body)| prefix_candidates(body))
         .unwrap_or_default();
     Some(identity)
+}
+
+/// Every `href` and `src` value a document carries, in the order it wrote them.
+///
+/// Deliberately dumb: it extracts, and decides nothing. Whether a link is on this origin,
+/// whether it is safe to fetch, and whether it is worth fetching are the auditor's
+/// decisions, and keeping them out of here means the extraction cannot quietly widen.
+pub fn document_links(body: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let lower = body.to_ascii_lowercase();
+
+    for attribute in ["href=", "src="] {
+        let mut at = 0;
+        while let Some(found) = lower[at..].find(attribute) {
+            let start = at + found + attribute.len();
+            at = start;
+            let rest = &body[start.min(body.len())..];
+            let Some(quote) = rest.chars().next() else {
+                break;
+            };
+            // Unquoted attribute values are ambiguous to delimit; skipping one loses a
+            // link, and mis-delimiting one invents a URL.
+            if quote != '"' && quote != '\'' {
+                continue;
+            }
+            let Some(end) = rest[1..].find(quote) else {
+                continue;
+            };
+            let value = rest[1..1 + end].trim();
+            if !value.is_empty() && links.len() < 200 {
+                links.push(value.to_string());
+            }
+            at = start + 1 + end;
+        }
+    }
+
+    links
 }
 
 /// Extracts `<title>` from a body, if any.

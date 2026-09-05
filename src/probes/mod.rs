@@ -9,6 +9,7 @@ pub mod http;
 pub mod icmp_mask;
 pub mod isis;
 pub mod lldp;
+pub mod management;
 pub mod mndp;
 pub mod natpmp;
 pub mod ndp;
