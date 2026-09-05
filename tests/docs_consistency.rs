@@ -17,23 +17,69 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn docs() -> Vec<(String, String)> {
-    let mut out = vec![(
-        "README.md".to_string(),
-        std::fs::read_to_string(repo().join("README.md")).expect("the README is readable"),
-    )];
-    let dir = repo().join("docs");
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("docs/ is readable")
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-        .collect();
-    entries.sort();
-    for path in entries {
-        let name = format!("docs/{}", path.file_name().unwrap().to_string_lossy());
-        out.push((name, std::fs::read_to_string(&path).expect("readable")));
+/// The marker that takes a document out of scope.
+///
+/// A design record from before the code existed cannot be held to the code's behaviour, and
+/// rewriting one to match would destroy the reason it is kept. It is excluded by saying so
+/// in the document, in a form both a reader and this test can see -- never by a path
+/// exclusion in the test, which the document's author would never know about.
+const SUPERSEDED: &str = "Status: Superseded";
+
+/// Whether a document declares itself superseded.
+///
+/// A whole line in the header, not the phrase anywhere in the body: this document's own
+/// banner explains the marker in prose, and a substring match let that explanation count as
+/// the marker itself -- which would have excluded the file even after someone deliberately
+/// changed its status back.
+fn is_superseded(text: &str) -> bool {
+    text.lines().take(30).any(|line| line.trim() == SUPERSEDED)
+}
+
+/// Every Markdown file in the repository's documentation, at any depth.
+///
+/// Recursive, because it was not: the design specification two directories down still
+/// required an `OpaqueBoundary` node the default build deliberately does not emit, and
+/// nothing noticed.
+fn markdown_files() -> Vec<(String, String)> {
+    fn walk(dir: &Path, into: &mut Vec<PathBuf>) {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("{} is readable: {error}", dir.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, into);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                into.push(path);
+            }
+        }
     }
-    out
+
+    let root = repo();
+    let mut files = vec![root.join("README.md")];
+    walk(&root.join("docs"), &mut files);
+
+    files
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let text = std::fs::read_to_string(&path).expect("readable");
+            (name, text)
+        })
+        .collect()
+}
+
+/// The documents that describe current behaviour, which is what the checks below apply to.
+fn docs() -> Vec<(String, String)> {
+    markdown_files()
+        .into_iter()
+        .filter(|(_, text)| !is_superseded(text))
+        .collect()
 }
 
 /// Every long option the CLI actually defines, read from its definition rather than from a
@@ -193,6 +239,16 @@ fn retracted_claims_do_not_come_back() {
             "nothing in the default build asserts an opaque boundary",
         ),
         (
+            "`opaqueboundary` node is created",
+            "no provider creates one; a forwarding interface with unresolved downstream \
+             prefixes is what the evidence supports",
+        ),
+        (
+            "appears as an opaque boundary",
+            "a NAT relationship is a claim about what is behind a device, which a single \
+             endpoint cannot establish",
+        ),
+        (
             "ICMP echo sweeps with dynamic timeout",
             "the ICMP path is interface-bound, correlated, and reports what it sent",
         ),
@@ -252,6 +308,45 @@ fn nothing_implemented_is_still_listed_as_planned() {
         assert!(
             !roadmap.contains(planned_line),
             "the roadmap lists {planned_line:?} as planned, but {why} ({artefact})"
+        );
+    }
+}
+
+#[test]
+fn the_recursive_walk_reaches_nested_documents() {
+    // The check that this test is looking where it claims to. Scanning only the top level of
+    // docs/ is how a design specification two directories down went on requiring behaviour
+    // the code deliberately does not have.
+    let all = markdown_files();
+    assert!(
+        all.iter().any(|(name, _)| name.contains("superpowers")),
+        "nested documents are walked: {:?}",
+        all.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
+    assert!(
+        all.len() > docs().len(),
+        "and something is excluded by marker"
+    );
+}
+
+#[test]
+fn a_superseded_document_says_so_and_says_what_replaced_it() {
+    // Exclusion is a claim about a document, so the document has to carry it -- and carry
+    // enough for a reader who lands there first to know where current behaviour is written
+    // down. A file that merely disagrees with the code is not superseded; it is wrong.
+    for (name, text) in markdown_files() {
+        if !is_superseded(&text) {
+            continue;
+        }
+        let head: String = text.lines().take(30).collect::<Vec<_>>().join(" ");
+        assert!(
+            head.contains("README.md") || head.contains("docs/architecture.md"),
+            "{name} is superseded but does not say what to read instead"
+        );
+        assert!(
+            text.contains("Addendum") || text.contains("addendum"),
+            "{name} is superseded but does not record where the implementation departed \
+             from it, which is the only reason to keep it"
         );
     }
 }
