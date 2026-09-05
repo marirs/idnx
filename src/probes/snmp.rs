@@ -32,6 +32,11 @@ pub const PDU_GET_NEXT_REQUEST: u8 = 0xA1;
 pub const PDU_GET_RESPONSE: u8 = 0xA2;
 
 // Standard MIB-II OIDs
+/// SNMPv2c exception markers, carried in the varbind value rather than the error status.
+pub const TAG_NO_SUCH_OBJECT: u8 = 0x80;
+pub const TAG_NO_SUCH_INSTANCE: u8 = 0x81;
+pub const TAG_END_OF_MIB_VIEW: u8 = 0x82;
+
 pub const OID_SYS_DESCR: &str = "1.3.6.1.2.1.1.1.0";
 pub const OID_SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
 pub const OID_IP_NET_TO_MEDIA_TABLE: &str = "1.3.6.1.2.1.4.22.1"; // ARP table
@@ -100,6 +105,19 @@ pub enum BerValue {
 }
 
 impl BerValue {
+    /// Whether this value is the agent saying the MIB view ends here.
+    pub fn is_end_of_mib_view(&self) -> bool {
+        matches!(self, BerValue::Unknown(TAG_END_OF_MIB_VIEW, _))
+    }
+
+    /// Whether this value is the agent saying the object or instance does not exist.
+    pub fn is_absent(&self) -> bool {
+        matches!(
+            self,
+            BerValue::Unknown(TAG_NO_SUCH_OBJECT, _) | BerValue::Unknown(TAG_NO_SUCH_INSTANCE, _)
+        )
+    }
+
     pub fn as_str(&self) -> Option<String> {
         match self {
             BerValue::OctetString(bytes) => String::from_utf8(bytes.clone()).ok().or_else(|| {
@@ -351,6 +369,18 @@ fn decode_integer_value(data: &[u8]) -> i64 {
     val
 }
 
+/// The bytes a declared length covers, or a stated refusal.
+///
+/// Every one of these was an unchecked slice. A response whose length byte claimed more
+/// than arrived -- which is a truncated datagram, a mis-framed one, or a hostile one --
+/// panicked the decoder and took the run with it. A declared length is a claim by the
+/// sender, and the only safe reading of a claim that overruns the buffer is to refuse the
+/// message.
+fn field<'a>(data: &'a [u8], offset: usize, len: usize, what: &str) -> Result<&'a [u8], String> {
+    data.get(offset..offset + len)
+        .ok_or_else(|| format!("{what} declares {len} bytes and the message does not hold them"))
+}
+
 pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
     let mut offset = 0;
     if offset >= data.len() || data[offset] != TAG_SEQUENCE {
@@ -365,7 +395,7 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
     }
     offset += 1;
     let vlen = decode_length(data, &mut offset)?;
-    let version = decode_integer_value(&data[offset..offset + vlen]) as i32;
+    let version = decode_integer_value(field(data, offset, vlen, "the version")?) as i32;
     offset += vlen;
 
     // 2. Community
@@ -374,7 +404,8 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
     }
     offset += 1;
     let clen = decode_length(data, &mut offset)?;
-    let community = String::from_utf8_lossy(&data[offset..offset + clen]).to_string();
+    let community =
+        String::from_utf8_lossy(field(data, offset, clen, "the community")?).to_string();
     offset += clen;
 
     // 3. PDU
@@ -391,7 +422,7 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
     }
     offset += 1;
     let rlen = decode_length(data, &mut offset)?;
-    let request_id = decode_integer_value(&data[offset..offset + rlen]) as i32;
+    let request_id = decode_integer_value(field(data, offset, rlen, "the request id")?) as i32;
     offset += rlen;
 
     // PDU: error-status
@@ -400,7 +431,7 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
     }
     offset += 1;
     let elen = decode_length(data, &mut offset)?;
-    let error_status = decode_integer_value(&data[offset..offset + elen]) as i32;
+    let error_status = decode_integer_value(field(data, offset, elen, "the error status")?) as i32;
     offset += elen;
 
     // PDU: error-index
@@ -409,7 +440,7 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
     }
     offset += 1;
     let ilen = decode_length(data, &mut offset)?;
-    let error_index = decode_integer_value(&data[offset..offset + ilen]) as i32;
+    let error_index = decode_integer_value(field(data, offset, ilen, "the error index")?) as i32;
     offset += ilen;
 
     // PDU: VarBindList (SEQUENCE OF VarBind)
@@ -436,7 +467,7 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
         }
         offset += 1;
         let oid_len = decode_length(data, &mut offset)?;
-        let oid = decode_oid_value(&data[offset..offset + oid_len])?;
+        let oid = decode_oid_value(field(data, offset, oid_len, "an OID")?)?;
         offset += oid_len;
 
         // Value
@@ -444,7 +475,7 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
             let val_tag = data[offset];
             offset += 1;
             let val_len = decode_length(data, &mut offset)?;
-            let val_bytes = &data[offset..offset + val_len];
+            let val_bytes = field(data, offset, val_len, "a varbind value")?;
 
             let val = match val_tag {
                 TAG_INTEGER => BerValue::Integer(decode_integer_value(val_bytes)),
@@ -485,42 +516,270 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
 // ---------------------------------------------------------------------------
 
 /// Performs a single SNMP GET or GET-NEXT request over UDP
+/// Where an SNMP conversation goes, and which device it is about.
+///
+/// Two addresses, because they are two different things. `device` is the identity every
+/// resulting fact is attributed to; `transport` is where the datagrams are sent. They are
+/// the same in every real run, and separating them is what lets a test drive the whole
+/// provider path against a loopback agent while the topology it produces still describes
+/// documentation addresses. It is deliberately not reachable from the command line: an
+/// operator asking about one device and probing another is not a mode worth having.
+#[derive(Debug, Clone)]
+pub(crate) struct SnmpTarget {
+    /// The identity every resulting fact is attributed to.
+    pub device: Ipv4Addr,
+    pub transport: SocketAddrV4,
+    pub community: String,
+}
+
+impl SnmpTarget {
+    /// The ordinary case: ask the device itself, on the standard port.
+    pub fn direct(device: Ipv4Addr, port: u16, community: &str) -> Self {
+        Self {
+            device,
+            transport: SocketAddrV4::new(device, port),
+            community: community.to_string(),
+        }
+    }
+}
+
+/// The largest response this will read.
+///
+/// A bound rather than a buffer size: an agent that answers with more than this is either
+/// broken or not an agent, and reading further would let one device dictate how much memory
+/// a run spends.
+const MAX_RESPONSE_BYTES: usize = 8192;
+
+/// The most varbinds one response may carry.
+const MAX_VARBINDS: usize = 128;
+
+/// Sends one request and validates the answer against it.
+///
+/// Everything checked here is something an unvalidated implementation would accept from any
+/// host that happened to answer: the source address, the version, the community, the PDU
+/// type and the request id. A response failing any of them is not a weaker answer -- it is
+/// an answer to a different question, or from a different party.
+///
+/// The community never appears in an error. It is a shared secret in every deployment that
+/// changes it from the default, and a diagnostic is exactly where one leaks.
 async fn snmp_request(
-    target: Ipv4Addr,
-    port: u16,
-    community: &str,
+    target: &SnmpTarget,
     pdu_type: u8,
     oid: &Oid,
     binding: &SocketBinding,
     timeout: Duration,
 ) -> Result<SnmpMessage, String> {
-    let dest = SocketAddrV4::new(target, port);
+    let dest = target.transport;
     let socket = binding
         .udp_socket(&std::net::SocketAddr::V4(dest))
         .await
         .map_err(|e| format!("UDP bind error: {}", e))?;
-    let request_id = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        & 0x7FFFFFFF) as i32;
 
-    let req_bytes = build_snmp_request(1, community, request_id, pdu_type, oid); // SNMPv2c
+    // Derived from the clock and the OID, so two requests in one run do not share an id and
+    // a late reply to an earlier question cannot be read as an answer to this one.
+    let request_id = {
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        let mixed = clock ^ (oid.0.iter().map(|part| *part as i64).sum::<i64>() << 16);
+        (mixed & 0x7FFF_FFFF) as i32
+    };
+
+    let req_bytes = build_snmp_request(1, &target.community, request_id, pdu_type, oid);
     socket
         .send_to(&req_bytes, dest)
         .await
         .map_err(|e| format!("UDP send error: {}", e))?;
 
-    let mut buf = [0u8; 4096];
-    let recv_fut = socket.recv_from(&mut buf);
-    match tokio::time::timeout(timeout, recv_fut).await {
-        Ok(Ok((len, _from))) => decode_snmp_response(&buf[..len]),
-        Ok(Err(e)) => Err(format!("UDP recv error: {}", e)),
-        Err(_) => Err("SNMP request timed out".to_string()),
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = [0u8; MAX_RESPONSE_BYTES];
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("SNMP request timed out".to_string());
+        }
+        let (len, from) = match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
+            Ok(Ok(received)) => received,
+            Ok(Err(e)) => return Err(format!("UDP recv error: {}", e)),
+            Err(_) => return Err("SNMP request timed out".to_string()),
+        };
+
+        // A datagram from anywhere else is not this device's answer, whatever it contains.
+        match from {
+            std::net::SocketAddr::V4(v4) if v4 == dest => {}
+            _ => continue,
+        }
+
+        let message = decode_snmp_response(&buf[..len])?;
+        // Version 1 on the wire is SNMPv2c, which is what was asked.
+        if message.version != 1 {
+            return Err(format!(
+                "response used SNMP version {} where v2c was asked",
+                message.version
+            ));
+        }
+        if message.community != target.community {
+            // Neither community is named: the one we sent is a secret, and the one that
+            // came back is whatever an unrelated agent happens to use.
+            return Err("response carried a different community".to_string());
+        }
+        if message.pdu.pdu_type != PDU_GET_RESPONSE {
+            return Err(format!(
+                "response was PDU type {:#04x}, not a GetResponse",
+                message.pdu.pdu_type
+            ));
+        }
+        if message.pdu.request_id != request_id {
+            return Err("response did not carry the request id it answers".to_string());
+        }
+        if message.pdu.varbinds.len() > MAX_VARBINDS {
+            return Err(format!(
+                "response carried {} varbinds, beyond the {MAX_VARBINDS} this reads",
+                message.pdu.varbinds.len()
+            ));
+        }
+        return Ok(message);
     }
 }
 
-/// Walks an SNMP subtree starting from `root_oid`
+/// Why a walk stopped.
+///
+/// Named rather than collapsed into an empty result. "The table ended" and "the agent
+/// repeated an OID" produce the same rows and mean opposite things about the agent, and a
+/// walk that stopped because it hit a bound has not seen the whole table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalkEnd {
+    /// The agent said the MIB view ends here (SNMPv2c endOfMibView).
+    EndOfMibView,
+    /// The next OID left the subtree, which is the ordinary end of a table.
+    LeftSubtree,
+    /// The agent reported an error status, SNMPv1 noSuchName among them.
+    AgentError(i32),
+    /// The agent answered with an OID that did not advance. Repeating or going backwards
+    /// makes a walk loop, so it terminates as invalid rather than continuing.
+    OidDidNotAdvance,
+    /// A response failed validation, or none arrived.
+    Invalid(String),
+    /// A bound stopped it: the step limit or the total time.
+    Bounded(&'static str),
+}
+
+/// The rows a walk collected, and why it stopped.
+#[derive(Debug, Clone)]
+pub struct Walk {
+    pub rows: Vec<(Oid, BerValue)>,
+    pub end: WalkEnd,
+}
+
+impl Walk {
+    /// Whether the walk saw the whole subtree rather than stopping early.
+    pub fn complete(&self) -> bool {
+        matches!(self.end, WalkEnd::EndOfMibView | WalkEnd::LeftSubtree)
+    }
+}
+
+/// Walks an SNMP subtree starting from `root_oid`.
+///
+/// Bounded three ways, because an agent controls how long this runs otherwise: a step
+/// limit, a total time limit, and the per-response limits the request path enforces. Each
+/// bound is reported rather than being indistinguishable from a table that simply ended.
+pub(crate) async fn snmp_walk_target(
+    target: &SnmpTarget,
+    root_oid: &Oid,
+    binding: &SocketBinding,
+    timeout: Duration,
+    max_steps: usize,
+    total_budget: Duration,
+) -> Walk {
+    let mut rows = Vec::new();
+    let mut current_oid = root_oid.clone();
+    let deadline = tokio::time::Instant::now() + total_budget;
+
+    for step in 0..max_steps {
+        if tokio::time::Instant::now() >= deadline {
+            return Walk {
+                rows,
+                end: WalkEnd::Bounded("the walk's total time budget"),
+            };
+        }
+        let _ = step;
+
+        let message = match snmp_request(
+            target,
+            PDU_GET_NEXT_REQUEST,
+            &current_oid,
+            binding,
+            timeout,
+        )
+        .await
+        {
+            Ok(message) => message,
+            Err(reason) => {
+                return Walk {
+                    rows,
+                    end: WalkEnd::Invalid(reason),
+                };
+            }
+        };
+
+        // An error status ends the walk and says so. SNMPv1 agents end a table with
+        // noSuchName (2) where v2c uses an endOfMibView marker in the varbind.
+        if message.pdu.error_status != 0 {
+            return Walk {
+                rows,
+                end: WalkEnd::AgentError(message.pdu.error_status),
+            };
+        }
+        let Some((next_oid, value)) = message.pdu.varbinds.first().cloned() else {
+            return Walk {
+                rows,
+                end: WalkEnd::Invalid("response carried no varbind".to_string()),
+            };
+        };
+
+        // SNMPv2c marks the end of the view in the value rather than in the error status.
+        if value.is_end_of_mib_view() {
+            return Walk {
+                rows,
+                end: WalkEnd::EndOfMibView,
+            };
+        }
+        if value.is_absent() {
+            return Walk {
+                rows,
+                end: WalkEnd::LeftSubtree,
+            };
+        }
+
+        if !next_oid.starts_with(root_oid) {
+            return Walk {
+                rows,
+                end: WalkEnd::LeftSubtree,
+            };
+        }
+        // Strictly increasing, always. An agent that repeats an OID -- or answers with an
+        // earlier one -- makes this loop until a bound stops it, and the rows after such an
+        // answer describe an order nobody guaranteed.
+        if next_oid <= current_oid {
+            return Walk {
+                rows,
+                end: WalkEnd::OidDidNotAdvance,
+            };
+        }
+
+        current_oid = next_oid.clone();
+        rows.push((next_oid, value));
+    }
+
+    Walk {
+        rows,
+        end: WalkEnd::Bounded("the walk's step limit"),
+    }
+}
+
+/// Walks a subtree on a device, at its own address.
 pub async fn snmp_walk(
     target: Ipv4Addr,
     port: u16,
@@ -530,45 +789,17 @@ pub async fn snmp_walk(
     timeout: Duration,
     max_steps: usize,
 ) -> Vec<(Oid, BerValue)> {
-    let mut results = Vec::new();
-    let mut current_oid = root_oid.clone();
-
-    for _ in 0..max_steps {
-        match snmp_request(
-            target,
-            port,
-            community,
-            PDU_GET_NEXT_REQUEST,
-            &current_oid,
-            binding,
-            timeout,
-        )
-        .await
-        {
-            Ok(msg) => {
-                if msg.pdu.error_status != 0 || msg.pdu.varbinds.is_empty() {
-                    break;
-                }
-                let (next_oid, value) = msg.pdu.varbinds[0].clone();
-
-                // Stop if we walked outside the root subtree
-                if !next_oid.starts_with(root_oid) {
-                    break;
-                }
-
-                // Stop if OID didn't advance (loop protection)
-                if next_oid <= current_oid {
-                    break;
-                }
-
-                current_oid = next_oid.clone();
-                results.push((next_oid, value));
-            }
-            Err(_) => break,
-        }
-    }
-
-    results
+    snmp_walk_target(
+        &SnmpTarget::direct(target, port, community),
+        root_oid,
+        binding,
+        timeout,
+        max_steps,
+        // A table that has not finished in this long is not going to.
+        Duration::from_secs(20),
+    )
+    .await
+    .rows
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +825,8 @@ pub struct SnmpRouteEntry {
 /// Router/Switch hardware information
 #[derive(Debug, Clone, Default)]
 pub struct SnmpDeviceInfo {
+    /// The device the answers came from, which is what every resulting fact is about.
+    pub device: Option<Ipv4Addr>,
     pub sys_descr: Option<String>,
     pub sys_name: Option<String>,
     pub arp_cache: Vec<SnmpArpEntry>,
@@ -609,19 +842,40 @@ pub async fn harvest_snmp_device(
     binding: &SocketBinding,
     timeout: Duration,
 ) -> Option<SnmpDeviceInfo> {
-    // 1. Probe sysDescr to verify SNMP responsiveness and community validity
-    let sys_descr_oid = Oid::from_str(OID_SYS_DESCR).ok()?;
-    let sys_descr_msg = snmp_request(
-        target,
-        port,
-        community,
-        PDU_GET_REQUEST,
-        &sys_descr_oid,
+    harvest_snmp_target(
+        &SnmpTarget::direct(target, port, community),
         binding,
         timeout,
     )
     .await
-    .ok()?;
+}
+
+/// One bounded walk's rows, with the reason it stopped discarded.
+///
+/// The harvesters want the table; the reason a walk ended matters to the caller that is
+/// testing the walk, and is reported there.
+async fn walk_rows(
+    target: &SnmpTarget,
+    root: &Oid,
+    binding: &SocketBinding,
+    timeout: Duration,
+) -> Vec<(Oid, BerValue)> {
+    snmp_walk_target(target, root, binding, timeout, 512, Duration::from_secs(20))
+        .await
+        .rows
+}
+
+/// Harvests one device, sending to wherever the target says.
+pub(crate) async fn harvest_snmp_target(
+    target: &SnmpTarget,
+    binding: &SocketBinding,
+    timeout: Duration,
+) -> Option<SnmpDeviceInfo> {
+    // 1. Probe sysDescr to verify SNMP responsiveness and community validity
+    let sys_descr_oid = Oid::from_str(OID_SYS_DESCR).ok()?;
+    let sys_descr_msg = snmp_request(target, PDU_GET_REQUEST, &sys_descr_oid, binding, timeout)
+        .await
+        .ok()?;
 
     if sys_descr_msg.pdu.varbinds.is_empty() {
         return None;
@@ -631,16 +885,8 @@ pub async fn harvest_snmp_device(
 
     // 2. Query sysName
     let sys_name_oid = Oid::from_str(OID_SYS_NAME).ok()?;
-    let sys_name = if let Ok(msg) = snmp_request(
-        target,
-        port,
-        community,
-        PDU_GET_REQUEST,
-        &sys_name_oid,
-        binding,
-        timeout,
-    )
-    .await
+    let sys_name = if let Ok(msg) =
+        snmp_request(target, PDU_GET_REQUEST, &sys_name_oid, binding, timeout).await
     {
         msg.pdu.varbinds.first().and_then(|vb| vb.1.as_str())
     } else {
@@ -648,6 +894,7 @@ pub async fn harvest_snmp_device(
     };
 
     let mut info = SnmpDeviceInfo {
+        device: Some(target.device),
         sys_descr,
         sys_name,
         arp_cache: Vec::new(),
@@ -660,8 +907,7 @@ pub async fn harvest_snmp_device(
     // .2 = ipNetToMediaPhysAddress (MAC)
     // .3 = ipNetToMediaNetAddress (IP)
     if let Ok(arp_root) = Oid::from_str(OID_IP_NET_TO_MEDIA_TABLE) {
-        let arp_results =
-            snmp_walk(target, port, community, &arp_root, binding, timeout, 512).await;
+        let arp_results = walk_rows(target, &arp_root, binding, timeout).await;
         let mut ip_map: std::collections::HashMap<
             Vec<u32>,
             (Option<Ipv4Addr>, Option<String>, u32),
@@ -703,8 +949,7 @@ pub async fn harvest_snmp_device(
     // .7 = ipRouteNextHop
     // .11 = ipRouteMask
     if let Ok(route_root) = Oid::from_str(OID_IP_ROUTE_TABLE) {
-        let route_results =
-            snmp_walk(target, port, community, &route_root, binding, timeout, 256).await;
+        let route_results = walk_rows(target, &route_root, binding, timeout).await;
         type RouteTuple = (Option<Ipv4Addr>, Option<Ipv4Addr>, Option<Ipv4Addr>);
         let mut route_map: std::collections::HashMap<Vec<u32>, RouteTuple> =
             std::collections::HashMap::new();
@@ -741,8 +986,7 @@ pub async fn harvest_snmp_device(
     // .1 = ipAdEntAddr
     // .3 = ipAdEntNetMask
     if let Ok(addr_root) = Oid::from_str(OID_IP_ADDR_TABLE) {
-        let addr_results =
-            snmp_walk(target, port, community, &addr_root, binding, timeout, 64).await;
+        let addr_results = walk_rows(target, &addr_root, binding, timeout).await;
         let mut addr_map: std::collections::HashMap<
             Vec<u32>,
             (Option<Ipv4Addr>, Option<Ipv4Addr>),
@@ -776,6 +1020,456 @@ pub async fn harvest_snmp_device(
 // ---------------------------------------------------------------------------
 // UNIT TESTS
 // ---------------------------------------------------------------------------
+
+/// A scripted agent on loopback, for testing the conversation rather than the codec.
+///
+/// Parsing a hand-built response proves the decoder reads bytes. It does not prove the walk
+/// terminates, that a reply to someone else's request is refused, or that an agent which
+/// repeats an OID is stopped -- those are properties of the exchange, and the only way to
+/// exercise them is against something that answers, including answering wrongly.
+#[cfg(test)]
+pub mod fake_agent {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// How the agent answers one request.
+    #[derive(Debug, Clone)]
+    pub enum Reply {
+        /// The varbind to return, echoing the request id.
+        Varbind(Oid, BerValue),
+        /// An SNMPv2c end-of-view marker.
+        EndOfMibView(Oid),
+        /// An error status, as an SNMPv1 agent ends a table (noSuchName is 2).
+        Error(i32),
+        /// A well-formed response carrying someone else's request id.
+        WrongRequestId(Oid, BerValue),
+        /// A well-formed response carrying a different community.
+        WrongCommunity(Oid, BerValue),
+        /// A response that is not a GetResponse.
+        WrongPduType(Oid, BerValue),
+        /// Bytes that are not a decodable message.
+        Malformed(Vec<u8>),
+        /// No answer at all.
+        Silence,
+    }
+
+    /// A running agent. Dropping it stops the thread.
+    pub struct FakeAgent {
+        pub port: u16,
+        stop: Arc<AtomicBool>,
+        served: Arc<AtomicUsize>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeAgent {
+        /// Binds an ephemeral loopback port and answers with `script` in order, repeating
+        /// the last entry once it runs out.
+        pub fn start(community: &str, script: Vec<Reply>) -> Self {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("an ephemeral loopback port");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("a read timeout");
+            let port = socket.local_addr().expect("a bound address").port();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let served = Arc::new(AtomicUsize::new(0));
+            let community = community.to_string();
+            let (stopper, counter) = (Arc::clone(&stop), Arc::clone(&served));
+
+            let handle = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while !stopper.load(Ordering::Relaxed) {
+                    let Ok((len, from)) = socket.recv_from(&mut buf) else {
+                        continue;
+                    };
+                    let Ok(request) = decode_snmp_response(&buf[..len]) else {
+                        continue;
+                    };
+                    let step = counter.fetch_add(1, Ordering::Relaxed);
+                    let reply = script
+                        .get(step)
+                        .or_else(|| script.last())
+                        .cloned()
+                        .unwrap_or(Reply::Silence);
+
+                    let response = match reply {
+                        Reply::Silence => continue,
+                        Reply::Malformed(bytes) => bytes,
+                        Reply::Varbind(oid, value) => response(
+                            &community,
+                            request.pdu.request_id,
+                            PDU_GET_RESPONSE,
+                            0,
+                            &oid,
+                            &value,
+                        ),
+                        Reply::EndOfMibView(oid) => response(
+                            &community,
+                            request.pdu.request_id,
+                            PDU_GET_RESPONSE,
+                            0,
+                            &oid,
+                            &BerValue::Unknown(TAG_END_OF_MIB_VIEW, Vec::new()),
+                        ),
+                        Reply::Error(status) => response(
+                            &community,
+                            request.pdu.request_id,
+                            PDU_GET_RESPONSE,
+                            status,
+                            &Oid(vec![1, 3, 6, 1]),
+                            &BerValue::Null,
+                        ),
+                        Reply::WrongRequestId(oid, value) => response(
+                            &community,
+                            request.pdu.request_id.wrapping_add(1),
+                            PDU_GET_RESPONSE,
+                            0,
+                            &oid,
+                            &value,
+                        ),
+                        Reply::WrongCommunity(oid, value) => response(
+                            "someone-elses-agent",
+                            request.pdu.request_id,
+                            PDU_GET_RESPONSE,
+                            0,
+                            &oid,
+                            &value,
+                        ),
+                        Reply::WrongPduType(oid, value) => response(
+                            &community,
+                            request.pdu.request_id,
+                            PDU_GET_NEXT_REQUEST,
+                            0,
+                            &oid,
+                            &value,
+                        ),
+                    };
+                    let _ = socket.send_to(&response, from);
+                }
+            });
+
+            Self {
+                port,
+                stop,
+                served,
+                handle: Some(handle),
+            }
+        }
+
+        /// How many requests it has answered.
+        pub fn served(&self) -> usize {
+            self.served.load(Ordering::Relaxed)
+        }
+
+        /// A target whose device address is a documentation address and whose transport is
+        /// this agent: the topology describes 192.0.2.x while the datagrams stay on
+        /// loopback.
+        pub(crate) fn target(&self, device: &str, community: &str) -> SnmpTarget {
+            SnmpTarget {
+                device: device.parse().expect("a documentation address"),
+                transport: SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, self.port),
+                community: community.to_string(),
+            }
+        }
+    }
+
+    impl Drop for FakeAgent {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Encodes one response message.
+    fn response(
+        community: &str,
+        request_id: i32,
+        pdu_type: u8,
+        error_status: i32,
+        oid: &Oid,
+        value: &BerValue,
+    ) -> Vec<u8> {
+        let mut varbind = Vec::new();
+        varbind.extend_from_slice(&encode_oid(oid));
+        varbind.extend_from_slice(&encode_value(value));
+        let varbind = encode_tlv(TAG_SEQUENCE, &varbind);
+        let varbinds = encode_tlv(TAG_SEQUENCE, &varbind);
+
+        let mut pdu = Vec::new();
+        pdu.extend_from_slice(&encode_integer(request_id as i64));
+        pdu.extend_from_slice(&encode_integer(error_status as i64));
+        pdu.extend_from_slice(&encode_integer(0)); // error index
+        pdu.extend_from_slice(&varbinds);
+        let pdu = encode_tlv(pdu_type, &pdu);
+
+        let mut message = Vec::new();
+        message.extend_from_slice(&encode_integer(1)); // SNMPv2c
+        message.extend_from_slice(&encode_tlv(TAG_OCTET_STRING, community.as_bytes()));
+        message.extend_from_slice(&pdu);
+        encode_tlv(TAG_SEQUENCE, &message)
+    }
+
+    fn encode_value(value: &BerValue) -> Vec<u8> {
+        match value {
+            BerValue::Null => encode_tlv(TAG_NULL, &[]),
+            BerValue::Integer(number) => encode_integer(*number),
+            BerValue::OctetString(bytes) => encode_tlv(TAG_OCTET_STRING, bytes),
+            BerValue::IpAddress(address) => encode_tlv(TAG_IP_ADDRESS, &address.octets()),
+            BerValue::Counter32(number) => encode_integer(*number as i64),
+            BerValue::Gauge32(number) => encode_integer(*number as i64),
+            BerValue::TimeTicks(number) => encode_integer(*number as i64),
+            BerValue::Oid(oid) => encode_oid(oid),
+            BerValue::Unknown(tag, bytes) => encode_tlv(*tag, bytes),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle {
+    //! The conversation, not the codec.
+    //!
+    //! Every test here runs against an agent that actually answers on loopback, because the
+    //! properties worth proving are properties of an exchange: that a walk terminates, that
+    //! a reply to someone else's request is refused, that an agent repeating an OID is
+    //! stopped rather than followed until a bound. A hand-built byte string cannot fail in
+    //! any of those ways.
+
+    use super::fake_agent::{FakeAgent, Reply};
+    use super::*;
+
+    /// The device every fixture describes. Documentation address: the topology produced is
+    /// about 192.0.2.1 while the datagrams never leave loopback.
+    const DEVICE: &str = "192.0.2.1";
+    const COMMUNITY: &str = "fixture-community";
+
+    fn binding() -> SocketBinding {
+        SocketBinding::unbound()
+    }
+
+    fn oid(text: &str) -> Oid {
+        Oid::from_str(text).expect("a literal OID")
+    }
+
+    fn walk(agent: &FakeAgent, root: &str) -> Walk {
+        let target = agent.target(DEVICE, COMMUNITY);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(snmp_walk_target(
+                &target,
+                &oid(root),
+                &binding(),
+                Duration::from_millis(400),
+                16,
+                Duration::from_secs(5),
+            ))
+    }
+
+    #[test]
+    fn a_walk_collects_a_table_and_ends_at_the_mib_view() {
+        // Three rows and then the agent says the view ends. That is a complete walk, and it
+        // is distinguishable from one that stopped for any other reason.
+        let root = "1.3.6.1.2.1.4.20.1.1";
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![
+                Reply::Varbind(
+                    oid("1.3.6.1.2.1.4.20.1.1.192.0.2.1"),
+                    BerValue::IpAddress("192.0.2.1".parse().unwrap()),
+                ),
+                Reply::Varbind(
+                    oid("1.3.6.1.2.1.4.20.1.1.198.51.100.1"),
+                    BerValue::IpAddress("198.51.100.1".parse().unwrap()),
+                ),
+                Reply::EndOfMibView(oid("1.3.6.1.2.1.4.20.1.2")),
+            ],
+        );
+
+        let result = walk(&agent, root);
+        assert_eq!(result.end, WalkEnd::EndOfMibView);
+        assert!(result.complete());
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(agent.served(), 3, "one request per step, and no more");
+    }
+
+    #[test]
+    fn a_walk_ends_when_the_next_oid_leaves_the_subtree() {
+        // The ordinary end of a table on an agent that keeps walking into the next one.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![
+                Reply::Varbind(oid("1.3.6.1.2.1.4.21.1.1.0.0.0.0"), BerValue::Integer(1)),
+                Reply::Varbind(oid("1.3.6.1.2.1.4.22.1.1.1"), BerValue::Integer(2)),
+            ],
+        );
+
+        let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+        assert_eq!(result.end, WalkEnd::LeftSubtree);
+        assert!(result.complete());
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "the row from the next table is not ours"
+        );
+    }
+
+    #[test]
+    fn an_snmpv1_agent_ending_a_table_with_no_such_name_is_reported_as_that() {
+        // v1 has no end-of-view marker: it ends a table with an error status. Reporting it
+        // as an error rather than as a completed walk is the honest reading.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![
+                Reply::Varbind(oid("1.3.6.1.2.1.4.21.1.1.0.0.0.0"), BerValue::Integer(1)),
+                Reply::Error(2), // noSuchName
+            ],
+        );
+
+        let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+        assert_eq!(result.end, WalkEnd::AgentError(2));
+        assert!(!result.complete());
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn an_agent_that_repeats_an_oid_terminates_the_walk_as_invalid() {
+        // The failure this prevents: an agent that answers every GETNEXT with the same OID
+        // makes a walk run until a bound stops it, and every row after the repeat describes
+        // an order nobody guaranteed.
+        let stuck = oid("1.3.6.1.2.1.4.21.1.1.10.0.0.0");
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![
+                Reply::Varbind(stuck.clone(), BerValue::Integer(1)),
+                Reply::Varbind(stuck.clone(), BerValue::Integer(1)),
+            ],
+        );
+
+        let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+        assert_eq!(result.end, WalkEnd::OidDidNotAdvance);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            agent.served(),
+            2,
+            "it stopped at the repeat, not at the bound"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_walks_backwards_is_stopped_too() {
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![
+                Reply::Varbind(oid("1.3.6.1.2.1.4.21.1.1.10.0.0.0"), BerValue::Integer(1)),
+                Reply::Varbind(oid("1.3.6.1.2.1.4.21.1.1.9.0.0.0"), BerValue::Integer(2)),
+            ],
+        );
+
+        let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+        assert_eq!(result.end, WalkEnd::OidDidNotAdvance);
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_response_to_someone_elses_request_is_refused() {
+        // Correlation is what makes an answer ours. Without it, any agent answering on the
+        // same socket would have its table attributed to the device we asked.
+        for wrong in [
+            Reply::WrongRequestId(oid("1.3.6.1.2.1.4.21.1.1.10.0.0.0"), BerValue::Integer(1)),
+            Reply::WrongCommunity(oid("1.3.6.1.2.1.4.21.1.1.10.0.0.0"), BerValue::Integer(1)),
+            Reply::WrongPduType(oid("1.3.6.1.2.1.4.21.1.1.10.0.0.0"), BerValue::Integer(1)),
+        ] {
+            let agent = FakeAgent::start(COMMUNITY, vec![wrong.clone()]);
+            let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+            assert!(
+                matches!(result.end, WalkEnd::Invalid(_)),
+                "{wrong:?} must not be accepted, got {:?}",
+                result.end
+            );
+            assert!(result.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_never_carries_the_community() {
+        // A community is a shared secret wherever it is not the default, and a diagnostic
+        // is exactly where one leaks.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![Reply::WrongCommunity(
+                oid("1.3.6.1.2.1.4.21.1.1.10.0.0.0"),
+                BerValue::Integer(1),
+            )],
+        );
+
+        let WalkEnd::Invalid(reason) = walk(&agent, "1.3.6.1.2.1.4.21.1").end else {
+            panic!("a mismatched community must be refused");
+        };
+        assert!(
+            !reason.contains(COMMUNITY) && !reason.contains("someone-elses-agent"),
+            "neither community may appear in a diagnostic: {reason}"
+        );
+        assert!(reason.contains("different community"), "{reason}");
+    }
+
+    #[test]
+    fn malformed_and_truncated_replies_are_refused_rather_than_parsed() {
+        // A length byte claiming more than arrived, a truncated value, and bytes that are
+        // not BER at all.
+        for bytes in [
+            vec![0x30, 0x82, 0xff, 0xff, 0x02, 0x01, 0x01],
+            vec![0x30, 0x0a, 0x02, 0x01, 0x01, 0x04, 0x20, b'x'],
+            b"this is not BER".to_vec(),
+            Vec::new(),
+        ] {
+            let agent = FakeAgent::start(COMMUNITY, vec![Reply::Malformed(bytes.clone())]);
+            let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+            assert!(
+                matches!(result.end, WalkEnd::Invalid(_)),
+                "{bytes:?} must not parse into a walk step, got {:?}",
+                result.end
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_that_never_answers_ends_the_walk_at_the_timeout() {
+        // Silence is not a table. It is reported as the request timing out, and the walk
+        // does not spin until its step limit.
+        let agent = FakeAgent::start(COMMUNITY, vec![Reply::Silence]);
+        let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+
+        match result.end {
+            WalkEnd::Invalid(reason) => assert!(reason.contains("timed out"), "{reason}"),
+            other => panic!("silence must end the walk as a timeout: {other:?}"),
+        }
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn a_walk_is_bounded_by_its_step_limit() {
+        // An agent with an endless table cannot make a run endless: the walk stops at its
+        // own bound and says which one.
+        let mut script = Vec::new();
+        for index in 1..64u32 {
+            script.push(Reply::Varbind(
+                oid(&format!("1.3.6.1.2.1.4.21.1.1.10.0.0.{index}")),
+                BerValue::Integer(index as i64),
+            ));
+        }
+        let agent = FakeAgent::start(COMMUNITY, script);
+
+        let result = walk(&agent, "1.3.6.1.2.1.4.21.1");
+        assert_eq!(result.end, WalkEnd::Bounded("the walk's step limit"));
+        assert_eq!(result.rows.len(), 16, "the step limit passed to the walk");
+        assert!(!result.complete());
+    }
+}
 
 #[cfg(test)]
 mod tests {

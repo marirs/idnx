@@ -398,108 +398,7 @@ impl DiscoveryProvider for SnmpProvider {
             let Some(info) = info else {
                 return out;
             };
-            let device = DeviceKey::Address(IpAddr::V4(target));
-
-            out.push(
-                TopologyEvidence::new(
-                    Fact::DeviceRoleSignal {
-                        device: device.clone(),
-                        signal: RoleSignal::SnmpForwarding,
-                    },
-                    EvidenceSource::Snmp,
-                    Confidence::Advertised,
-                    vantage,
-                )
-                .with_detail("returned MIB-II routing state"),
-            );
-
-            if let Some(name) = info.sys_name.clone() {
-                out.push(TopologyEvidence::new(
-                    Fact::DeviceHostname {
-                        device: device.clone(),
-                        hostname: name,
-                    },
-                    EvidenceSource::Snmp,
-                    Confidence::Advertised,
-                    vantage,
-                ));
-            }
-
-            // ipAddrTable: networks this router is directly attached to, with its exact
-            // interface address on each. Prefix-bearing, so these become real networks.
-            for (addr, mask) in &info.local_ips {
-                let prefix_len = u32::from(*mask).count_ones() as u8;
-                if !(1..=30).contains(&prefix_len) {
-                    continue;
-                }
-                let Ok(net) = ipnet::Ipv4Net::new(*addr, prefix_len) else {
-                    continue;
-                };
-                let network = IpNet::V4(net.trunc());
-                out.push(TopologyEvidence::new(
-                    Fact::Network { prefix: network },
-                    EvidenceSource::Snmp,
-                    Confidence::Advertised,
-                    vantage,
-                ));
-                out.push(TopologyEvidence::new(
-                    Fact::GatewayFor {
-                        device: DeviceKey::Address(IpAddr::V4(*addr)),
-                        network,
-                    },
-                    EvidenceSource::Snmp,
-                    Confidence::Advertised,
-                    vantage,
-                ));
-            }
-
-            // ipRouteTable: everything it forwards toward.
-            for entry in &info.routes {
-                let prefix_len = u32::from(entry.mask).count_ones() as u8;
-                if !(1..=30).contains(&prefix_len) || entry.dest_network.is_unspecified() {
-                    continue;
-                }
-                let Ok(net) = ipnet::Ipv4Net::new(entry.dest_network, prefix_len) else {
-                    continue;
-                };
-                let network = IpNet::V4(net.trunc());
-                let next_hop = if entry.next_hop.is_unspecified() {
-                    None
-                } else {
-                    Some(IpAddr::V4(entry.next_hop))
-                };
-                out.push(TopologyEvidence::new(
-                    Fact::Network { prefix: network },
-                    EvidenceSource::Snmp,
-                    Confidence::Advertised,
-                    vantage,
-                ));
-                out.push(TopologyEvidence::new(
-                    Fact::RoutesTo {
-                        device: device.clone(),
-                        network,
-                        next_hop,
-                    },
-                    EvidenceSource::Snmp,
-                    Confidence::Advertised,
-                    vantage,
-                ));
-            }
-
-            // The router's ARP cache lists devices that answered it even if they answer
-            // nothing of ours.
-            for entry in &info.arp_cache {
-                out.push(TopologyEvidence::new(
-                    Fact::DeviceAddress {
-                        device: DeviceKey::mac(&entry.mac),
-                        address: IpAddr::V4(entry.ip),
-                    },
-                    EvidenceSource::Snmp,
-                    Confidence::Advertised,
-                    vantage,
-                ));
-            }
-
+            out.extend(snmp_evidence(&info, target, vantage));
             out
         }))
     }
@@ -867,6 +766,135 @@ fn describe_resolution(resolution: &crate::probes::arp::ArpResolution) -> String
             format!("no ARP resolution attempted here: {reason}")
         }
     }
+}
+
+/// Turns one device's harvested MIB-II state into evidence.
+///
+/// Separated from the provider so the whole path -- agent, walk, harvest, evidence, graph --
+/// can be exercised against a scripted agent on loopback while the topology it produces
+/// still describes the device's own address.
+pub(crate) fn snmp_evidence(
+    info: &crate::probes::snmp::SnmpDeviceInfo,
+    target: std::net::Ipv4Addr,
+    vantage: &str,
+) -> Vec<TopologyEvidence> {
+    let mut out = Vec::new();
+    let device = DeviceKey::Address(IpAddr::V4(target));
+
+    // It answered, so it is there. Observed rather than advertised: this is the exchange
+    // having happened, not the device's claim about itself. Without it the device carried
+    // role evidence and no address, so nothing downstream could render or reach it.
+    out.push(TopologyEvidence::new(
+        Fact::DeviceAddress {
+            device: device.clone(),
+            address: IpAddr::V4(target),
+        },
+        EvidenceSource::Snmp,
+        Confidence::Observed,
+        vantage,
+    ));
+
+    out.push(
+        TopologyEvidence::new(
+            Fact::DeviceRoleSignal {
+                device: device.clone(),
+                signal: RoleSignal::SnmpForwarding,
+            },
+            EvidenceSource::Snmp,
+            Confidence::Advertised,
+            vantage,
+        )
+        .with_detail("returned MIB-II routing state"),
+    );
+
+    if let Some(name) = info.sys_name.clone() {
+        out.push(TopologyEvidence::new(
+            Fact::DeviceHostname {
+                device: device.clone(),
+                hostname: name,
+            },
+            EvidenceSource::Snmp,
+            Confidence::Advertised,
+            vantage,
+        ));
+    }
+
+    // ipAddrTable: networks this router is directly attached to, with its exact
+    // interface address on each. Prefix-bearing, so these become real networks.
+    for (addr, mask) in &info.local_ips {
+        let prefix_len = u32::from(*mask).count_ones() as u8;
+        if !(1..=30).contains(&prefix_len) {
+            continue;
+        }
+        let Ok(net) = ipnet::Ipv4Net::new(*addr, prefix_len) else {
+            continue;
+        };
+        let network = IpNet::V4(net.trunc());
+        out.push(TopologyEvidence::new(
+            Fact::Network { prefix: network },
+            EvidenceSource::Snmp,
+            Confidence::Advertised,
+            vantage,
+        ));
+        out.push(TopologyEvidence::new(
+            Fact::GatewayFor {
+                device: DeviceKey::Address(IpAddr::V4(*addr)),
+                network,
+            },
+            EvidenceSource::Snmp,
+            Confidence::Advertised,
+            vantage,
+        ));
+    }
+
+    // ipRouteTable: everything it forwards toward.
+    for entry in &info.routes {
+        let prefix_len = u32::from(entry.mask).count_ones() as u8;
+        if !(1..=30).contains(&prefix_len) || entry.dest_network.is_unspecified() {
+            continue;
+        }
+        let Ok(net) = ipnet::Ipv4Net::new(entry.dest_network, prefix_len) else {
+            continue;
+        };
+        let network = IpNet::V4(net.trunc());
+        let next_hop = if entry.next_hop.is_unspecified() {
+            None
+        } else {
+            Some(IpAddr::V4(entry.next_hop))
+        };
+        out.push(TopologyEvidence::new(
+            Fact::Network { prefix: network },
+            EvidenceSource::Snmp,
+            Confidence::Advertised,
+            vantage,
+        ));
+        out.push(TopologyEvidence::new(
+            Fact::RoutesTo {
+                device: device.clone(),
+                network,
+                next_hop,
+            },
+            EvidenceSource::Snmp,
+            Confidence::Advertised,
+            vantage,
+        ));
+    }
+
+    // The router's ARP cache lists devices that answered it even if they answer
+    // nothing of ours.
+    for entry in &info.arp_cache {
+        out.push(TopologyEvidence::new(
+            Fact::DeviceAddress {
+                device: DeviceKey::mac(&entry.mac),
+                address: IpAddr::V4(entry.ip),
+            },
+            EvidenceSource::Snmp,
+            Confidence::Advertised,
+            vantage,
+        ));
+    }
+
+    out
 }
 
 /// Router discovery: soliciting advertisements and recording what they disclose.
@@ -1812,6 +1840,131 @@ mod tests {
         let names: Vec<&str> = network_providers().iter().map(|p| p.name()).collect();
         assert!(!names.contains(&"lldp-cdp"));
         assert!(!names.contains(&"passive-capture"));
+    }
+
+    /// The whole SNMP path, against a scripted agent on loopback.
+    ///
+    /// Everything from the first GET to the finished graph: sysName, the interface address
+    /// table, the route table and the neighbour table, walked over a real socket, harvested,
+    /// converted to evidence and absorbed. The agent answers on 127.0.0.1 while every fact
+    /// produced describes a documentation address, which is what makes this testable without
+    /// asserting anything false about the topology.
+    #[test]
+    fn the_snmp_path_runs_from_scripted_agent_to_graph() {
+        use crate::probes::snmp::fake_agent::{FakeAgent, Reply};
+        use crate::probes::snmp::{BerValue, Oid, SnmpTarget, harvest_snmp_target};
+        use crate::topology::TopologyGraph;
+        use std::str::FromStr;
+
+        let oid = |text: &str| Oid::from_str(text).expect("a literal OID");
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+
+        // sysDescr, sysName, then three tables, each ending with an end-of-view marker.
+        let script = vec![
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.1.1.0"),
+                BerValue::OctetString(b"Synthetic router, fixture only".to_vec()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.1.5.0"),
+                BerValue::OctetString(b"fixture-router".to_vec()),
+            ),
+            // ipNetToMediaTable: a neighbour, by address and hardware address.
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.22.1.2.1.192.0.2.50"),
+                BerValue::OctetString(vec![0x02, 0x00, 0x5e, 0x00, 0x00, 0x03]),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.22.1.3.1.192.0.2.50"),
+                BerValue::IpAddress("192.0.2.50".parse().unwrap()),
+            ),
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.22.2")),
+            // ipRouteTable: a destination, its mask and its next hop.
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.1.198.51.100.0"),
+                BerValue::IpAddress("198.51.100.0".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.7.198.51.100.0"),
+                BerValue::IpAddress("192.0.2.254".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.11.198.51.100.0"),
+                BerValue::IpAddress("255.255.255.0".parse().unwrap()),
+            ),
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.21.2")),
+            // ipAddrTable: the router's own address on the attached network, and its mask.
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.20.1.1.192.0.2.1"),
+                BerValue::IpAddress("192.0.2.1".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.20.1.3.192.0.2.1"),
+                BerValue::IpAddress("255.255.255.0".parse().unwrap()),
+            ),
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.20.2")),
+        ];
+
+        let agent = FakeAgent::start("fixture-community", script);
+        let target = SnmpTarget {
+            device,
+            transport: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, agent.port),
+            community: "fixture-community".to_string(),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let info = runtime
+            .block_on(harvest_snmp_target(
+                &target,
+                &crate::net::socket::SocketBinding::unbound(),
+                std::time::Duration::from_millis(400),
+            ))
+            .expect("the agent answered sysDescr, so the device is harvested");
+
+        assert_eq!(info.sys_name.as_deref(), Some("fixture-router"));
+        assert_eq!(info.local_ips.len(), 1, "{:?}", info.local_ips);
+        assert_eq!(info.routes.len(), 1, "{:?}", info.routes);
+        assert_eq!(info.arp_cache.len(), 1, "{:?}", info.arp_cache);
+
+        let evidence = snmp_evidence(&info, device, "test0");
+        let mut graph = TopologyGraph::new();
+        for item in evidence {
+            graph.absorb(item);
+        }
+        graph.finalize_roles();
+
+        let networks: Vec<String> = graph
+            .network_refs()
+            .into_iter()
+            .map(|net| net.prefix.to_string())
+            .collect();
+        assert!(
+            networks.contains(&"192.0.2.0/24".to_string()),
+            "the interface address and its mask name the attached network: {networks:?}"
+        );
+        assert!(
+            networks.contains(&"198.51.100.0/24".to_string()),
+            "the route table names the network it forwards toward: {networks:?}"
+        );
+
+        // The neighbour it reported is a device on the graph, keyed by its hardware address.
+        assert!(
+            graph
+                .nodes()
+                .any(|node| format!("{:?}", node.id).contains("02:00:5e:00:00:03")),
+            "the neighbour table names a device"
+        );
+        // And the router itself is infrastructure by its own answers.
+        assert!(
+            graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&IpAddr::V4(device))),
+            "returning MIB-II routing state is router behaviour"
+        );
     }
 
     #[test]

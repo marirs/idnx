@@ -229,7 +229,17 @@ fn no_discovery_module_opens_a_socket_directly() {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for (number, line) in text.lines().enumerate() {
+        // Test-only code is exempt, and only test-only code: a scripted agent that binds a
+        // loopback port to answer this crate's own probes is not discovery traffic, and
+        // routing it through the interface binding would defeat the point of testing what
+        // the binding does. Everything before the first `#[cfg(test)]` in a file is subject
+        // to the rule, which is where discovery code lives.
+        let productive = match text.find("#[cfg(test)]") {
+            Some(at) => &text[..at],
+            None => text.as_str(),
+        };
+
+        for (number, line) in productive.lines().enumerate() {
             // Doc comments and ordinary comments name these constructs while explaining
             // why they are not used; only real calls matter.
             let code = line.trim_start();
