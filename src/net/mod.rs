@@ -8,6 +8,7 @@ pub mod ipv6;
 pub mod link_speed;
 pub mod linklayer;
 pub mod mdns;
+pub mod pcap;
 pub mod routes;
 pub mod socket;
 pub mod vantage;

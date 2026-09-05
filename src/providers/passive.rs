@@ -966,7 +966,7 @@ fn convert(
 ///
 /// Used by the continuous path, where evidence is absorbed for the whole vantage rather
 /// than for one network under examination.
-fn convert_unscoped(facts: &[FrameFact], interface: &str) -> Vec<TopologyEvidence> {
+pub fn convert_unscoped(facts: &[FrameFact], interface: &str) -> Vec<TopologyEvidence> {
     let context = DiscoveryContext::seed(
         crate::providers::Vantage {
             interface: interface.to_string(),
