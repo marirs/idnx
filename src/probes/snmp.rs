@@ -185,7 +185,7 @@ pub struct SnmpPdu {
 /// A complete SNMP Message
 #[derive(Debug, Clone)]
 pub struct SnmpMessage {
-    pub version: i32, // 0 = SNMPv1, 1 = SNMPv2c
+    pub version: i32, // 1 = SNMPv2c, the only version this client sends or accepts
     pub community: String,
     pub pdu: SnmpPdu,
 }
@@ -700,7 +700,7 @@ pub enum WalkEnd {
     EndOfMibView,
     /// The next OID left the subtree, which is the ordinary end of a table.
     LeftSubtree,
-    /// The agent reported an error status, SNMPv1 noSuchName among them.
+    /// The agent reported an error status, noSuchName (2) among them.
     AgentError(i32),
     /// The agent answered with an OID that did not advance. Repeating or going backwards
     /// makes a walk loop, so it terminates as invalid rather than continuing.
@@ -772,8 +772,9 @@ pub(crate) async fn snmp_walk_target(
             }
         };
 
-        // An error status ends the walk and says so. SNMPv1 agents end a table with
-        // noSuchName (2) where v2c uses an endOfMibView marker in the varbind.
+        // An error status ends the walk and says so. This client speaks v2c only, where a
+        // table ordinarily ends with an endOfMibView marker in the varbind; an error status
+        // instead means the walk stopped without reaching that end.
         if message.pdu.error_status != 0 {
             return Walk {
                 rows,
