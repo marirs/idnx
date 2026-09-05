@@ -285,6 +285,124 @@ write(
 )
 
 
+# --- OSPFv3 -----------------------------------------------------------------------------
+def ospf_v3_lsa(kind: int, age: int, prefix: str, length: int, metric: int) -> bytes:
+    lsa = bytearray(struct.pack("!HH", age, kind))
+    lsa += bytes([0, 0, 0, 1])  # link state id
+    lsa += bytes([10, 0, 0, 1])  # advertising router
+    lsa += struct.pack("!I", 0x80000003)
+    lsa += b"\x00\x00"  # checksum
+    lsa += b"\x00\x00"  # length
+    lsa += struct.pack("!I", metric)
+    # Prefix: length, options, reserved, then the significant bytes padded to four.
+    significant = (length + 7) // 8
+    padded = ((significant + 3) // 4) * 4
+    lsa += bytes([length, 0, 0, 0]) + addr6(prefix)[:significant] + b"\x00" * (padded - significant)
+    struct.pack_into("!H", lsa, 18, len(lsa))
+    return bytes(lsa)
+
+
+def ospf_v3(kind: int, body: bytes) -> bytes:
+    packet = bytearray([3, kind, 0, 0])
+    packet += bytes([10, 0, 0, 1])  # router id
+    packet += bytes([0, 0, 0, 0])  # area
+    packet += b"\x00\x00"  # checksum
+    packet += b"\x00\x00"  # instance, reserved
+    packet += body
+    struct.pack_into("!H", packet, 2, len(packet))
+    return bytes(packet)
+
+
+v3_lsas = ospf_v3_lsa(0x2003, 300, "2001:db8:60::", 48, 20)
+v3_lsas += ospf_v3_lsa(0x2003, 3600, "2001:db8:61::", 48, 30)  # MaxAge: a withdrawal
+v3_update = ospf_v3(4, struct.pack("!I", 2) + v3_lsas)
+write(
+    "ospf_v3_update.pcap",
+    [
+        ethernet(
+            bytes.fromhex("333300000005"),
+            ROUTER_MAC,
+            0x86DD,
+            ipv6(addr6("fe80::1"), addr6("ff02::5"), 89, v3_update),
+        )
+    ],
+)
+
+
+# --- CDP over LLC/SNAP -------------------------------------------------------------------
+def cdp_tlv(kind: int, value: bytes) -> bytes:
+    return struct.pack("!HH", kind, len(value) + 4) + value
+
+
+cdp_body = bytes([2, 180]) + b"\x00\x00"  # version, ttl, checksum
+cdp_body += cdp_tlv(0x0001, b"test-switch-cdp")  # device id
+cdp_body += cdp_tlv(0x0003, b"FastEthernet0/2")  # port id
+cdp_body += cdp_tlv(0x0004, struct.pack("!I", 0x0A))  # capabilities: router + switch bits
+cdp_body += cdp_tlv(0x0005, b"Synthetic CDP software, fixture only")
+cdp_body += cdp_tlv(0x0006, b"Synthetic platform")
+snap = bytes([0xAA, 0xAA, 0x03, 0x00, 0x00, 0x0C, 0x20, 0x00])
+cdp_frame = bytes.fromhex("01000ccccccc") + SWITCH_MAC + struct.pack("!H", len(snap) + len(cdp_body))
+cdp_frame += snap + cdp_body
+write("cdp_neighbor.pcap", [cdp_frame + b"\x00" * max(0, 60 - len(cdp_frame))])
+
+
+# --- Spanning tree -----------------------------------------------------------------------
+def bpdu(bpdu_type: int) -> bytes:
+    body = struct.pack("!HBB", 0x0000, 0x00 if bpdu_type == 0 else 0x02, bpdu_type)
+    body += bytes([0x00])  # flags
+    body += struct.pack("!H", 32768) + SWITCH_MAC  # root id
+    body += struct.pack("!I", 4)  # root path cost
+    body += struct.pack("!H", 32768) + SWITCH_MAC  # bridge id
+    body += struct.pack("!H", 0x8001)  # port id
+    body += struct.pack("!HHHH", 0, 20 * 256, 2 * 256, 15 * 256)
+    frame = bytes.fromhex("0180c2000000") + SWITCH_MAC
+    llc = bytes([0x42, 0x42, 0x03]) + body
+    frame += struct.pack("!H", len(llc)) + llc
+    return frame + b"\x00" * max(0, 60 - len(frame))
+
+
+write("stp_bpdu.pcap", [bpdu(0x00)])
+write("rstp_bpdu.pcap", [bpdu(0x02)])
+
+
+# --- Tagged DHCP -------------------------------------------------------------------------
+# A VLAN tag and a prefix disclosure in one frame: the tag is evidence of the VLAN, the
+# option is evidence of the network, and neither implies the other.
+write(
+    "vlan_tagged_dhcp.pcap",
+    [vlan(HOST_MAC, ROUTER_MAC, 12, 0x0800, dhcp_ack(dhcp_options))],
+)
+
+
+# --- ARP and NDP identity ----------------------------------------------------------------
+def arp_reply(mac: bytes, address: str, target_mac: bytes, target: str) -> bytes:
+    body = bytes.fromhex("0001080006040002") + mac
+    body += bytes(int(o) for o in address.split("."))
+    body += target_mac + bytes(int(o) for o in target.split("."))
+    return ethernet(target_mac, mac, 0x0806, body)
+
+
+def neighbour_advertisement(mac: bytes, source: str, target: str, router: bool) -> bytes:
+    body = bytes([136, 0, 0, 0, 0xE0 if router else 0x60, 0, 0, 0]) + addr6(target)
+    body += bytes([2, 1]) + mac  # target link-layer address
+    return ethernet(
+        bytes.fromhex("333300000001"),
+        mac,
+        0x86DD,
+        icmpv6(addr6(source), addr6("ff02::1"), body),
+    )
+
+
+# One hardware address, one IPv4 address and one IPv6 address, learned two different ways.
+write(
+    "arp_ndp_identity.pcap",
+    [
+        arp_reply(ROUTER_MAC, "192.0.2.1", HOST_MAC, "192.0.2.50"),
+        neighbour_advertisement(ROUTER_MAC, "fe80::1", "fe80::1", True),
+    ],
+)
+
+
 # --- Malformed ---------------------------------------------------------------------------
 # Each of these is structurally wrong in one specific way, and none may create topology.
 truncated_ra = ra_body[: len(ra_body) - 20]

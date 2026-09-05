@@ -6,6 +6,11 @@
 //! about what may become a network. A defect anywhere along that path is invisible to a
 //! per-decoder test and visible here.
 //!
+//! These are synthetic PCAP byte fixtures, not independently captured device traffic. They
+//! prove the complete file-to-graph pipeline against structurally valid frames; they do not
+//! establish interoperability with what a particular vendor actually emits, and a passing
+//! suite here should never be read as that claim.
+//!
 //! The captures are synthetic and sanitised. Addresses come from the documentation ranges
 //! (RFC 5737 and RFC 3849), hardware addresses are locally administered, and no
 //! credentials, community strings or authentication material appear in any of them.
@@ -241,6 +246,109 @@ fn a_mixed_capture_merges_one_router_across_three_protocols() {
     // The VLAN tag in the same capture still creates no network.
     let vlans: Vec<u16> = graph.vlans_without_prefix().map(|vlan| vlan.id).collect();
     assert_eq!(vlans, vec![4]);
+}
+
+#[test]
+fn an_ospfv3_prefix_lsa_names_a_network_and_maxage_withdraws_one() {
+    let (graph, evidence) = absorb("ospf_v3_update.pcap");
+    let found = networks(&graph);
+
+    assert!(found.contains(&"2001:db8:60::/48".to_string()), "{found:?}");
+    assert!(
+        !found.contains(&"2001:db8:61::/48".to_string()),
+        "an LSA at MaxAge is being withdrawn from the flooding domain: {found:?}"
+    );
+    assert!(
+        evidence.iter().any(|e| matches!(
+            &e.fact,
+            Fact::DeviceDescription { text, .. } if text.contains("2001:db8:61::/48") && text.contains("MaxAge")
+        )),
+        "the withdrawal stays evidence about the router's table"
+    );
+}
+
+#[test]
+fn a_cdp_neighbour_over_llc_snap_is_a_device_and_not_a_network() {
+    // CDP rides 802.2 LLC with a SNAP header rather than its own ethertype, so it exercises
+    // a different dispatch path from LLDP entirely.
+    let (graph, evidence) = absorb("cdp_neighbor.pcap");
+    assert!(
+        networks(&graph).is_empty(),
+        "a neighbour announcement carries no prefix: {:?}",
+        networks(&graph)
+    );
+    assert!(
+        evidence.iter().any(|e| matches!(
+            &e.fact,
+            Fact::DeviceHostname { hostname, .. } if hostname == "test-switch-cdp"
+        )),
+        "the switch named itself over CDP: {evidence:?}"
+    );
+}
+
+#[test]
+fn a_spanning_tree_bpdu_is_bridge_evidence_and_never_a_network() {
+    // Only a bridge emits a BPDU, which is behaviour observed rather than claimed. It
+    // describes a spanning tree, and a spanning tree is not an address space.
+    for fixture in ["stp_bpdu.pcap", "rstp_bpdu.pcap"] {
+        let (graph, evidence) = absorb(fixture);
+        assert!(
+            networks(&graph).is_empty(),
+            "{fixture} must create no network: {:?}",
+            networks(&graph)
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|e| matches!(&e.fact, Fact::DeviceRoleSignal { .. })),
+            "{fixture} establishes the sender as a bridge: {evidence:?}"
+        );
+    }
+}
+
+#[test]
+fn a_tagged_frame_records_its_vlan_and_its_prefix_separately() {
+    // Both facts come from one frame and neither implies the other: the tag says the VLAN
+    // exists in this switched domain, and the option says a network is reachable through a
+    // named next hop. Associating them would claim the prefix belongs to the VLAN, which
+    // nothing in the frame states.
+    let (graph, _) = absorb("vlan_tagged_dhcp.pcap");
+
+    let vlans: Vec<u16> = graph.vlans_without_prefix().map(|vlan| vlan.id).collect();
+    assert_eq!(
+        vlans,
+        vec![12],
+        "the tag is recorded, still without a prefix"
+    );
+    assert!(
+        networks(&graph).contains(&"198.51.100.0/24".to_string()),
+        "the classless static route is independent evidence: {:?}",
+        networks(&graph)
+    );
+}
+
+#[test]
+fn one_hardware_address_learned_two_ways_is_one_device() {
+    // An ARP reply and a neighbour advertisement from the same station, in one capture.
+    // Both address families must land on a single node: keying them apart would report one
+    // router as two, and every fact about it would be split between them.
+    let (graph, _) = absorb("arp_ndp_identity.pcap");
+
+    let router = graph
+        .nodes()
+        .find(|node| format!("{:?}", node.id).contains("02:00:5e:00:00:01"))
+        .expect("the router is one node");
+    let addresses: Vec<String> = router.addresses.iter().map(|a| a.to_string()).collect();
+
+    assert!(
+        addresses.iter().any(|a| a == "192.0.2.1"),
+        "the ARP reply bound its IPv4 address: {addresses:?}"
+    );
+    assert!(
+        addresses.iter().any(|a| a == "fe80::1"),
+        "the neighbour advertisement bound its IPv6 address: {addresses:?}"
+    );
+    assert!(networks(&graph).is_empty(), "{:?}", networks(&graph));
 }
 
 #[test]
