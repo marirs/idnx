@@ -17,6 +17,7 @@ use crate::providers::{
     ContinuousSource, DiscoveryContext, DiscoveryProvider, ProviderOutput, ProviderRun, Vantage,
 };
 use crate::topology::TopologyGraph;
+use crate::topology::graph::NetworkRef;
 
 /// How a provider pass is described when it yielded no evidence.
 ///
@@ -126,7 +127,12 @@ pub struct DiscoveryReport {
     /// network absent from this map was never probed at all, which is a different thing
     /// from one that was probed and stayed silent -- and the difference is exactly what a
     /// consumer needs and a sentence cannot carry.
-    pub network_reachability: BTreeMap<IpNet, crate::providers::NetworkOutcome>,
+    ///
+    /// Keyed by `NetworkRef`, not by prefix. Two peers can each hold a 10.0.0.0/24, and a
+    /// prefix-keyed map merged their results into one -- then handed a peer's network the
+    /// local sweep's outcome on lookup, which is the observation-domain error this whole
+    /// identity scheme exists to prevent.
+    pub network_reachability: BTreeMap<NetworkRef, crate::providers::NetworkReachability>,
     pub converged: bool,
 }
 
@@ -198,16 +204,26 @@ impl DiscoveryEngine {
         let mut enrichment_elapsed = Duration::ZERO;
         let mut enrichment_sequential = Duration::ZERO;
         let mut probes_attempted = 0usize;
-        let mut network_reachability: BTreeMap<IpNet, crate::providers::NetworkOutcome> =
+        let mut network_reachability: BTreeMap<NetworkRef, crate::providers::NetworkReachability> =
             BTreeMap::new();
 
         /// Folds one provider's account of a network into the run's.
+        ///
+        /// Providers probe from this machine, so what they report is about this machine's
+        /// observation domain and is keyed as such. A prefix alone is not a network's name.
         fn record_reachability(
-            into: &mut BTreeMap<IpNet, crate::providers::NetworkOutcome>,
-            produced: Vec<(IpNet, crate::providers::NetworkOutcome)>,
+            into: &mut BTreeMap<NetworkRef, crate::providers::NetworkReachability>,
+            produced: Vec<(IpNet, crate::providers::NetworkReachability)>,
         ) {
-            for (network, outcome) in produced {
-                into.entry(network)
+            for (prefix, outcome) in produced {
+                let key = NetworkRef {
+                    prefix,
+                    realm: crate::topology::realm::network_realm(
+                        &prefix,
+                        &crate::topology::realm::Realm::Local,
+                    ),
+                };
+                into.entry(key)
                     .and_modify(|held| held.merge(outcome.clone()))
                     .or_insert(outcome);
             }
@@ -411,13 +427,11 @@ impl DiscoveryEngine {
                         &mut network_reachability,
                         vec![(
                             scope,
-                            crate::providers::NetworkOutcome::NotEnumerated {
-                                reason: format!(
-                                    "{} addresses exceeds the {} this run enumerates",
-                                    enumerable_host_count(&scope),
-                                    self.budget.max_enumerable_hosts
-                                ),
-                            },
+                            crate::providers::NetworkReachability::not_enumerated(format!(
+                                "{} addresses exceeds the {} this run enumerates",
+                                enumerable_host_count(&scope),
+                                self.budget.max_enumerable_hosts
+                            )),
                         )],
                     );
                 }

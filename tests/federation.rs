@@ -1575,4 +1575,95 @@ mod cross_realm_leaks {
             }
         }
     }
+    #[test]
+    fn reachability_is_recorded_per_observation_domain_and_never_shared_by_prefix() {
+        // Two peers each hold a 10.0.0.0/24, and this machine holds one too. They are three
+        // networks. Keying reachability by prefix merged all three into one result -- and,
+        // on lookup, handed a peer's network whatever the local sweep found, which is a
+        // claim about a network this vantage has never probed and cannot reach.
+        use idnx::providers::{NetworkReachability, ReachabilityState};
+        use idnx::topology::graph::NetworkRef;
+        use idnx::topology::realm::{Realm, network_realm};
+
+        let prefix: ipnet::IpNet = "10.0.0.0/24".parse().expect("a literal prefix");
+        let mut graph = TopologyGraph::new();
+        let mut ledger = PeerLedger::new();
+
+        // The local network of that shape, swept and silent.
+        graph.absorb(TopologyEvidence::new(
+            Fact::Network { prefix },
+            EvidenceSource::InterfaceAddress,
+            Confidence::Observed,
+            VANTAGE,
+        ));
+
+        // And a peer's, which this machine has never probed.
+        let key = PeerKey::generate();
+        ledger.pair(key.id());
+        let bundle = EvidenceBundle::publish(
+            &key,
+            "eth0",
+            1,
+            &[TopologyEvidence::new(
+                Fact::Network { prefix },
+                EvidenceSource::InterfaceAddress,
+                Confidence::Observed,
+                "eth0",
+            )],
+        );
+        for record in ledger
+            .accept_immediately(&bundle)
+            .expect("accepted")
+            .evidence
+        {
+            graph.absorb(record);
+        }
+        graph.finalize_roles();
+
+        let mut report = sample_report(graph);
+        report.network_reachability.insert(
+            NetworkRef {
+                prefix,
+                realm: network_realm(&prefix, &Realm::Local),
+            },
+            NetworkReachability::probed(
+                Vec::new(),
+                254,
+                0,
+                vec!["swept the local link; nothing answered".to_string()],
+            )
+            .discovered_by("attached to this vantage"),
+        );
+
+        let export = idnx::output::export::build_export(&report);
+        let same_prefix: Vec<_> = export
+            .networks
+            .iter()
+            .filter(|network| network.cidr == "10.0.0.0/24")
+            .collect();
+        assert_eq!(same_prefix.len(), 2, "two networks, one shape");
+
+        let local = same_prefix
+            .iter()
+            .find(|network| network.identity_domain.peer.is_none())
+            .expect("the local one");
+        let remote = same_prefix
+            .iter()
+            .find(|network| network.identity_domain.peer.is_some())
+            .expect("the peer's");
+
+        assert_eq!(
+            local
+                .reachability
+                .as_ref()
+                .expect("the local sweep is recorded")
+                .state,
+            ReachabilityState::ProbedUnreachable.wire()
+        );
+        assert!(
+            remote.reachability.is_none(),
+            "a network this vantage never probed carries no probe result: {:?}",
+            remote.reachability
+        );
+    }
 }

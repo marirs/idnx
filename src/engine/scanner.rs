@@ -45,10 +45,26 @@ fn is_local_failure(error: &std::io::Error) -> bool {
     )
 }
 
+/// How a host's liveness was established, which decides what may be claimed from it.
+///
+/// The distinction is not cosmetic. The kernel's neighbour cache keeps entries long after a
+/// station has gone, so a scan that reads the cache reports hosts nobody heard from during
+/// this run. Treating those as evidence that a network answers made an empty network
+/// reachable on the strength of a memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostLiveness {
+    /// It answered during this run: a TCP response or refusal, or an ICMP echo reply.
+    Answered,
+    /// Only the neighbour cache says it exists. A reason to ask, never an answer.
+    Remembered,
+}
+
 #[derive(Debug, Clone)]
 pub struct HostResult {
     pub ip: Ipv4Addr,
     pub is_alive: bool,
+    /// Whether anything was heard from this host during this run.
+    pub liveness: HostLiveness,
     pub hostname: Option<String>,
     pub mac_address: Option<String>,
     pub vendor: Option<String>,
@@ -61,6 +77,14 @@ pub struct HostResult {
 pub struct ScanSummary {
     pub total_hosts: usize,
     pub active_hosts: Vec<HostResult>,
+    /// Addresses at least one probe actually left this machine for.
+    ///
+    /// Counted rather than assumed from the subnet size: a socket that would not bind
+    /// sends nothing, and reporting the address as probed turned a local misconfiguration
+    /// into a claim that the remote network was silent.
+    pub addresses_probed: usize,
+    pub probes_sent: usize,
+    pub probes_not_sent: usize,
     pub elapsed: Duration,
 }
 
@@ -282,12 +306,23 @@ pub async fn probe_tcp_socket(
 }
 
 /// Scans a single host across multiple ports with concurrency control
+/// One host's TCP sweep, with what actually reached the wire.
+#[derive(Debug, Clone, Default)]
+pub struct HostScan {
+    pub alive: bool,
+    pub open_ports: Vec<PortInfo>,
+    pub min_latency: Option<Duration>,
+    /// Probes that left this machine, and probes that could not.
+    pub sent: usize,
+    pub not_sent: usize,
+}
+
 pub async fn scan_host_tcp(
     ip: Ipv4Addr,
     ports: &[u16],
     channel: &crate::net::socket::ProbeChannel,
     timeout_duration: Duration,
-) -> (bool, Vec<PortInfo>, Option<Duration>) {
+) -> HostScan {
     let mut tasks = Vec::with_capacity(ports.len());
 
     for &port in ports {
@@ -302,9 +337,16 @@ pub async fn scan_host_tcp(
     let mut open_ports = Vec::new();
     let mut is_alive = false;
     let mut min_latency: Option<Duration> = None;
+    let mut sent = 0usize;
+    let mut not_sent = 0usize;
 
     for task in tasks {
         if let Ok(Some(info)) = task.await {
+            if info.status == PortStatus::NotSent {
+                not_sent += 1;
+            } else {
+                sent += 1;
+            }
             if info.status == PortStatus::Open {
                 is_alive = true;
                 if let Some(lat) = info.latency {
@@ -321,7 +363,13 @@ pub async fn scan_host_tcp(
     }
 
     open_ports.sort_by_key(|p| p.port);
-    (is_alive, open_ports, min_latency)
+    HostScan {
+        alive: is_alive,
+        open_ports,
+        min_latency,
+        sent,
+        not_sent,
+    }
 }
 
 /// Fast ICMP ping probe for discovering live hosts across routed/cascaded subnets
@@ -458,6 +506,9 @@ pub async fn scan_subnet_ext(
             HostResult {
                 ip,
                 is_alive: true,
+                // The cache remembers it. Nothing has answered yet in this run, and a TCP
+                // or ICMP reply below is what upgrades this.
+                liveness: HostLiveness::Remembered,
                 hostname: arp.hostname.clone(),
                 mac_address: Some(arp.mac.clone()),
                 vendor: arp.vendor.clone(),
@@ -468,13 +519,22 @@ pub async fn scan_subnet_ext(
         );
     }
 
-    // Merge TCP probe findings
+    // Merge TCP probe findings, and count what actually went out.
+    let mut probes_sent = 0usize;
+    let mut probes_not_sent = 0usize;
+    let mut addresses_probed = 0usize;
     for task in tcp_tasks {
-        if let Ok((ip, (tcp_alive, open_ports, min_lat))) = task.await {
-            if tcp_alive || !open_ports.is_empty() {
+        if let Ok((ip, scan)) = task.await {
+            probes_sent += scan.sent;
+            probes_not_sent += scan.not_sent;
+            if scan.sent > 0 {
+                addresses_probed += 1;
+            }
+            if scan.alive || !scan.open_ports.is_empty() {
                 let entry = host_results.entry(ip).or_insert_with(|| HostResult {
                     ip,
                     is_alive: true,
+                    liveness: HostLiveness::Answered,
                     hostname: None,
                     mac_address: None,
                     vendor: None,
@@ -484,15 +544,18 @@ pub async fn scan_subnet_ext(
                 });
 
                 entry.is_alive = true;
-                entry.open_ports = open_ports;
-                if min_lat.is_some() {
-                    entry.min_latency = min_lat;
+                // A TCP response or refusal is this run hearing from the host, which
+                // upgrades whatever the neighbour cache remembered about it.
+                entry.liveness = HostLiveness::Answered;
+                entry.open_ports = scan.open_ports;
+                if scan.min_latency.is_some() {
+                    entry.min_latency = scan.min_latency;
                 }
             } else if let Some(entry) = host_results.get_mut(&ip) {
                 // Device was seen in ARP, keep open_ports updated
-                entry.open_ports = open_ports;
-                if min_lat.is_some() {
-                    entry.min_latency = min_lat;
+                entry.open_ports = scan.open_ports;
+                if scan.min_latency.is_some() {
+                    entry.min_latency = scan.min_latency;
                 }
             }
         }
@@ -523,9 +586,10 @@ pub async fn scan_subnet_ext(
 
         for task in ping_tasks {
             if let Ok(Some(ip)) = task.await {
-                host_results.entry(ip).or_insert_with(|| HostResult {
+                let entry = host_results.entry(ip).or_insert_with(|| HostResult {
                     ip,
                     is_alive: true,
+                    liveness: HostLiveness::Answered,
                     hostname: None,
                     mac_address: None,
                     vendor: None,
@@ -533,6 +597,7 @@ pub async fn scan_subnet_ext(
                     min_latency: None,
                     ipv6_addrs: Vec::new(),
                 });
+                entry.liveness = HostLiveness::Answered;
             }
         }
     }
@@ -746,6 +811,8 @@ pub async fn scan_subnet_ext(
                 ipv6_only_hosts.push(HostResult {
                     ip: Ipv4Addr::UNSPECIFIED,
                     is_alive: true,
+                    // A neighbour advertisement is the station answering for itself.
+                    liveness: HostLiveness::Answered,
                     hostname,
                     mac_address: Some(ndp.mac),
                     vendor,
@@ -764,6 +831,9 @@ pub async fn scan_subnet_ext(
     ScanSummary {
         total_hosts,
         active_hosts,
+        addresses_probed,
+        probes_sent,
+        probes_not_sent,
         elapsed: start_time.elapsed(),
     }
 }

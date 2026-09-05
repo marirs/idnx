@@ -16,13 +16,14 @@
 
 use idnx::engine::orchestrator::{Budget, DiscoveryEngine};
 use idnx::providers::{
-    DiscoveryContext, DiscoveryProvider, NetworkOutcome, ProviderFuture, ProviderOutput, Vantage,
-    VantageKind,
+    DiscoveryContext, DiscoveryProvider, NetworkReachability, ProviderFuture, ProviderOutput,
+    ReachabilityState, Vantage, VantageKind,
 };
 use idnx::topology::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal};
+use idnx::topology::realm::Realm;
 use idnx::topology::{
     TopologyEvidence,
-    graph::{DeviceCategory, NodeId, Relationship},
+    graph::{DeviceCategory, NetworkRef, NodeId, Relationship},
 };
 
 use ipnet::IpNet;
@@ -39,6 +40,15 @@ fn addr(text: &str) -> IpAddr {
 
 fn net(text: &str) -> IpNet {
     text.parse().expect("a literal prefix")
+}
+
+/// The key a locally observed network is recorded under: prefix plus observation domain.
+fn local(text: &str) -> NetworkRef {
+    let prefix = net(text);
+    NetworkRef {
+        prefix,
+        realm: idnx::topology::realm::network_realm(&prefix, &Realm::Local),
+    }
 }
 
 fn advertised(fact: Fact) -> TopologyEvidence {
@@ -119,7 +129,7 @@ struct ScriptedNetwork {
     /// What examining a network finds in it: devices, never further networks.
     occupants: HashMap<IpNet, Vec<TopologyEvidence>>,
     /// Reachability each scope pass establishes, as state.
-    reachability: HashMap<IpNet, NetworkOutcome>,
+    reachability: HashMap<IpNet, NetworkReachability>,
     /// Devices that answer nothing at all, and what the provider says about that.
     silent: HashMap<IpAddr, String>,
     calls: Mutex<Vec<Call>>,
@@ -129,7 +139,7 @@ impl ScriptedNetwork {
     fn new() -> Self {
         let mut disclosures: HashMap<IpAddr, Vec<TopologyEvidence>> = HashMap::new();
         let mut occupants: HashMap<IpNet, Vec<TopologyEvidence>> = HashMap::new();
-        let mut reachability: HashMap<IpNet, NetworkOutcome> = HashMap::new();
+        let mut reachability: HashMap<IpNet, NetworkReachability> = HashMap::new();
 
         // The border router names a subnet nobody here is attached to. It names no device
         // on it: who lives there is only discoverable by examining the subnet.
@@ -166,9 +176,13 @@ impl ScriptedNetwork {
         );
         reachability.insert(
             net("192.0.2.0/24"),
-            NetworkOutcome::Reachable {
-                responders: vec![addr("192.0.2.1")],
-            },
+            NetworkReachability::probed(
+                vec![addr("192.0.2.1")],
+                254,
+                0,
+                vec!["swept the attached network".to_string()],
+            )
+            .discovered_by("attached to this vantage"),
         );
 
         // Examining the disclosed subnet finds the device in it: a layer-3 switch, which
@@ -192,9 +206,13 @@ impl ScriptedNetwork {
         );
         reachability.insert(
             net("198.51.100.0/24"),
-            NetworkOutcome::Reachable {
-                responders: vec![addr("198.51.100.1")],
-            },
+            NetworkReachability::probed(
+                vec![addr("198.51.100.1")],
+                254,
+                0,
+                vec!["swept the disclosed subnet".to_string()],
+            )
+            .discovered_by("routed by 192.0.2.1"),
         );
 
         // That switch routes toward two further networks, and keeps its switching identity
@@ -242,19 +260,26 @@ impl ScriptedNetwork {
         );
         reachability.insert(
             net("203.0.113.0/24"),
-            NetworkOutcome::Reachable {
-                responders: vec![addr("203.0.113.9"), addr("203.0.113.254")],
-            },
+            NetworkReachability::probed(
+                vec![addr("203.0.113.9"), addr("203.0.113.254")],
+                254,
+                0,
+                vec!["swept the second subnet".to_string()],
+            )
+            .discovered_by("routed by 198.51.100.1"),
         );
 
         // The third network is advertised and nothing in it answers. That is a result, not
         // an absence of one, and it is returned as state.
         reachability.insert(
             net("198.18.0.0/24"),
-            NetworkOutcome::AdvertisedUnreachable {
-                attempted: 254,
-                reasons: vec!["advertised by 198.51.100.1; no address answered".to_string()],
-            },
+            NetworkReachability::probed(
+                Vec::new(),
+                254,
+                0,
+                vec!["254 address(es) swept; nothing answered".to_string()],
+            )
+            .discovered_by("advertised by 198.51.100.1"),
         );
 
         let mut silent = HashMap::new();
@@ -481,33 +506,38 @@ fn what_could_not_be_resolved_survives_the_run_unresolved() {
         networks.contains(&"198.18.0.0/24".to_string()),
         "an advertised network stays advertised: {networks:?}"
     );
+    let unreachable = report
+        .network_reachability
+        .get(&local("198.18.0.0/24"))
+        .expect("it was probed like any other network");
     assert_eq!(
-        report.network_reachability.get(&net("198.18.0.0/24")),
-        Some(&NetworkOutcome::AdvertisedUnreachable {
-            attempted: 254,
-            reasons: vec!["advertised by 198.51.100.1; no address answered".to_string()],
-        }),
-        "its failed reachability is state, not a sentence: {:?}",
-        report.network_reachability
+        unreachable.state(),
+        ReachabilityState::ProbedUnreachable,
+        "probes went out and nothing answered: {unreachable:?}"
     );
-    // And a network that did answer is a different state, holding what answered.
-    assert_eq!(
-        report.network_reachability.get(&net("203.0.113.0/24")),
-        Some(&NetworkOutcome::Reachable {
-            responders: vec![addr("203.0.113.9"), addr("203.0.113.254")],
-        }),
-        "{:?}",
-        report.network_reachability
-    );
-    // The human sentence is rendered from the state and is never the state itself.
+    assert_eq!(unreachable.attempted, 254);
+    assert!(unreachable.responders.is_empty());
+    // How it was discovered is held apart from what answered: a failed sweep says nothing
+    // about whether a router advertised the prefix.
     assert!(
-        report
-            .network_reachability
-            .get(&net("198.18.0.0/24"))
-            .expect("recorded")
-            .describe()
-            .contains("none answered")
+        unreachable
+            .discovery
+            .iter()
+            .any(|how| how.contains("advertised by 198.51.100.1")),
+        "its provenance survives the failed sweep: {unreachable:?}"
     );
+
+    // A network that did answer is a different state, and keeps its coverage as well as
+    // its responders.
+    let reached = report
+        .network_reachability
+        .get(&local("203.0.113.0/24"))
+        .expect("recorded");
+    assert_eq!(reached.state(), ReachabilityState::Reachable);
+    assert_eq!(reached.responders.len(), 2);
+    assert_eq!(reached.attempted, 254, "the sweep's coverage is not erased");
+    // The human sentence is rendered from the state and is never the state itself.
+    assert!(unreachable.describe().contains("none answered"));
 
     // A VLAN with no prefix evidence keeps no prefix. Attaching the vantage's own prefix
     // to a tagged network is the invention this refuses.

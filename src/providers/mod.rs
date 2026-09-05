@@ -48,83 +48,145 @@ pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = ProviderOutput> + Send
 /// engine aggregates these across providers and passes; the human sentence is rendered
 /// from the result, never treated as the result.
 ///
-/// A network being unreachable is not a reason to drop it. An advertised prefix nothing
-/// answers on is a real finding -- it is what a router claims -- and it stays on the map
-/// carrying the reason it could not be confirmed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetworkOutcome {
-    /// Something in the network answered, and this is what answered.
-    Reachable { responders: Vec<IpAddr> },
-    /// The network is claimed by some device, addresses in it were probed, and none
-    /// answered. `reasons` carries each provider's account of what it tried.
-    AdvertisedUnreachable {
-        attempted: usize,
-        reasons: Vec<String>,
-    },
-    /// No address in it was probed at all, and why -- too large to enumerate, out of
-    /// scope for this vantage, or a protocol that never ran.
-    NotEnumerated { reason: String },
+/// A network being unreachable is not a reason to drop it. A prefix nothing answers on is
+/// a real finding -- it is what some device claims -- and it stays on the map carrying the
+/// reason it could not be confirmed. How the network came to be known is kept in
+/// `discovery` and never inferred from the probe result: reachability says what answered,
+/// not what the network is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkReachability {
+    /// Addresses that answered *during this run*: a TCP response or refusal, a correlated
+    /// ICMP reply, a fresh ARP or NDP answer, or a validated protocol reply.
+    ///
+    /// Never a neighbour-cache entry. The kernel remembers stations long after they are
+    /// gone, and counting a memory as an answer made empty networks reachable.
+    pub responders: Vec<IpAddr>,
+    /// Unique addresses at least one probe actually left this machine for.
+    pub attempted: usize,
+    /// Probes that never left: a socket that would not bind, a source address the vantage
+    /// does not hold. Kept apart from silence, which is a fact about the network.
+    pub not_sent: usize,
+    /// Each prober's account of what it tried and what came back.
+    pub reasons: Vec<String>,
+    /// How the network came to be known -- advertised by a router, attached to this
+    /// vantage, supplied by the operator. Held separately because probing does not
+    /// establish it and a failed probe must not overwrite it.
+    pub discovery: Vec<String>,
 }
 
-impl NetworkOutcome {
-    /// How strong a statement this is, for merging. A confirmed responder outranks a
-    /// failed sweep, which outranks never having asked: the strongest claim any pass
-    /// established is the one that survives.
-    fn rank(&self) -> u8 {
+/// The discriminant a consumer reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachabilityState {
+    /// Something in it answered during this run.
+    Reachable,
+    /// Probes reached the wire and nothing answered. Says nothing about how the network
+    /// was discovered: attached, routed, advertised and operator-supplied networks all
+    /// arrive here identically.
+    ProbedUnreachable,
+    /// Nothing was probed at all -- too large to enumerate, or every socket refused to
+    /// send. An absence of answers that nobody asked for is not silence.
+    NotEnumerated,
+}
+
+impl ReachabilityState {
+    pub fn wire(&self) -> &'static str {
         match self {
-            NetworkOutcome::Reachable { .. } => 2,
-            NetworkOutcome::AdvertisedUnreachable { .. } => 1,
-            NetworkOutcome::NotEnumerated { .. } => 0,
+            ReachabilityState::Reachable => "reachable",
+            ReachabilityState::ProbedUnreachable => "probed_unreachable",
+            ReachabilityState::NotEnumerated => "not_enumerated",
+        }
+    }
+}
+
+impl NetworkReachability {
+    /// A completed sweep: what answered, what was actually probed, and what never left.
+    pub fn probed(
+        responders: Vec<IpAddr>,
+        attempted: usize,
+        not_sent: usize,
+        reasons: Vec<String>,
+    ) -> Self {
+        Self {
+            responders,
+            attempted,
+            not_sent,
+            reasons,
+            discovery: Vec::new(),
         }
     }
 
-    /// Folds another pass's outcome for the same network into this one.
-    pub fn merge(&mut self, other: NetworkOutcome) {
-        match (&mut *self, other) {
-            (
-                NetworkOutcome::Reachable { responders },
-                NetworkOutcome::Reachable { responders: more },
-            ) => {
-                responders.extend(more);
-                responders.sort();
-                responders.dedup();
-            }
-            (
-                NetworkOutcome::AdvertisedUnreachable { attempted, reasons },
-                NetworkOutcome::AdvertisedUnreachable {
-                    attempted: more,
-                    reasons: also,
-                },
-            ) => {
-                *attempted += more;
-                reasons.extend(also);
-                reasons.dedup();
-            }
-            (current, other) => {
-                if other.rank() > current.rank() {
-                    *current = other;
-                }
-            }
+    /// Nothing was probed, and why.
+    pub fn not_enumerated(reason: impl Into<String>) -> Self {
+        Self {
+            reasons: vec![reason.into()],
+            ..Self::default()
         }
+    }
+
+    /// Records how the network came to be known, which probing never establishes.
+    pub fn discovered_by(mut self, how: impl Into<String>) -> Self {
+        self.discovery.push(how.into());
+        self
+    }
+
+    /// The state, derived from the evidence rather than asserted alongside it.
+    ///
+    /// Derived so the two can never disagree: a responder means reachable, probes with no
+    /// responder mean silence, and no probe at all means the question was never put --
+    /// including the case where every socket refused to send, which used to be reported as
+    /// a silent network.
+    pub fn state(&self) -> ReachabilityState {
+        if !self.responders.is_empty() {
+            ReachabilityState::Reachable
+        } else if self.attempted > 0 {
+            ReachabilityState::ProbedUnreachable
+        } else {
+            ReachabilityState::NotEnumerated
+        }
+    }
+
+    /// Folds another pass's account of the same network into this one.
+    ///
+    /// Everything accumulates. An earlier design kept only the strongest state, so one
+    /// responder among 254 attempts erased the 253 that answered nothing -- and the
+    /// coverage of the sweep, which is most of what the result is worth, went with it.
+    pub fn merge(&mut self, other: NetworkReachability) {
+        self.responders.extend(other.responders);
+        self.responders.sort();
+        self.responders.dedup();
+        self.attempted += other.attempted;
+        self.not_sent += other.not_sent;
+        self.reasons.extend(other.reasons);
+        self.reasons.dedup();
+        self.discovery.extend(other.discovery);
+        self.discovery.dedup();
     }
 
     /// The sentence a person reads. Rendered from the state; never the state itself.
     pub fn describe(&self) -> String {
-        match self {
-            NetworkOutcome::Reachable { responders } => match responders.len() {
-                0 => "reachable".to_string(),
-                1 => format!("reachable; {} answered", responders[0]),
-                n => format!("reachable; {n} address(es) answered"),
-            },
-            NetworkOutcome::AdvertisedUnreachable { attempted, reasons } => {
-                let detail = if reasons.is_empty() {
-                    String::new()
+        let detail = if self.reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.reasons.join("; "))
+        };
+        match self.state() {
+            ReachabilityState::Reachable => format!(
+                "reachable; {} of {} address(es) probed answered{detail}",
+                self.responders.len(),
+                self.attempted.max(self.responders.len())
+            ),
+            ReachabilityState::ProbedUnreachable => format!(
+                "{} address(es) probed, none answered{detail}",
+                self.attempted
+            ),
+            ReachabilityState::NotEnumerated => {
+                let unsent = if self.not_sent > 0 {
+                    format!("; {} probe(s) never left this machine", self.not_sent)
                 } else {
-                    format!(" ({})", reasons.join("; "))
+                    String::new()
                 };
-                format!("advertised; {attempted} address(es) probed, none answered{detail}")
+                format!("not enumerated{detail}{unsent}")
             }
-            NetworkOutcome::NotEnumerated { reason } => format!("not enumerated: {reason}"),
         }
     }
 }
@@ -144,7 +206,7 @@ pub struct ProviderOutput {
     /// Separate from evidence because it is not a topology fact: whether an address
     /// answered says nothing about what the network *is*, and folding the two together is
     /// how "nothing answered" became "no such network".
-    pub reachability: Vec<(IpNet, NetworkOutcome)>,
+    pub reachability: Vec<(IpNet, NetworkReachability)>,
 }
 
 impl ProviderOutput {
@@ -387,80 +449,81 @@ mod reachability_tests {
     }
 
     #[test]
-    fn a_responder_outranks_a_failed_sweep_and_a_sweep_that_never_ran() {
-        // Passes disagree legitimately: one provider sweeps a network and hears nothing
-        // while another reaches a device in it. The strongest thing anyone established is
-        // the truth about the network; the weaker accounts must not overwrite it whichever
-        // order they arrive in.
-        let responder = NetworkOutcome::Reachable {
-            responders: vec![ip("192.0.2.5")],
-        };
-        let silence = NetworkOutcome::AdvertisedUnreachable {
-            attempted: 254,
-            reasons: vec!["swept, nothing answered".to_string()],
-        };
-        let never = NetworkOutcome::NotEnumerated {
-            reason: "too large".to_string(),
-        };
+    fn one_responder_among_many_attempts_keeps_both() {
+        // The defect this replaced: a rank-based merge kept only the strongest state, so a
+        // single answer erased the 253 addresses that answered nothing. "1 of 254" and
+        // "1 of 1" are different results, and only the coverage tells them apart.
+        let mut held =
+            NetworkReachability::probed(Vec::new(), 253, 0, vec!["253 swept, silent".to_string()]);
+        held.merge(NetworkReachability::probed(
+            vec![ip("192.0.2.5")],
+            1,
+            0,
+            vec!["one answered".to_string()],
+        ));
 
-        let mut forwards = responder.clone();
-        forwards.merge(silence.clone());
-        forwards.merge(never.clone());
-        assert_eq!(forwards, responder);
-
-        let mut backwards = never;
-        backwards.merge(silence);
-        backwards.merge(responder.clone());
-        assert_eq!(backwards, responder);
+        assert_eq!(held.state(), ReachabilityState::Reachable);
+        assert_eq!(held.responders, vec![ip("192.0.2.5")]);
+        assert_eq!(held.attempted, 254, "the whole sweep's coverage survives");
+        assert_eq!(held.reasons.len(), 2, "both accounts are kept");
+        assert!(held.describe().contains("1 of 254"));
     }
 
     #[test]
-    fn two_sweeps_of_the_same_network_accumulate_rather_than_replace() {
-        let mut held = NetworkOutcome::Reachable {
-            responders: vec![ip("192.0.2.5")],
-        };
-        held.merge(NetworkOutcome::Reachable {
-            responders: vec![ip("192.0.2.9"), ip("192.0.2.5")],
-        });
-        assert_eq!(
-            held,
-            NetworkOutcome::Reachable {
-                responders: vec![ip("192.0.2.5"), ip("192.0.2.9")]
-            },
-            "every responder is kept, once each"
+    fn probes_that_never_left_are_not_silence() {
+        // Every socket refused to bind, so nothing was asked. Reporting that as a network
+        // that stayed silent turned a local fault into a finding about someone else's
+        // network.
+        let nothing_sent = NetworkReachability::probed(
+            Vec::new(),
+            0,
+            254,
+            vec!["no usable source address on this vantage".to_string()],
         );
+        assert_eq!(nothing_sent.state(), ReachabilityState::NotEnumerated);
+        assert!(nothing_sent.describe().contains("never left this machine"));
 
-        let mut failed = NetworkOutcome::AdvertisedUnreachable {
-            attempted: 10,
-            reasons: vec!["ICMP".to_string()],
-        };
-        failed.merge(NetworkOutcome::AdvertisedUnreachable {
-            attempted: 4,
-            reasons: vec!["TCP".to_string()],
-        });
+        // One probe that did leave makes the silence real, for that one address.
+        let one_sent = NetworkReachability::probed(Vec::new(), 1, 253, Vec::new());
+        assert_eq!(one_sent.state(), ReachabilityState::ProbedUnreachable);
+    }
+
+    #[test]
+    fn how_a_network_was_discovered_survives_a_failed_sweep() {
+        // Probing establishes what answered. It never establishes what the network is, so
+        // a silent sweep must not overwrite the provenance that put it on the map.
+        let mut held = NetworkReachability::probed(Vec::new(), 254, 0, Vec::new())
+            .discovered_by("advertised by 198.51.100.1");
+        held.merge(NetworkReachability::probed(Vec::new(), 0, 0, Vec::new()));
+
+        assert_eq!(held.state(), ReachabilityState::ProbedUnreachable);
         assert_eq!(
-            failed,
-            NetworkOutcome::AdvertisedUnreachable {
-                attempted: 14,
-                reasons: vec!["ICMP".to_string(), "TCP".to_string()]
-            },
-            "the total probed is the sum, and each account is kept"
+            held.discovery,
+            vec!["advertised by 198.51.100.1".to_string()]
         );
+    }
+
+    #[test]
+    fn responders_accumulate_once_each() {
+        let mut held = NetworkReachability::probed(vec![ip("192.0.2.5")], 1, 0, Vec::new());
+        held.merge(NetworkReachability::probed(
+            vec![ip("192.0.2.9"), ip("192.0.2.5")],
+            2,
+            0,
+            Vec::new(),
+        ));
+        assert_eq!(held.responders, vec![ip("192.0.2.5"), ip("192.0.2.9")]);
+        assert_eq!(held.attempted, 3);
     }
 
     #[test]
     fn silence_and_never_having_asked_read_differently() {
-        // The whole reason this is state rather than prose: these two produce an identical
-        // absence of hosts, and only one of them is a statement about the network.
-        let silent = NetworkOutcome::AdvertisedUnreachable {
-            attempted: 254,
-            reasons: vec!["swept".to_string()],
-        };
-        let unasked = NetworkOutcome::NotEnumerated {
-            reason: "65534 addresses exceeds the 4096 this run enumerates".to_string(),
-        };
+        // The whole reason this is state rather than prose: both produce an identical
+        // absence of hosts, and only one is a statement about the network.
+        let silent = NetworkReachability::probed(Vec::new(), 254, 0, Vec::new());
+        let unasked = NetworkReachability::not_enumerated("65534 addresses exceeds the budget");
+        assert_ne!(silent.state(), unasked.state());
         assert!(silent.describe().contains("none answered"));
         assert!(unasked.describe().starts_with("not enumerated"));
-        assert_ne!(silent, unasked);
     }
 }

@@ -429,6 +429,25 @@ impl DiscoveryProvider for SnmpProvider {
     }
 }
 
+/// The addresses that answered during this run, from one sweep.
+///
+/// A neighbour-cache entry is not an answer. `scan_subnet_ext` seeds its host list from the
+/// kernel's ARP table, which remembers stations long after they have gone, so counting
+/// those made a network "reachable" on the strength of a memory -- and a network nobody has
+/// spoken to since a reboot looked identical to one answering right now.
+fn fresh_responders(summary: &crate::engine::scanner::ScanSummary) -> Vec<IpAddr> {
+    let mut responders: Vec<IpAddr> = summary
+        .active_hosts
+        .iter()
+        .filter(|host| host.liveness == crate::engine::scanner::HostLiveness::Answered)
+        .filter(|host| !host.ip.is_unspecified())
+        .map(|host| IpAddr::V4(host.ip))
+        .collect();
+    responders.sort();
+    responders.dedup();
+    responders
+}
+
 /// Active host enrichment for a discovered network.
 ///
 /// This runs *after* topology discovery and only against networks the graph already knows
@@ -498,7 +517,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             )
             .await;
             let summary_hosts = summary.active_hosts.len();
-            let mut responders: Vec<IpAddr> = Vec::new();
+            let responders = fresh_responders(&summary);
 
             for host in summary.active_hosts {
                 // Prefer the MAC as identity so a host merges with whatever the neighbour
@@ -510,7 +529,6 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                 };
 
                 if !host.ip.is_unspecified() {
-                    responders.push(IpAddr::V4(host.ip));
                     // Attribute the address to how it was actually established. Labelling
                     // every host as an ICMP result was simply false for the many found via
                     // ARP or a TCP response, and it made the evidence trail useless.
@@ -593,18 +611,26 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             // The same result as a structure, for anything that has to act on it. The note
             // above is for a person to read; this is what an export or a later pass
             // consumes, so neither has to parse a sentence.
-            let probed = crate::engine::orchestrator::enumerable_host_count(&IpNet::V4(scope));
-            let outcome = if responders.is_empty() {
-                crate::providers::NetworkOutcome::AdvertisedUnreachable {
-                    attempted: probed,
-                    reasons: vec![format!(
-                        "{} port(s) swept across {probed} address(es); nothing answered",
-                        self.ports.len()
-                    )],
-                }
-            } else {
-                crate::providers::NetworkOutcome::Reachable { responders }
-            };
+            // Counts taken from the sweep rather than from the subnet's size. A socket
+            // that would not bind sends nothing, and calling those addresses probed
+            // reported a local fault as a silent network.
+            let mut reasons = vec![format!(
+                "{} port(s) swept across {} address(es)",
+                self.ports.len(),
+                summary.addresses_probed
+            )];
+            if summary.probes_not_sent > 0 {
+                reasons.push(format!(
+                    "{} probe(s) never left this machine",
+                    summary.probes_not_sent
+                ));
+            }
+            let outcome = crate::providers::NetworkReachability::probed(
+                responders,
+                summary.addresses_probed,
+                summary.probes_not_sent,
+                reasons,
+            );
             ProviderOutput {
                 evidence: out,
                 notes,
@@ -2404,6 +2430,95 @@ mod tests {
             .into_iter()
             .map(|net| net.prefix.to_string())
             .collect()
+    }
+
+    #[test]
+    fn a_remembered_host_is_not_a_reachability_response() {
+        // The sweep seeds its host list from the kernel's ARP table. Those entries outlive
+        // the stations that made them, so a network nobody has spoken to since a reboot
+        // reported responders and read as reachable. Only what answered during this run
+        // counts.
+        use crate::engine::scanner::{HostLiveness, HostResult, ScanSummary};
+
+        let host = |last: u8, liveness: HostLiveness| HostResult {
+            ip: std::net::Ipv4Addr::new(192, 0, 2, last),
+            is_alive: true,
+            liveness,
+            hostname: None,
+            mac_address: Some("02:00:5e:00:00:01".to_string()),
+            vendor: None,
+            open_ports: Vec::new(),
+            min_latency: None,
+            ipv6_addrs: Vec::new(),
+        };
+
+        let cache_only = ScanSummary {
+            total_hosts: 254,
+            active_hosts: vec![host(10, HostLiveness::Remembered)],
+            addresses_probed: 254,
+            probes_sent: 254,
+            probes_not_sent: 0,
+            elapsed: Duration::ZERO,
+        };
+        assert!(
+            fresh_responders(&cache_only).is_empty(),
+            "a cache entry is a reason to ask, not an answer"
+        );
+        assert_eq!(
+            crate::providers::NetworkReachability::probed(
+                fresh_responders(&cache_only),
+                cache_only.addresses_probed,
+                cache_only.probes_not_sent,
+                Vec::new(),
+            )
+            .state(),
+            crate::providers::ReachabilityState::ProbedUnreachable,
+            "probed, and nothing answered"
+        );
+
+        let answered = ScanSummary {
+            active_hosts: vec![
+                host(10, HostLiveness::Remembered),
+                host(11, HostLiveness::Answered),
+            ],
+            ..cache_only
+        };
+        assert_eq!(
+            fresh_responders(&answered),
+            vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 11))],
+            "and the one that answered is the only responder"
+        );
+    }
+
+    #[test]
+    fn an_attached_network_that_stays_silent_is_not_called_advertised() {
+        // The state describes the probe result and nothing else. Host enrichment runs
+        // against attached, routed, advertised and operator-supplied networks alike, so a
+        // silent sweep of the link this machine is standing on must not be reported as an
+        // advertisement that failed to verify. How it was discovered is separate, and kept.
+        let attached = crate::providers::NetworkReachability::probed(
+            Vec::new(),
+            254,
+            0,
+            vec!["swept the attached link".to_string()],
+        )
+        .discovered_by("attached to this vantage");
+
+        assert_eq!(
+            attached.state(),
+            crate::providers::ReachabilityState::ProbedUnreachable
+        );
+        assert_eq!(attached.state().wire(), "probed_unreachable");
+        assert!(
+            !attached.describe().contains("advertised"),
+            "the rendered sentence describes the probe, not the provenance: {}",
+            attached.describe()
+        );
+        assert_eq!(
+            attached.discovery,
+            vec!["attached to this vantage".to_string()],
+            "and the provenance is still recorded, separately"
+        );
     }
 
     #[test]

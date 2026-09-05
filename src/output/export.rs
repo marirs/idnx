@@ -289,43 +289,38 @@ pub struct DeviceExport {
 /// Consumers read `state`, never the sentence.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReachabilityExport {
-    /// `reachable`, `advertised_unreachable` or `not_enumerated`.
+    /// `reachable`, `probed_unreachable` or `not_enumerated`.
     pub state: String,
-    /// Addresses that answered, where any did.
+    /// Addresses that answered during the run. Never a neighbour-cache entry.
     pub responders: Vec<String>,
-    /// How many addresses were probed, where a sweep ran.
-    pub attempted: Option<usize>,
+    /// Unique addresses at least one probe actually left this machine for. Kept even when
+    /// something answered: "1 of 254 answered" and "1 of 1 answered" are different results
+    /// and only the coverage tells them apart.
+    pub attempted: usize,
+    /// Probes that never left this machine, which is a local fault and not remote silence.
+    pub not_sent: usize,
     /// Why nothing answered, or why nothing was tried.
     pub reasons: Vec<String>,
+    /// How the network came to be known. Held apart from the probe result, since a failed
+    /// sweep says nothing about whether a router advertised the prefix.
+    pub discovery: Vec<String>,
     pub note: String,
 }
 
 impl ReachabilityExport {
-    fn of(outcome: &crate::providers::NetworkOutcome) -> Self {
-        use crate::providers::NetworkOutcome;
-        let note = outcome.describe();
-        match outcome {
-            NetworkOutcome::Reachable { responders } => Self {
-                state: "reachable".to_string(),
-                responders: responders.iter().map(|r| r.to_string()).collect(),
-                attempted: None,
-                reasons: Vec::new(),
-                note,
-            },
-            NetworkOutcome::AdvertisedUnreachable { attempted, reasons } => Self {
-                state: "advertised_unreachable".to_string(),
-                responders: Vec::new(),
-                attempted: Some(*attempted),
-                reasons: reasons.clone(),
-                note,
-            },
-            NetworkOutcome::NotEnumerated { reason } => Self {
-                state: "not_enumerated".to_string(),
-                responders: Vec::new(),
-                attempted: None,
-                reasons: vec![reason.clone()],
-                note,
-            },
+    fn of(reachability: &crate::providers::NetworkReachability) -> Self {
+        Self {
+            state: reachability.state().wire().to_string(),
+            responders: reachability
+                .responders
+                .iter()
+                .map(|address| address.to_string())
+                .collect(),
+            attempted: reachability.attempted,
+            not_sent: reachability.not_sent,
+            reasons: reachability.reasons.clone(),
+            discovery: reachability.discovery.clone(),
+            note: reachability.describe(),
         }
     }
 }
@@ -458,9 +453,11 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             // several observers and must not be reduced to one.
             observed_by: node.map(observers_of).unwrap_or_default(),
             locally_observed: node.is_some_and(|n| n.locally_observed()),
+            // By reference, not by prefix: a peer's 10.0.0.0/24 must never be handed the
+            // local sweep's result.
             reachability: report
                 .network_reachability
-                .get(&net.prefix)
+                .get(&net)
                 .map(ReachabilityExport::of),
             evidence: node.map(|n| evidence_of(&n.provenance)).unwrap_or_default(),
         });
@@ -1044,12 +1041,22 @@ mod tests {
         // An export consumer must be able to tell "probed, nothing answered" from "never
         // probed" without matching on English. Both produce an empty host list.
         let mut report = sample_report();
+        let prefix: ipnet::IpNet = "192.168.1.0/24".parse().expect("a literal prefix");
         report.network_reachability.insert(
-            "192.168.1.0/24".parse().expect("a literal prefix"),
-            crate::providers::NetworkOutcome::AdvertisedUnreachable {
-                attempted: 254,
-                reasons: vec!["swept; nothing answered".to_string()],
+            crate::topology::graph::NetworkRef {
+                prefix,
+                realm: crate::topology::realm::network_realm(
+                    &prefix,
+                    &crate::topology::realm::Realm::Local,
+                ),
             },
+            crate::providers::NetworkReachability::probed(
+                Vec::new(),
+                254,
+                0,
+                vec!["swept; nothing answered".to_string()],
+            )
+            .discovered_by("attached to this vantage"),
         );
 
         let data = build_export(&report);
@@ -1062,14 +1069,19 @@ mod tests {
             .reachability
             .as_ref()
             .expect("its reachability is exported");
-        assert_eq!(reachability.state, "advertised_unreachable");
-        assert_eq!(reachability.attempted, Some(254));
+        assert_eq!(reachability.state, "probed_unreachable");
+        assert_eq!(reachability.attempted, 254);
         assert!(!reachability.reasons.is_empty());
+        assert_eq!(
+            reachability.discovery,
+            vec!["attached to this vantage".to_string()],
+            "how it was found is exported apart from what answered"
+        );
         assert!(reachability.note.contains("none answered"));
 
         // Serialisation keeps the discriminant, which is the part a consumer reads.
         let json = serde_json::to_string(&data).expect("the export serialises");
-        assert!(json.contains("advertised_unreachable"));
+        assert!(json.contains("probed_unreachable"));
     }
 
     #[test]

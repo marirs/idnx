@@ -490,7 +490,21 @@ pub fn decode_dhcp(server_mac: &str, body: &[u8]) -> Option<FrameFact> {
     // op(1) htype(1) hlen(1) hops(1) xid(4) secs(2) flags(2)
     // ciaddr(4) yiaddr(4) siaddr(4) giaddr(4) chaddr(16) sname(64) file(128) = 236
     const OPTIONS_OFFSET: usize = 236;
+    const BOOTREPLY: u8 = 2;
+    const HTYPE_ETHERNET: u8 = 1;
+    const ETHERNET_HLEN: u8 = 6;
     if body.len() < OPTIONS_OFFSET + 4 {
+        return None;
+    }
+    // A server's reply, and only that. Anything read out of a client's request is the
+    // client's own assertion: a host can put option 53 = ACK and any mask it likes into a
+    // BOOTREQUEST, and reading it as a server's answer lets a station on the link define
+    // the topology. The direction is one byte and was not being checked.
+    if body[0] != BOOTREPLY {
+        return None;
+    }
+    // Ethernet framing, since the addresses read below assume it.
+    if body[1] != HTYPE_ETHERNET || body[2] != ETHERNET_HLEN {
         return None;
     }
     // Magic cookie 99.130.83.99 marks the start of the option block.
@@ -1152,6 +1166,8 @@ mod tests {
     fn dhcp_body(yiaddr: Ipv4Addr, options: &[u8]) -> Vec<u8> {
         let mut b = vec![0u8; 236];
         b[0] = 2; // BOOTREPLY
+        b[1] = 1; // htype: Ethernet
+        b[2] = 6; // hlen
         b[16..20].copy_from_slice(&yiaddr.octets());
         b.extend_from_slice(&[0x63, 0x82, 0x53, 0x63]);
         b.extend_from_slice(options);
@@ -1180,6 +1196,50 @@ mod tests {
             }
             other => panic!("expected DHCP, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn a_client_request_carrying_ack_shaped_options_is_not_a_server_reply() {
+        // Any station on the link can put option 53 = ACK and a mask of its choosing into a
+        // BOOTREQUEST. Reading one as a server's answer would let a host define the
+        // network -- and, with a tag on the frame, bind a VLAN to a prefix it invented.
+        let options = [
+            53, 1, 5, // DHCPACK
+            1, 4, 255, 255, 255, 0, // subnet mask
+        ];
+        let mut body = dhcp_body(Ipv4Addr::new(192, 168, 8, 44), &options);
+        body[0] = 1; // BOOTREQUEST
+
+        assert!(
+            decode_dhcp("00:11:22:33:44:55", &body).is_none(),
+            "a client's assertion is not a server's reply"
+        );
+
+        // And with the direction corrected, the same bytes do decode -- so the test is
+        // about the direction byte and nothing else.
+        body[0] = 2;
+        assert!(decode_dhcp("00:11:22:33:44:55", &body).is_some());
+    }
+
+    #[test]
+    fn a_tagged_client_request_binds_no_vlan_to_a_prefix() {
+        // The join runs over one frame's facts. A tag beside a client-originated packet
+        // must produce the tag alone.
+        let options = [53, 1, 5, 1, 4, 255, 255, 255, 0];
+        let mut request = dhcp_body(Ipv4Addr::new(192, 168, 8, 44), &options);
+        request[0] = 1; // BOOTREQUEST
+
+        let mut facts = vec![FrameFact::Vlan { id: 44 }];
+        if let Some(fact) = decode_dhcp("00:11:22:33:44:55", &request) {
+            facts.push(fact);
+        }
+        join_tagged_prefix(&mut facts);
+
+        assert_eq!(
+            facts,
+            vec![FrameFact::Vlan { id: 44 }],
+            "the tag stands alone: {facts:?}"
+        );
     }
 
     #[test]

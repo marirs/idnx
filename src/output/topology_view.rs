@@ -156,7 +156,7 @@ fn render_networks(report: &DiscoveryReport) {
             // An advertised prefix nothing answered on stays listed and says so; silence
             // and never having asked are different lines because they are different
             // findings.
-            if let Some(outcome) = report.network_reachability.get(&net.prefix) {
+            if let Some(outcome) = report.network_reachability.get(net) {
                 println!("  │     {}", outcome.describe().dimmed());
             }
         }

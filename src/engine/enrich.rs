@@ -34,7 +34,7 @@ pub struct EnrichmentRun {
     /// Reachability a per-device provider established about whole networks, carried out of
     /// the pass rather than dropped: a router answering for a subnet is the strongest
     /// statement anything in this run makes about that subnet.
-    pub reachability: Vec<(ipnet::IpNet, crate::providers::NetworkOutcome)>,
+    pub reachability: Vec<(ipnet::IpNet, crate::providers::NetworkReachability)>,
     /// Wall-clock time for the whole pass, which concurrency makes far shorter than the
     /// sum of the per-device times.
     pub elapsed: Duration,
@@ -71,7 +71,7 @@ pub async fn enrich_devices(
     type DeviceResult = (
         Vec<TopologyEvidence>,
         DeviceCoverage,
-        Vec<(ipnet::IpNet, crate::providers::NetworkOutcome)>,
+        Vec<(ipnet::IpNet, crate::providers::NetworkReachability)>,
     );
     let mut set: JoinSet<DeviceResult> = JoinSet::new();
 
