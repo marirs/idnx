@@ -36,7 +36,7 @@ Every reported network carries a confidence grade:
 | --- | --- | --- |
 | `observed` | `*` | Seen directly: a frame on the wire, a kernel table entry, or a live response. |
 | `advertised` | `+` | A control-plane source asserted it (SNMP route/address table, LLDP/CDP, DHCP). We believe the device but have not reached the network. |
-| `user-supplied` | `=` | You passed it via `--subnets`. |
+| `user-supplied` | `=` | You named it as the starting point (`idnx 10.20.0.0/16`). |
 | `inferred` | `~` | Derived by assumption, never by observation. Opt-in only. |
 
 ### 2.1a What passive observation can and cannot establish
@@ -57,22 +57,32 @@ A wireless station receives none of the wired link-layer signals. Traffic isolat
 another router's boundary never arrives at this capture point at all, so listening on the
 parent side cannot reveal what that router does not forward.
 
-### 2.2 Unexplored Boundaries
+### 2.2 Unresolved Forwarding Interfaces
 
 The most important thing idNX can report when it *cannot* enumerate what lies behind a
-router is that the router is there. A downstream NAT router presents itself on the parent
-network as one ordinary client address among many; without an explicit report it is
-indistinguishable from a printer.
+device is that the device is there and that it forwards. A downstream router presents itself
+on the parent network as one ordinary client address among many; without an explicit report
+it is indistinguishable from a printer.
 
-Every device identified as a router but not traversed is listed with the evidence that
-identified it and the reason it could not be explored:
+An interface that forwarded our traffic, or that answered for itself at a gateway-candidate
+address, is kept in its own category with the evidence that established it and a plain
+statement that nothing disclosed a network behind it:
 
 ```
-[!] Unexplored Network Boundaries (routers detected, contents not enumerable)
-    ├── 🚧 192.168.1.125 [ASUSTek Computer Inc.] - 60:cf:84:37:1b:70
-    │     • evidence: hardware vendor is ASUSTek Computer Inc.
-    │     └── not traversed: no SNMP response (UDP 161)
+Forwarding interfaces (routing confirmed, ownership unknown) (1)
+  ├── 192.168.70.1 [192.168.70.1]
+  │     • observed forwarding traffic on a path
+  │     downstream prefixes unresolved: no source disclosed a network behind this interface
 ```
+
+Two things it deliberately does not say. It does not call the device a router: forwarding
+one packet proves the interface forwards, and says nothing about who administers it — a
+carrier's, a landlord's and the operator's own routers are indistinguishable by hop count.
+And it does not call it a NAT boundary, which would be a claim about what lies behind it.
+
+Manufacturer is never part of this. A vendor string identifies who built the hardware; an
+ASUS, MikroTik or Ubiquiti OUI on a device that has disclosed nothing produces no boundary,
+no router and no evidence of either.
 
 Router evidence, all observed rather than assumed:
 
@@ -133,7 +143,12 @@ managed switches, run idNX from a host with a wired connection.
 Capture reveals the neighbours that advertise on the link idNX is bound to. That is the device on the other end of your cable plus anything else advertising in that broadcast domain — it is not a full switch-to-switch fabric reconstruction. Management addresses learned here are fed back into discovery as pivots.
 
 ### 2.6 Stealth ICMP Echo Fallbacks
-For devices on routed subnets that have no open TCP ports or drop SYN packets, `idNX` runs parallel ICMP echo sweeps with dynamic timeout clamping (`.clamp(300, 1500)`), capturing stealth endpoints that standard port scanners skip.
+For devices with no open TCP port, and for addresses the neighbour cache merely remembers,
+`idNX` sends a correlated ICMP echo over an interface-bound socket. A reply counts only when
+it comes from the address that was asked and carries this run's identifier and sequence; a
+probe that could not be sent is recorded as unsent rather than as silence. It does not shell
+out to the system `ping` command, which ignores the selected interface and cannot report
+which of its probes actually left.
 
 ---
 
@@ -155,10 +170,20 @@ Both tables are graded `advertised`, not `observed`: the device asserted them, a
 
 ### Requirements and limits
 
-SNMP is the mechanism that makes cascading real, and most consumer routers ship with it **disabled**. When that is the case idNX reports the router as an unexplored boundary rather than silently omitting it.
+SNMP is one of several sources that can disclose a network beyond the attached link, and
+most consumer routers ship with it **disabled**. The others carry no credentials at all: RA
+prefix and route information options, DHCP option 121/249 classless static routes, passive
+RIPv2/RIPng, OSPFv2/v3 and IS-IS, ICMP address mask replies, and bounded reachability
+probing of gateway candidates. Cascading does not depend on SNMP, and a run with SNMP
+unavailable is not a degraded mode.
+
+Where every source is silent, the forwarding interface stays on the map with its downstream
+prefixes recorded as unresolved, rather than being omitted or having a subnet invented for
+it.
 
 A downstream NAT router is also, by design, opaque from its WAN side: it will typically
 drop inbound connections, expose its UPnP IGD only to its own LAN clients, and answer no
 management port. Where no control-plane source discloses the networks behind it, they
 cannot be enumerated from the parent network at all - the boundary report is the correct
-and complete answer. To map behind it, enable SNMP on the device or run idNX from a host on its LAN. Where SNMP is off and no other control-plane source discloses anything, idNX will report the local subnet and whatever its kernel routes cover — which is the honest answer, not a failure. SNMPv3, BRIDGE-MIB forwarding tables and LLDP-MIB are not yet implemented; see the roadmap.
+and complete answer. To map behind it, enable SNMP on the device or run idNX from a host on its LAN. Where SNMP is off and no other control-plane source discloses anything, idNX will report the local subnet and whatever its kernel routes cover — which is the honest answer, not a failure. SNMPv3, BRIDGE-MIB forwarding tables and LLDP-MIB are not implemented; SNMPv1 is refused
+rather than parsed. See the roadmap.

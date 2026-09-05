@@ -7,8 +7,14 @@
 **idNX** maps the network topology observable from a chosen vantage point, tells you how it
 knows each thing, and states plainly what it could not see.
 
-It is not a port scanner. Scanning happens last, to enrich and validate what discovery
-already found; it is never the thing that finds it.
+It is not a port scanner. Port sweeping happens last, to enrich and validate devices
+discovery has already found; it never finds them.
+
+Active *topology* probing is a different thing and does discover: a bounded, ordered set of
+gateway-candidate addresses is asked to answer for itself, and an address that does answer
+becomes a forwarding interface on the map. What it does not become is a network — a
+responding address is an address, and only a stated prefix (an address mask reply, a route,
+an interrogation of the interface) creates one.
 
 ---
 
@@ -31,13 +37,41 @@ so and idNX did not verify it.
 
 **Roles come from behaviour, never from manufacturer.** A device is a router because it is
 your default gateway, hands out DHCP leases, sends router advertisements, advertises a UPnP
-InternetGatewayDevice, or reports IP forwarding over SNMP. An OUI identifies who built the
-hardware and says nothing about what it does.
+InternetGatewayDevice, or reports IP forwarding over SNMP. A device that both bridges and
+routes — spanning-tree participation *and* forwarding evidence — is reported as a layer-3
+switch, in its own category, with both kinds of evidence retained on one node. An OUI
+identifies who built the hardware and says nothing about what it does.
+
+An interface that forwarded our traffic but identified nothing about itself is a
+*forwarding interface (ownership unknown)*, not a router: a hop count cannot tell the
+operator's router from a carrier's.
 
 **Nothing is invented.** A network node requires prefix-bearing evidence — an interface
-mask, a kernel route, DHCP option 1 or 121, or an RA prefix option. An observed VLAN tag
-produces `VLAN 20 observed; prefix unknown`, never a guessed `192.168.20.0/24`. Router
-addresses are never widened into assumed `/24`s.
+mask, a kernel route, DHCP option 1 or 121, an RA prefix option, a RIP/OSPF/IS-IS
+advertisement, or an ICMP address mask reply. An observed VLAN tag produces
+`VLAN 20 observed; prefix unknown`, never a guessed `192.168.20.0/24`. Router addresses are
+never widened into assumed `/24`s.
+
+A VLAN gains a prefix only when a *single observation* states both — a client-facing,
+untagged-by-no-relay DHCP ACK carrying the client's address and option 1, on a frame with
+exactly one tag. A tag seen in one frame and a prefix seen in another are two observations,
+and pairing them would be inference presented as capture. The binding is a relationship in
+the graph carrying the frame that produced it, so it can be checked rather than taken.
+
+**Reachability is a separate question from topology.** Whether anything answered inside a
+network says nothing about whether the network exists, so the two are recorded apart. Each
+network carries one of three states, with the coverage behind it:
+
+| State | Meaning |
+| --- | --- |
+| `reachable` | Something in it answered *during this run* — a TCP response or refusal, a correlated ICMP reply, a fresh ARP reply |
+| `probed_unreachable` | Probes reached the wire and nothing answered |
+| `not_enumerated` | Nothing was probed: too large to enumerate, or every socket refused to send |
+
+A neighbour-cache entry is never a responder — the kernel remembers stations long after they
+are gone. An advertised network nothing answers on stays on the map with its failed
+reachability recorded; how it was discovered is kept separately, because a silent sweep says
+nothing about whether a router advertised the prefix.
 
 ---
 
@@ -86,18 +120,28 @@ kernel routing tables, default gateway, the DHCP lease the OS already holds incl
 options 1, 3 and 121, ARP and IPv6 neighbour caches.
 
 **Credential-free network** — SSDP/UPnP descriptors and announced device types, mDNS and
-unicast DNS/PTR naming, MikroTik MNDP, vendor discovery broadcasts, ICMP and TCP
-reachability, service fingerprinting.
+unicast DNS/PTR naming, MikroTik MNDP, vendor discovery broadcasts, service fingerprinting,
+and the prefix-bearing active sources: IPv6 router solicitation (prefix and route
+information options), DHCP INFORM, ICMP address mask requests, and bounded reachability
+probing of gateway candidates. Every active probe is bound to the selected interface — ICMP
+included — so an answer is never attributed to a vantage that did not carry it.
 
 **Passive link-layer observation** (privileged, opportunistic) — opens at startup on the
 selected interface and runs concurrently until discovery converges. No listening flag, no
 fixed delay, nothing waits on it. Decodes Ethernet II, 802.3 LLC/SNAP, 802.1Q and QinQ,
-STP/RSTP BPDUs, LLDP, CDP, ARP, DHCPv4, IPv6 router advertisements and neighbour discovery,
-and MNDP. If it cannot start, everything else is unaffected.
+STP/RSTP BPDUs, LLDP, CDP, ARP, DHCPv4 (options 1, 3 and 121), IPv6 router advertisements
+and neighbour discovery, MNDP, RIPv2 and RIPng, OSPFv2 and OSPFv3, and IS-IS. Routing
+updates are read, never answered. If capture cannot start, everything else is unaffected —
+and "no routing protocol on this link" is reported differently from "the decoder never
+ran".
 
-**Optional amplifier** — SNMP v1/v2c over UDP 161 with a community you supply. One source
-among many, not a prerequisite. Most consumer routers ship with SNMP disabled, and
-discovery proceeds normally without it.
+**Optional amplifier** — SNMP v2c over UDP 161 with a community you supply (v1 and v3 are
+not spoken; a v1 response is refused rather than parsed). One source among many, not a
+prerequisite. Most consumer routers ship with SNMP disabled, and discovery proceeds
+normally without it. Every response is bounded and correlated: the returned OID must match
+the request, exactly one varbind is accepted, oversized datagrams are refused rather than
+truncated, and each walk reports whether the table it read was complete — a truncated table
+is never presented as an exhaustive one.
 
 ---
 
@@ -107,8 +151,11 @@ Stated plainly, because a partial map presented as complete is worse than no map
 
 - **A NAT boundary is opaque without cooperation.** A downstream router rewrites every
   packet from its LAN to one source address. Nothing passive sees those devices and nothing
-  active reaches them. Where a router discloses no downstream prefix, idNX reports an opaque
-  boundary rather than inventing a subnet or omitting the router.
+  active reaches them. Where a device forwards traffic and no source states a prefix behind
+  it, idNX keeps it as a *forwarding interface (ownership unknown)* and says the downstream
+  prefixes are unresolved — it neither invents a subnet nor drops the interface. Nothing in
+  the default build asserts a NAT boundary: that would be a claim about what is behind the
+  device, which is exactly what could not be established.
 - **Passive capture only sees what reaches the capture point.** A wireless station receives
   no wired STP, LLDP or trunk VLAN tags, and no switched unicast between other hosts. An
   access port sees its own broadcast domain; observing every VLAN generally needs a trunk or
@@ -117,8 +164,9 @@ Stated plainly, because a partial map presented as complete is worse than no map
   started".
 - **A BPDU proves a bridge, nothing more.** It is not router evidence and implies no hidden
   subnet.
-- **A VLAN tag proves only the VLAN ID.** Its prefix stays unknown until DHCP, an RA or IP
-  traffic supplies one.
+- **A VLAN tag proves only the VLAN ID.** Its prefix stays unknown until one observation
+  states both. A relayed DHCP reply does not: it was captured on the relay's link, so its
+  tag is not the client's VLAN.
 - **Unmanaged switches are transparent** by design: no management address, no agent, no
   advertisement.
 
@@ -142,9 +190,15 @@ Vantage: en0 (wireless station) — carries the default route
 Networks
   ├── 192.168.1.0/24
   │     via en0
+  │     reachable; 12 of 254 address(es) probed answered
+  ├── 198.18.0.0/24
+  │     254 address(es) probed, none answered (advertised by 192.168.1.1)
 
-Virtual & VPN networks (local to this machine)
-  ├── 10.242.0.0/16 via feth466
+VLANs carrying a known prefix
+  ├── VLAN 77 192.0.2.0/24 (from DHCP lease)
+
+VLANs
+  ├── VLAN 42 observed; prefix unknown
 
 Routers & gateways
   ├── myrouter [192.168.1.1, fe80::7612:13ff:fe14:75dc] (Linksys Velop 6SP)
@@ -152,7 +206,15 @@ Routers & gateways
   │     • advertises a UPnP InternetGatewayDevice
   │     • advertises itself as an IPv6 router (RFC 4861)
   │     • is this machine's default gateway
-  │     • serves DNS and a web management interface
+
+Layer-3 switches (bridging and routing)
+  ├── 10.0.0.2 [10.0.0.2]
+  │     • emits spanning-tree BPDUs
+  │     • SNMP reports IP forwarding
+
+Forwarding interfaces (routing confirmed, ownership unknown) (1)
+  ├── 10.100.136.62
+  │     downstream prefixes unresolved: no source disclosed a network behind this interface
 
 Discovery coverage
   192.168.1.0/24
@@ -167,8 +229,14 @@ RFC 1918 is not treated as the only valid internal space — public, CGNAT, IPv6
 ULA prefixes are all preserved.
 
 Every export format carries the same information as the terminal view: node kinds,
-relationships, evidence, confidence, coverage and opaque boundaries. The HTML page is
+relationships, evidence, confidence, reachability, coverage and opaque boundaries. CSV is a
+typed-record export — one row per network, VLAN, device, relationship and coverage record,
+each naming its type in the first column — rather than a device inventory. The HTML page is
 self-contained and opens with no network access.
+
+Every format is covered by a byte-for-byte golden snapshot of one scripted discovery run
+(`tests/goldens/`), so a change to what an operator or a downstream consumer is told shows
+up as a diff rather than as a surprise.
 
 ---
 
@@ -203,6 +271,13 @@ result any other way, which is what stops a working decoder from silently feedin
 - `engine/orchestrator.rs` — the automatic fixed-point work queue and safety budget
 - `probes/` — protocol decoders, each testable from byte fixtures
 - `output/` — terminal, serialised and HTML renderings of the same graph
+
+Correctness is proven where it can be: synthetic PCAP byte fixtures for every decoder, a
+scripted SNMP agent on loopback for the walk lifecycle, an acceptance test that drives the
+real orchestrator and proves a newly disclosed network moves the frontier and causes another
+pass, and golden snapshots of every output format. What cannot be proven from a laptop —
+privileged Linux capture, and a wired trunk or SPAN port — is stated as untested rather than
+assumed.
 
 See `docs/architecture.md`, `docs/deep_exploration.md` and `docs/protocols.md`; the protocol
 tables there mark implemented versus planned explicitly.

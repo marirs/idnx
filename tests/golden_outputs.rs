@@ -43,6 +43,33 @@ fn make_deterministic(report: &mut idnx::engine::orchestrator::DiscoveryReport) 
     for record in &mut report.coverage {
         record.elapsed = std::time::Duration::ZERO;
     }
+    // A pivot's note is a summary rendered during the run, so it carries the measured time
+    // as text and zeroing the field it came from is too late. The duration is trimmed from
+    // that one field rather than scanned for across rendered output -- which is the mistake
+    // the previous harness made.
+    for pivot in &mut report.pivot_runs {
+        for run in &mut pivot.runs {
+            if let Some(note) = run.note.take() {
+                run.note = Some(zero_trailing_duration(&note));
+            }
+        }
+    }
+}
+
+/// Rewrites a trailing `, 12ms` to `, 0ms`, leaving everything else alone.
+fn zero_trailing_duration(note: &str) -> String {
+    let Some(stripped) = note.strip_suffix("ms") else {
+        return note.to_string();
+    };
+    let digits: String = stripped
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return note.to_string();
+    }
+    format!("{}0ms", &stripped[..stripped.len() - digits.len()])
 }
 
 /// The one value that cannot be fixed in the report, because the exporter stamps it.
