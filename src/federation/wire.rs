@@ -38,6 +38,13 @@ pub enum WireFact {
     Vlan {
         id: u16,
     },
+    /// A VLAN and the prefix one observation stated it carries. The binding travels as a
+    /// unit: a peer sending the tag and the prefix as two records would be sending two
+    /// observations, which is the pairing this fact exists to prevent.
+    VlanNetwork {
+        vlan: u16,
+        network: String,
+    },
     InterfaceNetwork {
         interface: String,
         prefix: String,
@@ -191,6 +198,10 @@ impl WireEvidence {
                 prefix: prefix.to_string(),
             },
             Fact::Vlan { id } => WireFact::Vlan { id: *id },
+            Fact::VlanNetwork { vlan, network } => WireFact::VlanNetwork {
+                vlan: *vlan,
+                network: network.to_string(),
+            },
             Fact::InterfaceNetwork { interface, prefix } => WireFact::InterfaceNetwork {
                 interface: interface.clone(),
                 prefix: prefix.to_string(),
@@ -308,6 +319,10 @@ impl WireEvidence {
                 prefix: parse_prefix(prefix)?,
             },
             WireFact::Vlan { id } => Fact::Vlan { id: *id },
+            WireFact::VlanNetwork { vlan, network } => Fact::VlanNetwork {
+                vlan: *vlan,
+                network: parse_prefix(network)?,
+            },
             WireFact::InterfaceNetwork { interface, prefix } => Fact::InterfaceNetwork {
                 interface: interface.clone(),
                 prefix: parse_prefix(prefix)?,
@@ -429,6 +444,7 @@ impl WireFact {
         match self {
             WireFact::Network { prefix } => vec![("prefix", prefix)],
             WireFact::Vlan { .. } => Vec::new(),
+            WireFact::VlanNetwork { network, .. } => vec![("network", network)],
             WireFact::InterfaceNetwork { interface, prefix } => {
                 vec![("interface", interface), ("prefix", prefix)]
             }

@@ -232,6 +232,7 @@ impl DiscoveryProvider for VendorDiscoveryProvider {
                 evidence: run.evidence,
                 notes: run.outcomes,
                 attempted: run.transmitted,
+                reachability: Vec::new(),
             }
         })
     }
@@ -405,6 +406,7 @@ impl DiscoveryProvider for SnmpProvider {
                         "{target}:161 did not answer SNMP with any of {tried} community string(s)"
                     )],
                     attempted: true,
+                    reachability: Vec::new(),
                 };
             };
 
@@ -421,6 +423,7 @@ impl DiscoveryProvider for SnmpProvider {
                 evidence: snmp_evidence(&info, target, vantage),
                 notes,
                 attempted: true,
+                reachability: Vec::new(),
             }
         })
     }
@@ -495,6 +498,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             )
             .await;
             let summary_hosts = summary.active_hosts.len();
+            let mut responders: Vec<IpAddr> = Vec::new();
 
             for host in summary.active_hosts {
                 // Prefer the MAC as identity so a host merges with whatever the neighbour
@@ -506,6 +510,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
                 };
 
                 if !host.ip.is_unspecified() {
+                    responders.push(IpAddr::V4(host.ip));
                     // Attribute the address to how it was actually established. Labelling
                     // every host as an ICMP result was simply false for the many found via
                     // ARP or a TCP response, and it made the evidence trail useless.
@@ -585,10 +590,26 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             }
 
             notes.push(format!("{} host(s) answered something", summary_hosts));
+            // The same result as a structure, for anything that has to act on it. The note
+            // above is for a person to read; this is what an export or a later pass
+            // consumes, so neither has to parse a sentence.
+            let probed = crate::engine::orchestrator::enumerable_host_count(&IpNet::V4(scope));
+            let outcome = if responders.is_empty() {
+                crate::providers::NetworkOutcome::AdvertisedUnreachable {
+                    attempted: probed,
+                    reasons: vec![format!(
+                        "{} port(s) swept across {probed} address(es); nothing answered",
+                        self.ports.len()
+                    )],
+                }
+            } else {
+                crate::providers::NetworkOutcome::Reachable { responders }
+            };
             ProviderOutput {
                 evidence: out,
                 notes,
                 attempted: true,
+                reachability: vec![(IpNet::V4(scope), outcome)],
             }
         })
     }
@@ -761,6 +782,7 @@ impl DiscoveryProvider for ArpLivenessProvider {
                 evidence: out,
                 notes,
                 attempted,
+                reachability: Vec::new(),
             }
         })
     }
@@ -1231,6 +1253,7 @@ impl DiscoveryProvider for RouterDiscoveryProvider {
                 evidence: out,
                 notes,
                 attempted,
+                reachability: Vec::new(),
             }
         })
     }
@@ -1487,6 +1510,7 @@ impl DiscoveryProvider for DhcpInformProvider {
                 evidence: out,
                 notes,
                 attempted,
+                reachability: Vec::new(),
             }
         })
     }
@@ -1822,6 +1846,7 @@ impl DiscoveryProvider for BoundedReachabilityProvider {
                 evidence: out,
                 notes,
                 attempted: !sweep.asked.is_empty(),
+                reachability: Vec::new(),
             }
         })
     }
@@ -1951,6 +1976,7 @@ impl DiscoveryProvider for NdpLivenessProvider {
                 evidence: out,
                 notes,
                 attempted,
+                reachability: Vec::new(),
             }
         })
     }

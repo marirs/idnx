@@ -314,6 +314,8 @@ pub enum Relationship {
     RoutesTo,
     GatewayFor,
     Advertises,
+    /// A VLAN carries a network, from one observation that stated both.
+    CarriesNetwork,
     /// One interface forwards toward a destination, downstream of another.
     ForwardsToward,
     ObservedBehind,
@@ -329,6 +331,7 @@ impl Relationship {
             Relationship::RoutesTo => "routes to",
             Relationship::GatewayFor => "gateway for",
             Relationship::Advertises => "advertises",
+            Relationship::CarriesNetwork => "carries",
             Relationship::ForwardsToward => "forwards toward",
             Relationship::ObservedBehind => "observed behind",
             Relationship::PossibleUplink => "possible uplink",
@@ -874,6 +877,31 @@ impl TopologyGraph {
         self.vlans_without_prefix.iter()
     }
 
+    /// Every VLAN whose prefix one observation actually stated, with that observation.
+    ///
+    /// Read from the graph's own edges rather than from a side table, so a binding cannot
+    /// exist without the evidence that produced it.
+    pub fn vlan_networks(&self) -> Vec<(VlanRef, IpNet, Vec<Provenance>)> {
+        let mut bound: Vec<(VlanRef, IpNet, Vec<Provenance>)> = self
+            .edges
+            .values()
+            .filter(|edge| edge.relationship == Relationship::CarriesNetwork)
+            .filter_map(|edge| match (&edge.from, &edge.to) {
+                (NodeId::Vlan(id, realm), NodeId::Network(prefix, _)) => Some((
+                    VlanRef {
+                        id: *id,
+                        realm: realm.clone(),
+                    },
+                    *prefix,
+                    edge.provenance.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        bound.sort_by_key(|(vlan, prefix, _)| (vlan.id, prefix.to_string()));
+        bound
+    }
+
     /// Counts for presentation, computed once so every renderer agrees.
     pub fn counts(&self) -> TopologyCounts {
         let mut counts = TopologyCounts {
@@ -1162,6 +1190,31 @@ impl TopologyGraph {
                 self.vlans_without_prefix.insert(VlanRef {
                     id,
                     realm: scoped_realm(&realm),
+                });
+            }
+            Fact::VlanNetwork { vlan, network } => {
+                let vlan_realm = scoped_realm(&realm);
+                let vlan_id = NodeId::Vlan(vlan, vlan_realm.clone());
+                self.upsert(vlan_id.clone(), NodeKind::Vlan, ev.confidence, prov.clone());
+                let network_id = NodeId::Network(network, network_realm(&network, &realm));
+                self.upsert(
+                    network_id.clone(),
+                    NodeKind::Network,
+                    ev.confidence,
+                    prov.clone(),
+                );
+                self.link(
+                    vlan_id,
+                    network_id,
+                    Relationship::CarriesNetwork,
+                    ev.confidence,
+                    prov,
+                );
+                // It is no longer a tag of unknown extent, and the edge -- with its own
+                // provenance -- is what says so.
+                self.vlans_without_prefix.remove(&VlanRef {
+                    id: vlan,
+                    realm: vlan_realm,
                 });
             }
             Fact::DeviceAddress { device, address } => {
@@ -1698,11 +1751,6 @@ impl TopologyGraph {
         }
     }
 
-    /// Marks a VLAN as having gained prefix evidence, so it stops being reported as unknown.
-    pub fn attach_vlan_prefix(&mut self, vlan: &VlanRef) {
-        self.vlans_without_prefix.remove(vlan);
-    }
-
     /// Chooses the canonical device key, merging address-only identities into a MAC when
     /// one is known for that address.
     ///
@@ -1880,6 +1928,9 @@ fn qualify_fact(fact: Fact, realm: &Realm) -> Fact {
             network,
             next_hop,
         },
+        // A VLAN tag and a prefix are both already realm-qualified by the node ids they
+        // become, so the fact passes through unchanged.
+        Fact::VlanNetwork { vlan, network } => Fact::VlanNetwork { vlan, network },
         Fact::AttachedTo { device, network } => Fact::AttachedTo {
             device: q(device),
             network,

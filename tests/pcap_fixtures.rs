@@ -328,6 +328,64 @@ fn a_tagged_frame_records_its_vlan_and_its_prefix_separately() {
 }
 
 #[test]
+fn a_tagged_client_facing_ack_states_both_the_vlan_and_its_prefix() {
+    // The positive case, and the only shape that earns it: one tag, a DHCP ACK, no relay,
+    // the client's own address in yiaddr and its mask in option 1. One frame states both,
+    // so the association is an observation rather than a pairing of two separate ones.
+    let (graph, _) = absorb("vlan_tagged_dhcp_client_ack.pcap");
+
+    let bound = graph.vlan_networks();
+    assert_eq!(bound.len(), 1, "one binding, from one frame: {bound:?}");
+    assert_eq!(bound[0].0.id, 30);
+    assert_eq!(bound[0].1.to_string(), "203.0.113.0/24");
+    assert!(
+        !bound[0].2.is_empty(),
+        "the binding carries the observation that made it"
+    );
+    assert!(
+        !graph.vlans_without_prefix().any(|vlan| vlan.id == 30),
+        "it is no longer a tag of unknown extent"
+    );
+
+    // The option 121 route in the same frame names a network reachable *through* this one.
+    // It is evidence of that network and of nothing about the tag.
+    assert!(
+        networks(&graph).contains(&"198.51.100.0/24".to_string()),
+        "the classless route is still its own evidence: {:?}",
+        networks(&graph)
+    );
+    assert!(
+        !bound
+            .iter()
+            .any(|(_, prefix, _)| prefix.to_string() == "198.51.100.0/24"),
+        "a route reachable through the network is not a network riding on the tag"
+    );
+}
+
+#[test]
+fn a_relayed_ack_leaves_the_tag_unassociated() {
+    // giaddr is set, so this reply was captured on the relay's link. The tag here belongs
+    // to the relay's segment; joining it to the client's prefix would name a VLAN that
+    // this capture never saw the client on.
+    let (graph, _) = absorb("vlan_tagged_dhcp_relayed.pcap");
+
+    assert!(
+        graph.vlan_networks().is_empty(),
+        "a relayed reply joins nothing: {:?}",
+        graph.vlan_networks()
+    );
+    assert!(
+        graph.vlans_without_prefix().any(|vlan| vlan.id == 31),
+        "the tag itself was still observed"
+    );
+    assert!(
+        networks(&graph).contains(&"203.0.113.0/24".to_string()),
+        "and option 1 still names the client's network: {:?}",
+        networks(&graph)
+    );
+}
+
+#[test]
 fn one_hardware_address_learned_two_ways_is_one_device() {
     // An ARP reply and a neighbour advertisement from the same station, in one capture.
     // Both address families must land on a single node: keying them apart would report one

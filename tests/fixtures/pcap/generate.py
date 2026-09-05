@@ -374,6 +374,42 @@ write(
 )
 
 
+# A client-facing ACK: the server names the client's own address in yiaddr, the mask in
+# option 1, and the frame carries exactly one tag. This is the one shape where a single
+# observation states both the VLAN and the prefix riding on it.
+def dhcp_ack_to_client(yiaddr: str, giaddr: str, options: bytes) -> bytes:
+    message = bytearray(236)
+    message[0] = 2  # BOOTREPLY
+    message[1] = 1
+    message[2] = 6
+    message[4:8] = struct.pack("!I", 0x11223355)
+    message[16:20] = bytes(int(o) for o in yiaddr.split("."))  # yiaddr
+    message[24:28] = bytes(int(o) for o in giaddr.split("."))  # giaddr
+    message[28:34] = HOST_MAC
+    message += bytes([99, 130, 83, 99])
+    message += bytes([53, 1, 5])  # DHCPACK
+    message += options
+    message += bytes([255])
+    return udp4("192.0.2.1", "203.0.113.50", 67, 68, bytes(message))
+
+
+# Option 1 names the client's own network; option 121 names a different one reachable
+# through it. Only the first belongs to the tag.
+client_options = bytes([1, 4, 255, 255, 255, 0]) + bytes([3, 4, 203, 0, 113, 1])
+client_options += bytes([121, len(classless)]) + classless
+write(
+    "vlan_tagged_dhcp_client_ack.pcap",
+    [vlan(HOST_MAC, ROUTER_MAC, 30, 0x0800, dhcp_ack_to_client("203.0.113.50", "0.0.0.0", client_options))],
+)
+
+# The same reply through a relay agent. It was captured on the relay's link, so the tag
+# here belongs to the relay's segment and says nothing about the client's VLAN.
+write(
+    "vlan_tagged_dhcp_relayed.pcap",
+    [vlan(HOST_MAC, ROUTER_MAC, 31, 0x0800, dhcp_ack_to_client("203.0.113.50", "203.0.113.1", client_options))],
+)
+
+
 # --- ARP and NDP identity ----------------------------------------------------------------
 def arp_reply(mac: bytes, address: str, target_mac: bytes, target: str) -> bytes:
     body = bytes.fromhex("0001080006040002") + mac

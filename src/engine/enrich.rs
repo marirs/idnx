@@ -31,6 +31,10 @@ use crate::topology::graph::{Node, NodeId, TopologyGraph};
 pub struct EnrichmentRun {
     pub evidence: Vec<TopologyEvidence>,
     pub coverage: Vec<DeviceCoverage>,
+    /// Reachability a per-device provider established about whole networks, carried out of
+    /// the pass rather than dropped: a router answering for a subnet is the strongest
+    /// statement anything in this run makes about that subnet.
+    pub reachability: Vec<(ipnet::IpNet, crate::providers::NetworkOutcome)>,
     /// Wall-clock time for the whole pass, which concurrency makes far shorter than the
     /// sum of the per-device times.
     pub elapsed: Duration,
@@ -64,7 +68,12 @@ pub async fn enrich_devices(
     target_providers: Arc<Vec<Box<dyn DiscoveryProvider>>>,
 ) -> EnrichmentRun {
     let started = Instant::now();
-    let mut set: JoinSet<(Vec<TopologyEvidence>, DeviceCoverage)> = JoinSet::new();
+    type DeviceResult = (
+        Vec<TopologyEvidence>,
+        DeviceCoverage,
+        Vec<(ipnet::IpNet, crate::providers::NetworkOutcome)>,
+    );
+    let mut set: JoinSet<DeviceResult> = JoinSet::new();
 
     for task in tasks {
         // Providers still address a single IP. The preferred endpoint is the one the full
@@ -74,6 +83,7 @@ pub async fn enrich_devices(
         let providers = Arc::clone(&target_providers);
         set.spawn(async move {
             let (mut evidence, mut coverage) = interrogate_device(&task, &targeted).await;
+            let mut reachability = Vec::new();
 
             // Target-applicable providers run per device rather than per pass, so that a
             // device that answers SNMP is credited for it in its own coverage record.
@@ -91,20 +101,23 @@ pub async fn enrich_devices(
                 // was attempted against. Without it, a provider that never transmitted is
                 // indistinguishable from a device that stayed silent.
                 coverage.adapter_outcomes.extend(produced.notes);
+                reachability.extend(produced.reachability);
                 evidence.extend(produced.evidence);
             }
 
-            (evidence, coverage)
+            (evidence, coverage, reachability)
         });
     }
 
     let mut evidence = Vec::new();
     let mut coverage = Vec::new();
+    let mut reachability = Vec::new();
     while let Some(joined) = set.join_next().await {
         // A panicking probe must lose that one device, not the whole pass.
-        if let Ok((produced, record)) = joined {
+        if let Ok((produced, record, reached)) = joined {
             evidence.extend(produced);
             coverage.push(record);
+            reachability.extend(reached);
         }
     }
     coverage.sort_by(|a, b| a.addresses.cmp(&b.addresses));
@@ -112,6 +125,7 @@ pub async fn enrich_devices(
     EnrichmentRun {
         evidence,
         coverage,
+        reachability,
         elapsed: started.elapsed(),
     }
 }

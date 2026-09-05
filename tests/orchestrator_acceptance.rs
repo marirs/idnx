@@ -16,10 +16,14 @@
 
 use idnx::engine::orchestrator::{Budget, DiscoveryEngine};
 use idnx::providers::{
-    DiscoveryContext, DiscoveryProvider, ProviderFuture, ProviderOutput, Vantage, VantageKind,
+    DiscoveryContext, DiscoveryProvider, NetworkOutcome, ProviderFuture, ProviderOutput, Vantage,
+    VantageKind,
 };
 use idnx::topology::evidence::{Confidence, DeviceKey, EvidenceSource, Fact, RoleSignal};
-use idnx::topology::{TopologyEvidence, graph::DeviceCategory};
+use idnx::topology::{
+    TopologyEvidence,
+    graph::{DeviceCategory, NodeId, Relationship},
+};
 
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -88,6 +92,7 @@ impl DiscoveryProvider for ScriptedSeed {
                 ],
                 notes: vec!["seeded from scripted local state".to_string()],
                 attempted: true,
+                reachability: Vec::new(),
             }
         })
     }
@@ -100,23 +105,34 @@ enum Call {
     Device(IpAddr),
 }
 
-/// The scripted network. Each device discloses what a real one would disclose, and the
-/// engine decides what to do about it.
+/// The scripted network.
+///
+/// The alternation matters more than the content. A *device* discloses networks and never
+/// the devices on them; a *scope* discovers the devices in it and never the networks beyond
+/// them. So the only way the run can reach 203.0.113.9 is: ask 192.0.2.1, learn a subnet,
+/// examine that subnet, find the router in it, ask that router, learn a further subnet,
+/// examine it, and find the host. Injecting a device from the router that named its network
+/// would let the test pass without the engine ever examining a scope.
 struct ScriptedNetwork {
+    /// What a device discloses when interrogated: networks, never devices.
     disclosures: HashMap<IpAddr, Vec<TopologyEvidence>>,
+    /// What examining a network finds in it: devices, never further networks.
+    occupants: HashMap<IpNet, Vec<TopologyEvidence>>,
+    /// Reachability each scope pass establishes, as state.
+    reachability: HashMap<IpNet, NetworkOutcome>,
     /// Devices that answer nothing at all, and what the provider says about that.
     silent: HashMap<IpAddr, String>,
-    /// Scopes where no address answers, so the network stays advertised-only.
-    unreachable: HashMap<IpNet, String>,
     calls: Mutex<Vec<Call>>,
 }
 
 impl ScriptedNetwork {
     fn new() -> Self {
         let mut disclosures: HashMap<IpAddr, Vec<TopologyEvidence>> = HashMap::new();
+        let mut occupants: HashMap<IpNet, Vec<TopologyEvidence>> = HashMap::new();
+        let mut reachability: HashMap<IpNet, NetworkOutcome> = HashMap::new();
 
-        // The border router discloses a subnet nobody here is attached to, and the router
-        // that lives on it. This is the disclosure the whole cascade hangs from.
+        // The border router names a subnet nobody here is attached to. It names no device
+        // on it: who lives there is only discoverable by examining the subnet.
         disclosures.insert(
             addr("192.0.2.1"),
             vec![
@@ -128,9 +144,45 @@ impl ScriptedNetwork {
                     network: net("198.51.100.0/24"),
                     next_hop: Some(addr("192.0.2.1")),
                 }),
+            ],
+        );
+
+        // Examining the attached network finds the border router's neighbours -- and one
+        // observation that stated a VLAN and the prefix riding on it together.
+        occupants.insert(
+            net("192.0.2.0/24"),
+            vec![
+                TopologyEvidence::new(
+                    Fact::VlanNetwork {
+                        vlan: 77,
+                        network: net("192.0.2.0/24"),
+                    },
+                    EvidenceSource::DhcpLease,
+                    Confidence::Observed,
+                    VANTAGE,
+                )
+                .with_detail("client-facing DHCP ACK, tagged, with option 1"),
+            ],
+        );
+        reachability.insert(
+            net("192.0.2.0/24"),
+            NetworkOutcome::Reachable {
+                responders: vec![addr("192.0.2.1")],
+            },
+        );
+
+        // Examining the disclosed subnet finds the device in it: a layer-3 switch, which
+        // both bridges and forwards. One box, two kinds of evidence.
+        occupants.insert(
+            net("198.51.100.0/24"),
+            vec![
                 advertised(Fact::DeviceAddress {
                     device: device_key("198.51.100.1"),
                     address: addr("198.51.100.1"),
+                }),
+                advertised(Fact::DeviceRoleSignal {
+                    device: device_key("198.51.100.1"),
+                    signal: RoleSignal::SpanningTreeBridge,
                 }),
                 advertised(Fact::DeviceRoleSignal {
                     device: device_key("198.51.100.1"),
@@ -138,9 +190,15 @@ impl ScriptedNetwork {
                 }),
             ],
         );
+        reachability.insert(
+            net("198.51.100.0/24"),
+            NetworkOutcome::Reachable {
+                responders: vec![addr("198.51.100.1")],
+            },
+        );
 
-        // The second router continues the cascade, and adds the two shapes that must
-        // survive without being resolved into something they are not.
+        // That switch routes toward two further networks, and keeps its switching identity
+        // while doing it.
         disclosures.insert(
             addr("198.51.100.1"),
             vec![
@@ -152,12 +210,6 @@ impl ScriptedNetwork {
                     network: net("203.0.113.0/24"),
                     next_hop: Some(addr("198.51.100.1")),
                 }),
-                // An ordinary host on the newly disclosed subnet.
-                advertised(Fact::DeviceAddress {
-                    device: device_key("203.0.113.9"),
-                    address: addr("203.0.113.9"),
-                }),
-                // A network it says it forwards toward, where nothing will answer.
                 advertised(Fact::Network {
                     prefix: net("198.18.0.0/24"),
                 }),
@@ -166,8 +218,18 @@ impl ScriptedNetwork {
                     network: net("198.18.0.0/24"),
                     next_hop: Some(addr("198.51.100.1")),
                 }),
-                // Something forwarded traffic and said nothing about itself. It is a
-                // boundary, not a router we can claim to have identified.
+            ],
+        );
+
+        // Examining the second disclosed subnet finds an ordinary host, and something that
+        // forwarded traffic without identifying itself.
+        occupants.insert(
+            net("203.0.113.0/24"),
+            vec![
+                advertised(Fact::DeviceAddress {
+                    device: device_key("203.0.113.9"),
+                    address: addr("203.0.113.9"),
+                }),
                 advertised(Fact::DeviceAddress {
                     device: device_key("203.0.113.254"),
                     address: addr("203.0.113.254"),
@@ -177,6 +239,22 @@ impl ScriptedNetwork {
                     signal: RoleSignal::ObservedForwarding,
                 }),
             ],
+        );
+        reachability.insert(
+            net("203.0.113.0/24"),
+            NetworkOutcome::Reachable {
+                responders: vec![addr("203.0.113.9"), addr("203.0.113.254")],
+            },
+        );
+
+        // The third network is advertised and nothing in it answers. That is a result, not
+        // an absence of one, and it is returned as state.
+        reachability.insert(
+            net("198.18.0.0/24"),
+            NetworkOutcome::AdvertisedUnreachable {
+                attempted: 254,
+                reasons: vec!["advertised by 198.51.100.1; no address answered".to_string()],
+            },
         );
 
         let mut silent = HashMap::new();
@@ -189,16 +267,11 @@ impl ScriptedNetwork {
             "203.0.113.254 forwarded traffic and disclosed nothing".to_string(),
         );
 
-        let mut unreachable = HashMap::new();
-        unreachable.insert(
-            net("198.18.0.0/24"),
-            "advertised by 198.51.100.1; no address in it answered".to_string(),
-        );
-
         Self {
             disclosures,
+            occupants,
+            reachability,
             silent,
-            unreachable,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -230,6 +303,7 @@ impl DiscoveryProvider for ScriptedNetwork {
                         evidence: evidence.clone(),
                         notes: vec![format!("{target} disclosed {} fact(s)", evidence.len())],
                         attempted: true,
+                        reachability: Vec::new(),
                     };
                 }
                 let note = self
@@ -241,6 +315,7 @@ impl DiscoveryProvider for ScriptedNetwork {
                     evidence: Vec::new(),
                     notes: vec![note],
                     attempted: true,
+                    reachability: Vec::new(),
                 };
             }
 
@@ -252,17 +327,20 @@ impl DiscoveryProvider for ScriptedNetwork {
                 .expect("the call log")
                 .push(Call::Scope(scope));
 
-            if let Some(reason) = self.unreachable.get(&scope) {
-                return ProviderOutput {
-                    evidence: Vec::new(),
-                    notes: vec![reason.clone()],
-                    attempted: true,
-                };
-            }
+            let evidence = self.occupants.get(&scope).cloned().unwrap_or_default();
+            let reachability = self
+                .reachability
+                .get(&scope)
+                .map(|outcome| vec![(scope, outcome.clone())])
+                .unwrap_or_default();
             ProviderOutput {
-                evidence: Vec::new(),
-                notes: vec![format!("{scope} examined")],
+                notes: vec![format!(
+                    "{scope} examined; {} occupant fact(s)",
+                    evidence.len()
+                )],
+                evidence,
                 attempted: true,
+                reachability,
             }
         })
     }
@@ -403,18 +481,32 @@ fn what_could_not_be_resolved_survives_the_run_unresolved() {
         networks.contains(&"198.18.0.0/24".to_string()),
         "an advertised network stays advertised: {networks:?}"
     );
-    let unreachable = report
-        .scope_runs
-        .iter()
-        .find(|run| run.scope == Some(net("198.18.0.0/24")))
-        .expect("it was examined like any other network");
+    assert_eq!(
+        report.network_reachability.get(&net("198.18.0.0/24")),
+        Some(&NetworkOutcome::AdvertisedUnreachable {
+            attempted: 254,
+            reasons: vec!["advertised by 198.51.100.1; no address answered".to_string()],
+        }),
+        "its failed reachability is state, not a sentence: {:?}",
+        report.network_reachability
+    );
+    // And a network that did answer is a different state, holding what answered.
+    assert_eq!(
+        report.network_reachability.get(&net("203.0.113.0/24")),
+        Some(&NetworkOutcome::Reachable {
+            responders: vec![addr("203.0.113.9"), addr("203.0.113.254")],
+        }),
+        "{:?}",
+        report.network_reachability
+    );
+    // The human sentence is rendered from the state and is never the state itself.
     assert!(
-        unreachable.runs.iter().any(|run| run
-            .note
-            .as_deref()
-            .is_some_and(|note| note.contains("no address in it answered"))),
-        "its failed reachability is stated: {:?}",
-        unreachable.runs
+        report
+            .network_reachability
+            .get(&net("198.18.0.0/24"))
+            .expect("recorded")
+            .describe()
+            .contains("none answered")
     );
 
     // A VLAN with no prefix evidence keeps no prefix. Attaching the vantage's own prefix
@@ -507,6 +599,132 @@ fn every_scope_and_device_is_processed_once_and_convergence_waits_for_all_of_the
             "{prefix} was examined before convergence was declared"
         );
     }
+}
+
+#[test]
+fn examining_a_network_is_what_finds_the_devices_in_it() {
+    // The ordering the whole cascade depends on. A router names a subnet and says nothing
+    // about who is on it; the devices only exist once the subnet itself is examined. If a
+    // device were interrogated before its network was examined, the run would have learned
+    // of it some other way and this test would be proving nothing about scope discovery.
+    let (_, calls) = run_scripted();
+
+    let at = |wanted: Call| {
+        calls
+            .iter()
+            .position(|call| *call == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} never happened: {calls:?}"))
+    };
+
+    for (scope, discovered) in [
+        (net("198.51.100.0/24"), addr("198.51.100.1")),
+        (net("203.0.113.0/24"), addr("203.0.113.9")),
+        (net("203.0.113.0/24"), addr("203.0.113.254")),
+    ] {
+        assert!(
+            at(Call::Scope(scope)) < at(Call::Device(discovered)),
+            "{discovered} can only be asked after {scope} was examined: {calls:?}"
+        );
+    }
+
+    // And each network was itself only reachable through the device that disclosed it.
+    assert!(
+        at(Call::Device(addr("192.0.2.1"))) < at(Call::Scope(net("198.51.100.0/24"))),
+        "the border router disclosed the subnet before it could be examined: {calls:?}"
+    );
+    assert!(
+        at(Call::Device(addr("198.51.100.1"))) < at(Call::Scope(net("203.0.113.0/24"))),
+        "the switch disclosed the second subnet before it could be examined: {calls:?}"
+    );
+}
+
+#[test]
+fn a_layer_three_switch_is_one_device_that_keeps_both_identities() {
+    // A box that bridges and routes is one box. Splitting it -- a switch node from the
+    // spanning-tree evidence, a router node from the forwarding evidence -- reports two
+    // devices that do not exist, and neither of them holds the whole picture: the routed
+    // networks hang off one, the switching identity off the other.
+    let (report, _) = run_scripted();
+
+    let switch = addr("198.51.100.1");
+    let holders: Vec<_> = report
+        .graph
+        .nodes()
+        .filter(|node| node.addresses.contains(&switch))
+        .collect();
+    assert_eq!(
+        holders.len(),
+        1,
+        "one box, one node: {:?}",
+        holders.iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+    let node = holders[0];
+
+    // Both kinds of evidence survive on it. Losing the switching evidence once the device
+    // is classified as a router would erase why it is on the map at all.
+    let signals: Vec<&String> = node.role_signals.iter().collect();
+    assert!(
+        signals.iter().any(|s| s.contains("spanning-tree")),
+        "its switching evidence is retained: {signals:?}"
+    );
+    assert!(
+        signals.iter().any(|s| s.contains("forward")),
+        "and so is its forwarding evidence: {signals:?}"
+    );
+
+    // It discloses more than one routed network, and both hang off that single node.
+    let routed: Vec<String> = report
+        .graph
+        .edges()
+        .filter(|edge| edge.relationship == Relationship::RoutesTo && edge.from == node.id)
+        .filter_map(|edge| match &edge.to {
+            NodeId::Network(prefix, _) => Some(prefix.to_string()),
+            _ => None,
+        })
+        .collect();
+    for prefix in ["203.0.113.0/24", "198.18.0.0/24"] {
+        assert!(
+            routed.iter().any(|net| net == prefix),
+            "it routes toward {prefix}: {routed:?}"
+        );
+    }
+}
+
+#[test]
+fn a_vlan_is_bound_to_a_prefix_only_by_an_observation_that_stated_both() {
+    // The positive VLAN case, with its evidence attached. VLAN 77 is bound because one
+    // observation carried the tag and the prefix together; VLAN 42 is not, because nothing
+    // ever stated its extent. Both survive the run, and the difference between them is
+    // visible in the graph rather than implied by an absence.
+    let (report, _) = run_scripted();
+
+    let bound = report.graph.vlan_networks();
+    assert_eq!(bound.len(), 1, "one binding: {bound:?}");
+    let (vlan, prefix, provenance) = &bound[0];
+    assert_eq!(vlan.id, 77);
+    assert_eq!(prefix.to_string(), "192.0.2.0/24");
+    assert!(
+        !provenance.is_empty(),
+        "the binding carries the observation that made it, so it can be checked"
+    );
+
+    // The binding is a graph relationship, not an untraceable mutation of a flag.
+    assert!(
+        report.graph.edges().any(|edge| {
+            edge.relationship == Relationship::CarriesNetwork
+                && matches!(&edge.from, NodeId::Vlan(id, _) if *id == 77)
+                && !edge.provenance.is_empty()
+        }),
+        "the VLAN carries the network as an edge with its own evidence"
+    );
+
+    assert!(
+        report
+            .graph
+            .vlans_without_prefix()
+            .all(|vlan| vlan.id != 77),
+        "a bound VLAN is no longer of unknown extent"
+    );
 }
 
 #[test]

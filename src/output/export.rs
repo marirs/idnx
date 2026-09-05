@@ -134,6 +134,10 @@ pub struct NetworkExport {
     /// True when something on this machine observed it, which is also what decides whether
     /// it can be traversed from here.
     pub locally_observed: bool,
+    /// What the run established about reaching into this network, as state a consumer can
+    /// act on. `None` means nothing probed into it at all -- which is not the same as
+    /// nothing answering, and the two must never collapse into one empty field.
+    pub reachability: Option<ReachabilityExport>,
     pub evidence: Vec<EvidenceExport>,
 }
 
@@ -245,7 +249,11 @@ pub struct VlanExport {
     /// The switched domain that uses this tag, with the full peer identity where it is a
     /// peer's. Two peers' VLAN 20 are two VLANs.
     pub observed_in: DomainExport,
+    /// Present only where a single observation stated the tag and the prefix together.
     pub prefix: Option<String>,
+    /// That observation. A binding without its evidence is indistinguishable from a guess,
+    /// so the two are exported together or not at all.
+    pub evidence: Vec<EvidenceExport>,
     pub note: String,
 }
 
@@ -273,6 +281,53 @@ pub struct DeviceExport {
     pub opaque_reason: Option<String>,
     pub confidence: String,
     pub evidence: Vec<EvidenceExport>,
+}
+
+/// One network's reachability, in a shape that survives serialisation.
+///
+/// `state` is the machine-readable discriminant; `note` is the sentence rendered from it.
+/// Consumers read `state`, never the sentence.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReachabilityExport {
+    /// `reachable`, `advertised_unreachable` or `not_enumerated`.
+    pub state: String,
+    /// Addresses that answered, where any did.
+    pub responders: Vec<String>,
+    /// How many addresses were probed, where a sweep ran.
+    pub attempted: Option<usize>,
+    /// Why nothing answered, or why nothing was tried.
+    pub reasons: Vec<String>,
+    pub note: String,
+}
+
+impl ReachabilityExport {
+    fn of(outcome: &crate::providers::NetworkOutcome) -> Self {
+        use crate::providers::NetworkOutcome;
+        let note = outcome.describe();
+        match outcome {
+            NetworkOutcome::Reachable { responders } => Self {
+                state: "reachable".to_string(),
+                responders: responders.iter().map(|r| r.to_string()).collect(),
+                attempted: None,
+                reasons: Vec::new(),
+                note,
+            },
+            NetworkOutcome::AdvertisedUnreachable { attempted, reasons } => Self {
+                state: "advertised_unreachable".to_string(),
+                responders: Vec::new(),
+                attempted: Some(*attempted),
+                reasons: reasons.clone(),
+                note,
+            },
+            NetworkOutcome::NotEnumerated { reason } => Self {
+                state: "not_enumerated".to_string(),
+                responders: Vec::new(),
+                attempted: None,
+                reasons: vec![reason.clone()],
+                note,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -403,6 +458,10 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             // several observers and must not be reduced to one.
             observed_by: node.map(observers_of).unwrap_or_default(),
             locally_observed: node.is_some_and(|n| n.locally_observed()),
+            reachability: report
+                .network_reachability
+                .get(&net.prefix)
+                .map(ReachabilityExport::of),
             evidence: node.map(|n| evidence_of(&n.provenance)).unwrap_or_default(),
         });
     }
@@ -412,7 +471,10 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             .then_with(|| a.identity_domain.flat().cmp(&b.identity_domain.flat()))
     });
 
-    let vlans: Vec<VlanExport> = graph
+    // Both kinds of VLAN, each carrying what it is entitled to. A bound VLAN exports the
+    // prefix *and* the observation that joined them, so a consumer can check the claim
+    // rather than take it; an unbound one exports no prefix at all.
+    let mut vlans: Vec<VlanExport> = graph
         .vlans_without_prefix()
         .map(|vlan| VlanExport {
             id: vlan.id,
@@ -420,9 +482,23 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
             // a consumer merging by number alone would fuse them.
             observed_in: DomainExport::of(&vlan.realm),
             prefix: None,
+            evidence: Vec::new(),
             note: "observed on the wire; no prefix evidence".to_string(),
         })
         .collect();
+    vlans.extend(
+        graph
+            .vlan_networks()
+            .into_iter()
+            .map(|(vlan, prefix, provenance)| VlanExport {
+                id: vlan.id,
+                observed_in: DomainExport::of(&vlan.realm),
+                prefix: Some(prefix.to_string()),
+                evidence: evidence_of(&provenance),
+                note: "one observation stated both the tag and the prefix".to_string(),
+            }),
+    );
+    vlans.sort_by(|a, b| (a.id, &a.prefix).cmp(&(b.id, &b.prefix)));
 
     let mut devices = Vec::new();
     for node in graph.nodes() {
@@ -728,12 +804,22 @@ fn render_text(data: &TopologyExport) -> String {
             n.confidence,
             if n.enumerated { "" } else { "(not enumerated)" }
         ));
+        // Rendered from the reachability state. A network nothing answered on stays listed
+        // and says so; one never probed says that instead.
+        if let Some(reachability) = &n.reachability {
+            t.push_str(&format!("      {}\n", reachability.note));
+        }
     }
 
     if !data.vlans.is_empty() {
         t.push_str("\nVLANS\n");
         for v in &data.vlans {
-            t.push_str(&format!("  VLAN {:<6} {}\n", v.id, v.note));
+            match &v.prefix {
+                Some(prefix) => {
+                    t.push_str(&format!("  VLAN {:<6} {:<20} {}\n", v.id, prefix, v.note))
+                }
+                None => t.push_str(&format!("  VLAN {:<6} {:<20} {}\n", v.id, "-", v.note)),
+            }
         }
     }
 
@@ -865,6 +951,7 @@ mod tests {
             enrichment_elapsed: std::time::Duration::ZERO,
             enrichment_sequential_equivalent: std::time::Duration::ZERO,
             probes_attempted: 0,
+            network_reachability: Default::default(),
             visibility: VisibilityReport {
                 vantage: Vantage {
                     interface: "en0".to_string(),
@@ -949,6 +1036,88 @@ mod tests {
         assert!(
             s.total_nodes >= s.devices,
             "the graph holds devices plus networks, interfaces and services"
+        );
+    }
+
+    #[test]
+    fn reachability_is_exported_as_state_and_not_only_as_a_sentence() {
+        // An export consumer must be able to tell "probed, nothing answered" from "never
+        // probed" without matching on English. Both produce an empty host list.
+        let mut report = sample_report();
+        report.network_reachability.insert(
+            "192.168.1.0/24".parse().expect("a literal prefix"),
+            crate::providers::NetworkOutcome::AdvertisedUnreachable {
+                attempted: 254,
+                reasons: vec!["swept; nothing answered".to_string()],
+            },
+        );
+
+        let data = build_export(&report);
+        let network = data
+            .networks
+            .iter()
+            .find(|n| n.cidr == "192.168.1.0/24")
+            .expect("the network is exported");
+        let reachability = network
+            .reachability
+            .as_ref()
+            .expect("its reachability is exported");
+        assert_eq!(reachability.state, "advertised_unreachable");
+        assert_eq!(reachability.attempted, Some(254));
+        assert!(!reachability.reasons.is_empty());
+        assert!(reachability.note.contains("none answered"));
+
+        // Serialisation keeps the discriminant, which is the part a consumer reads.
+        let json = serde_json::to_string(&data).expect("the export serialises");
+        assert!(json.contains("advertised_unreachable"));
+    }
+
+    #[test]
+    fn a_bound_vlan_exports_its_prefix_together_with_the_observation_that_bound_it() {
+        // A prefix on a VLAN without the evidence that put it there is indistinguishable
+        // from a guess, so the two are exported together or not at all.
+        let mut report = sample_report();
+        report.graph.absorb(
+            TopologyEvidence::new(
+                Fact::VlanNetwork {
+                    vlan: 30,
+                    network: "203.0.113.0/24".parse().expect("a literal prefix"),
+                },
+                EvidenceSource::DhcpLease,
+                Confidence::Observed,
+                "en0",
+            )
+            .with_detail("client-facing DHCP ACK, tagged, with option 1"),
+        );
+
+        let data = build_export(&report);
+        let bound = data
+            .vlans
+            .iter()
+            .find(|vlan| vlan.id == 30)
+            .expect("the bound VLAN is exported");
+        assert_eq!(bound.prefix.as_deref(), Some("203.0.113.0/24"));
+        assert!(
+            !bound.evidence.is_empty(),
+            "the observation that bound it travels with it"
+        );
+
+        let unbound = data
+            .vlans
+            .iter()
+            .find(|vlan| vlan.id == 20)
+            .expect("the unbound VLAN is still exported");
+        assert!(
+            unbound.prefix.is_none() && unbound.evidence.is_empty(),
+            "a tag of unknown extent exports no prefix and no binding evidence"
+        );
+
+        // The binding is also a relationship, with its own provenance.
+        assert!(
+            data.relationships
+                .iter()
+                .any(|rel| rel.relationship == "carries" && !rel.evidence.is_empty()),
+            "the VLAN-to-network edge is exported with its evidence"
         );
     }
 

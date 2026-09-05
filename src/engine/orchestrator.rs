@@ -4,7 +4,7 @@
 //! orchestration, recursion, concurrency, safety limits and completion detection. There is
 //! no "deep mode" to enable and no recursion depth to pick.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use ipnet::IpNet;
 
@@ -120,6 +120,13 @@ pub struct DiscoveryReport {
     pub visibility: VisibilityReport,
     /// Scopes discovered but not enumerated because they exceeded the safety budget.
     pub oversized_scopes: Vec<IpNet>,
+    /// What was established about each network's reachability, as state rather than prose.
+    ///
+    /// Aggregated from every provider that probed into a network, across every pass. A
+    /// network absent from this map was never probed at all, which is a different thing
+    /// from one that was probed and stayed silent -- and the difference is exactly what a
+    /// consumer needs and a sentence cannot carry.
+    pub network_reachability: BTreeMap<IpNet, crate::providers::NetworkOutcome>,
     pub converged: bool,
 }
 
@@ -191,6 +198,20 @@ impl DiscoveryEngine {
         let mut enrichment_elapsed = Duration::ZERO;
         let mut enrichment_sequential = Duration::ZERO;
         let mut probes_attempted = 0usize;
+        let mut network_reachability: BTreeMap<IpNet, crate::providers::NetworkOutcome> =
+            BTreeMap::new();
+
+        /// Folds one provider's account of a network into the run's.
+        fn record_reachability(
+            into: &mut BTreeMap<IpNet, crate::providers::NetworkOutcome>,
+            produced: Vec<(IpNet, crate::providers::NetworkOutcome)>,
+        ) {
+            for (network, outcome) in produced {
+                into.entry(network)
+                    .and_modify(|held| held.merge(outcome.clone()))
+                    .or_insert(outcome);
+            }
+        }
 
         // Phase 1: seed from local OS state. This always runs and never depends on any
         // remote device answering.
@@ -200,6 +221,7 @@ impl DiscoveryEngine {
                 continue;
             }
             let produced = provider.discover(&context).await;
+            record_reachability(&mut network_reachability, produced.reachability.clone());
             seed_runs.push(ProviderRun {
                 provider: provider.name(),
                 evidence_count: produced.evidence.len(),
@@ -336,6 +358,7 @@ impl DiscoveryEngine {
             )
             .await;
 
+            record_reachability(&mut network_reachability, run.reachability.clone());
             enrichment_elapsed += run.elapsed;
             enrichment_sequential += run.sequential_equivalent();
             probes_attempted += run.probes_attempted();
@@ -380,8 +403,23 @@ impl DiscoveryEngine {
                 processed.insert(scope);
 
                 if enumerable_host_count(&scope) > self.budget.max_enumerable_hosts {
-                    // Still recorded as a network; simply not swept host by host.
+                    // Still recorded as a network; simply not swept host by host. Stated as
+                    // reachability state too, so a consumer is never left to infer from an
+                    // empty host list that the network was silent.
                     oversized.push(scope);
+                    record_reachability(
+                        &mut network_reachability,
+                        vec![(
+                            scope,
+                            crate::providers::NetworkOutcome::NotEnumerated {
+                                reason: format!(
+                                    "{} addresses exceeds the {} this run enumerates",
+                                    enumerable_host_count(&scope),
+                                    self.budget.max_enumerable_hosts
+                                ),
+                            },
+                        )],
+                    );
                 }
 
                 let scoped = context.for_scope(scope);
@@ -391,6 +429,7 @@ impl DiscoveryEngine {
                         continue;
                     }
                     let produced = provider.discover(&scoped).await;
+                    record_reachability(&mut network_reachability, produced.reachability.clone());
                     runs.push(ProviderRun {
                         provider: provider.name(),
                         evidence_count: produced.evidence.len(),
@@ -457,6 +496,7 @@ impl DiscoveryEngine {
                 control_plane: None,
             },
             oversized_scopes: oversized,
+            network_reachability,
             converged,
         }
     }
@@ -590,6 +630,7 @@ mod tests {
         // a link where nothing answered, and must not inherit that claim.
         let never_ran = ProviderOutput {
             attempted: false,
+            reachability: Vec::new(),
             ..Default::default()
         };
         assert_eq!(
@@ -599,6 +640,7 @@ mod tests {
 
         let asked_and_quiet = ProviderOutput {
             attempted: true,
+            reachability: Vec::new(),
             ..Default::default()
         };
         assert_eq!(

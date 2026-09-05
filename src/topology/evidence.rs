@@ -357,6 +357,18 @@ pub enum Fact {
     /// prefix-bearing evidence arrives for it.
     Vlan { id: u16 },
 
+    /// One observation carried both a VLAN tag and the prefix riding on it.
+    ///
+    /// The join has to come from a single piece of evidence that states both -- a
+    /// client-facing tagged DHCP ACK carrying the client address and option 1, say. A tag
+    /// seen in one frame and a prefix seen in another are two observations, and pairing
+    /// them is inference dressed as measurement.
+    ///
+    /// Kept as a fact rather than performed as a graph mutation so the binding carries its
+    /// own provenance and survives into every export: an operator must be able to ask why
+    /// a VLAN is said to carry a network, and get the frame that said so.
+    VlanNetwork { vlan: u16, network: IpNet },
+
     /// A local interface carries a network. Establishes which networks are reached through
     /// which link, which is how virtual and VPN plumbing is told apart from physical
     /// topology at render time.

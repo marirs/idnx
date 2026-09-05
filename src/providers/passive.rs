@@ -386,6 +386,24 @@ fn convert(
         }
 
         match fact {
+            FrameFact::VlanNetwork { vlan, network } => {
+                // One frame stated both. It carries its own provenance into the graph, so
+                // an operator can ask why a VLAN is said to carry a prefix and be shown
+                // the capture that said so.
+                out.push(
+                    TopologyEvidence::new(
+                        Fact::VlanNetwork {
+                            vlan: *vlan,
+                            network: *network,
+                        },
+                        EvidenceSource::DhcpLease,
+                        Confidence::Observed,
+                        interface,
+                    )
+                    .with_detail("client-facing DHCP ACK, tagged, with option 1"),
+                );
+            }
+
             FrameFact::Vlan { id } => {
                 // A tag proves the VLAN ID exists on this link. It never produces a prefix.
                 out.push(TopologyEvidence::new(
@@ -454,6 +472,10 @@ fn convert(
                 subnet_mask,
                 routers,
                 classless_routes,
+                // The join between a tag and this prefix is made in the decoder, where
+                // both are in one frame; here the reply is only a reply.
+                message_type: _,
+                relayed: _,
             } => {
                 let server = DeviceKey::mac(server_mac);
 
@@ -1072,6 +1094,8 @@ mod tests {
                 subnet_mask: Some(Ipv4Addr::new(255, 255, 255, 0)),
                 routers: vec![Ipv4Addr::new(192, 168, 8, 1)],
                 classless_routes: Vec::new(),
+                message_type: Some(5),
+                relayed: false,
             }],
             "test0",
             &ctx(),

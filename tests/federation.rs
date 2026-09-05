@@ -1108,10 +1108,30 @@ mod domain_safety {
         assert_eq!(vlans[0].id, vlans[1].id);
         assert_ne!(vlans[0].realm, vlans[1].realm);
 
-        // Attaching a prefix to one must not remove the other.
-        graph.attach_vlan_prefix(&vlans[0]);
+        // Learning a prefix for one must not claim it for the other. The binding arrives as
+        // evidence, absorbed here, so it lands in the domain that observed it and nowhere
+        // else -- a graph mutation keyed on the tag alone would have removed both.
+        graph.absorb(TopologyEvidence::new(
+            Fact::VlanNetwork {
+                vlan: 20,
+                network: "192.0.2.0/24".parse().expect("a literal prefix"),
+            },
+            EvidenceSource::DhcpLease,
+            Confidence::Observed,
+            "en0",
+        ));
+
         let remaining: Vec<_> = graph.vlans_without_prefix().cloned().collect();
-        assert_eq!(remaining, vec![vlans[1].clone()]);
+        assert_eq!(
+            remaining, vlans,
+            "both peers' VLAN 20 keep their unknown extent: {remaining:?}"
+        );
+        let bound = graph.vlan_networks();
+        assert_eq!(bound.len(), 1, "one binding, in one domain: {bound:?}");
+        assert!(
+            bound[0].0.realm.is_local(),
+            "and it belongs to the domain that observed it"
+        );
     }
 
     #[test]
@@ -1249,6 +1269,7 @@ mod cross_realm_leaks {
             enrichment_elapsed: std::time::Duration::ZERO,
             enrichment_sequential_equivalent: std::time::Duration::ZERO,
             probes_attempted: 0,
+            network_reachability: Default::default(),
             visibility: VisibilityReport {
                 vantage: Vantage {
                     interface: VANTAGE.to_string(),

@@ -63,7 +63,22 @@ pub enum FrameFact {
         routers: Vec<Ipv4Addr>,
         /// Option 121 classless static routes, as (destination, prefix length, next hop).
         classless_routes: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
+        /// Option 53. Only an ACK is a completed assignment; an OFFER is a proposal that
+        /// the client may never take.
+        message_type: Option<u8>,
+        /// giaddr is set, so this reply passed through a relay. The link it was captured
+        /// on is then the relay's, not the client's, which is what makes a tag observed
+        /// here say nothing about the client's VLAN.
+        relayed: bool,
     },
+
+    /// One frame stated a VLAN tag and the prefix riding on it.
+    ///
+    /// Emitted only where a single frame carries both: a client-facing DHCP ACK, tagged
+    /// with exactly one VLAN, carrying the client's address and option 1. A tag from one
+    /// frame and a prefix from another are two observations, and pairing them would be
+    /// inference presented as capture.
+    VlanNetwork { vlan: u16, network: IpNet },
 
     /// A routing update heard on the link: RIPv2 on UDP 520, RIPng on UDP 521.
     ///
@@ -222,8 +237,68 @@ pub fn decode_frame(frame: &[u8]) -> Vec<FrameFact> {
         _ => {}
     }
 
+    join_tagged_prefix(&mut facts);
     facts
 }
+
+/// Joins a VLAN tag to a prefix, but only where one frame stated both.
+///
+/// The join is made here, on the facts of a single frame, because that is the only place
+/// the association is an observation rather than a guess: the tag and the option 1 mask
+/// arrived in the same capture, on the same client-facing exchange.
+///
+/// Four conditions, each of which has to hold on its own:
+///
+/// * exactly one tag. A QinQ frame carries a service tag and a customer tag, and nothing in
+///   the frame says which of them the client's prefix belongs to.
+/// * a DHCP ACK. An OFFER is a proposal the client may never accept.
+/// * not relayed. A relayed reply was captured on the relay's link, so a tag seen here
+///   belongs to the relay's segment and says nothing about the client's.
+/// * an assigned address and option 1. Only those two together name the client's network.
+///
+/// Anything else in the frame -- an option 121 route, a router address -- is left
+/// unassociated, since a route reachable through this network is not a network riding on
+/// this tag.
+fn join_tagged_prefix(facts: &mut Vec<FrameFact>) {
+    let tags: Vec<u16> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FrameFact::Vlan { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let [vlan] = tags[..] else {
+        return;
+    };
+
+    let mut joined = Vec::new();
+    for fact in facts.iter() {
+        let FrameFact::Dhcp {
+            assigned: Some(address),
+            subnet_mask: Some(mask),
+            message_type: Some(DHCP_ACK),
+            relayed: false,
+            ..
+        } = fact
+        else {
+            continue;
+        };
+        let Some(prefix_len) = crate::net::interface::contiguous_prefix_len(*mask) else {
+            continue;
+        };
+        let Ok(net) = ipnet::Ipv4Net::new(*address, prefix_len) else {
+            continue;
+        };
+        joined.push(FrameFact::VlanNetwork {
+            vlan,
+            network: IpNet::V4(net.trunc()),
+        });
+    }
+    facts.extend(joined);
+}
+
+/// Option 53 value for DHCPACK.
+const DHCP_ACK: u8 = 5;
 
 /// Decodes an 802.3 LLC payload: spanning tree, or SNAP-encapsulated CDP.
 fn decode_llc(
@@ -433,6 +508,7 @@ pub fn decode_dhcp(server_mac: &str, body: &[u8]) -> Option<FrameFact> {
     let mut subnet_mask = None;
     let mut routers = Vec::new();
     let mut classless_routes = Vec::new();
+    let mut message_type = None;
 
     let mut i = OPTIONS_OFFSET + 4;
     while i < body.len() {
@@ -463,6 +539,7 @@ pub fn decode_dhcp(server_mac: &str, body: &[u8]) -> Option<FrameFact> {
                     routers.push(Ipv4Addr::from(*chunk));
                 }
             }
+            53 if len == 1 => message_type = Some(value[0]),
             121 => classless_routes.extend(decode_classless_routes(value)),
             _ => {}
         }
@@ -480,6 +557,9 @@ pub fn decode_dhcp(server_mac: &str, body: &[u8]) -> Option<FrameFact> {
         subnet_mask,
         routers,
         classless_routes,
+        message_type,
+        // giaddr, at offset 24: non-zero means a relay agent forwarded this.
+        relayed: !Ipv4Addr::new(body[24], body[25], body[26], body[27]).is_unspecified(),
     })
 }
 

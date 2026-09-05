@@ -152,6 +152,13 @@ fn render_networks(report: &DiscoveryReport) {
             if let Some(origin) = network_origin(graph, net) {
                 println!("  │     {}", origin.magenta());
             }
+            // Rendered from the run's reachability state, not from any provider's prose.
+            // An advertised prefix nothing answered on stays listed and says so; silence
+            // and never having asked are different lines because they are different
+            // findings.
+            if let Some(outcome) = report.network_reachability.get(&net.prefix) {
+                println!("  │     {}", outcome.describe().dimmed());
+            }
         }
     }
 
@@ -169,6 +176,37 @@ fn render_networks(report: &DiscoveryReport) {
                 "  ├── {} {}",
                 net.to_string().yellow(),
                 format!("via {}", ifaces).dimmed()
+            );
+        }
+    }
+
+    // VLANs whose prefix one observation actually stated. Shown apart from the tags of
+    // unknown extent below, because the two are different findings and only one of them
+    // names a network.
+    let bound = graph.vlan_networks();
+    if !bound.is_empty() {
+        println!("\n{}", "VLANs carrying a known prefix".bold());
+        for (vlan, prefix, provenance) in &bound {
+            let domain = if vlan.realm.is_local() {
+                String::new()
+            } else {
+                format!(" [{}]", vlan.realm.label())
+            };
+            // The observation that joined them, named. A binding without its evidence is
+            // indistinguishable from a guess.
+            let how = provenance
+                .iter()
+                .map(|p| p.source.label())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  ├── VLAN {}{} {} {}",
+                vlan.to_string().cyan().bold(),
+                domain.magenta(),
+                prefix.to_string().yellow(),
+                format!("(from {how})").dimmed()
             );
         }
     }
