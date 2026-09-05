@@ -41,6 +41,8 @@ pub const OID_SYS_DESCR: &str = "1.3.6.1.2.1.1.1.0";
 pub const OID_SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
 pub const OID_IP_NET_TO_MEDIA_TABLE: &str = "1.3.6.1.2.1.4.22.1"; // ARP table
 pub const OID_IP_ROUTE_TABLE: &str = "1.3.6.1.2.1.4.21.1"; // Route table
+/// `ipForwarding.0`: 1 means this device forwards, 2 means it does not.
+pub const OID_IP_FORWARDING: &str = "1.3.6.1.2.1.4.1.0";
 pub const OID_IP_ADDR_TABLE: &str = "1.3.6.1.2.1.4.20.1"; // Interface addresses
 
 /// Represents an ASN.1 Object Identifier
@@ -308,33 +310,11 @@ pub fn build_snmp_request(
 
 // ---------------------------------------------------------------------------
 // BER DECODING HELPERS
+//
+// Decoding runs through `Reader`, which carries the bounds of the TLV it is inside.
+// The free-standing length reader that used to live here parsed against the whole
+// datagram, so a child could claim bytes belonging to its parent's siblings.
 // ---------------------------------------------------------------------------
-
-fn decode_length(data: &[u8], offset: &mut usize) -> Result<usize, String> {
-    if *offset >= data.len() {
-        return Err("Unexpected end of data reading length".to_string());
-    }
-    let first = data[*offset];
-    *offset += 1;
-
-    if (first & 0x80) == 0 {
-        Ok(first as usize)
-    } else {
-        let num_bytes = (first & 0x7F) as usize;
-        if num_bytes == 0 || num_bytes > 4 {
-            return Err(format!("Unsupported multi-byte length: {}", num_bytes));
-        }
-        if *offset + num_bytes > data.len() {
-            return Err("Length exceeds packet boundary".to_string());
-        }
-        let mut len = 0usize;
-        for _ in 0..num_bytes {
-            len = (len << 8) | (data[*offset] as usize);
-            *offset += 1;
-        }
-        Ok(len)
-    }
-}
 
 fn decode_oid_value(data: &[u8]) -> Result<Oid, String> {
     if data.is_empty() {
@@ -369,132 +349,179 @@ fn decode_integer_value(data: &[u8]) -> i64 {
     val
 }
 
-/// The bytes a declared length covers, or a stated refusal.
+/// A cursor over one BER container, which cannot read past it.
 ///
-/// Every one of these was an unchecked slice. A response whose length byte claimed more
-/// than arrived -- which is a truncated datagram, a mis-framed one, or a hostile one --
-/// panicked the decoder and took the run with it. A declared length is a claim by the
-/// sender, and the only safe reading of a claim that overruns the buffer is to refuse the
-/// message.
-fn field<'a>(data: &'a [u8], offset: usize, len: usize, what: &str) -> Result<&'a [u8], String> {
-    data.get(offset..offset + len)
-        .ok_or_else(|| format!("{what} declares {len} bytes and the message does not hold them"))
+/// Every field this decoder reads is now taken through one of these. The previous version
+/// decoded the outer message, PDU and varbind lengths and then ignored them: `offset + len`
+/// was computed against the whole datagram, so a nested length could point past its
+/// enclosing object and the next `data[offset]` could panic or read a neighbouring field as
+/// its own. A declared length is a claim by the sender, and every one of them is now
+/// checked against the container it appears in.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn done(&self) -> bool {
+        self.at >= self.bytes.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.at
+    }
+
+    /// Reads one tag-length-value, returning the tag and a reader bounded to its contents.
+    fn tlv(&mut self, what: &str) -> Result<(u8, Reader<'a>), String> {
+        let tag = *self
+            .bytes
+            .get(self.at)
+            .ok_or_else(|| format!("{what}: the container ended before its tag"))?;
+        self.at += 1;
+
+        let len = self.length(what)?;
+        let end = self
+            .at
+            .checked_add(len)
+            .ok_or_else(|| format!("{what}: its declared length overflows"))?;
+        let value = self.bytes.get(self.at..end).ok_or_else(|| {
+            format!(
+                "{what}: declares {len} bytes and its container holds {}",
+                self.remaining()
+            )
+        })?;
+        self.at = end;
+        Ok((tag, Reader::new(value)))
+    }
+
+    /// Reads one tag-length-value and requires the tag.
+    fn expect(&mut self, tag: u8, what: &str) -> Result<Reader<'a>, String> {
+        let (found, value) = self.tlv(what)?;
+        if found != tag {
+            return Err(format!(
+                "{what}: expected tag {tag:#04x}, found {found:#04x}"
+            ));
+        }
+        Ok(value)
+    }
+
+    /// The BER length at the cursor, definite form only.
+    fn length(&mut self, what: &str) -> Result<usize, String> {
+        let first = *self
+            .bytes
+            .get(self.at)
+            .ok_or_else(|| format!("{what}: the container ended before its length"))?;
+        self.at += 1;
+
+        if first & 0x80 == 0 {
+            return Ok(first as usize);
+        }
+        let count = (first & 0x7f) as usize;
+        // Indefinite length is not used by SNMP, and a length longer than a pointer is not
+        // a length this will honour.
+        if count == 0 || count > 4 {
+            return Err(format!("{what}: unsupported length encoding"));
+        }
+        let bytes = self
+            .bytes
+            .get(self.at..self.at + count)
+            .ok_or_else(|| format!("{what}: its length field is truncated"))?;
+        self.at += count;
+
+        let mut len = 0usize;
+        for byte in bytes {
+            len = len
+                .checked_shl(8)
+                .and_then(|shifted| shifted.checked_add(*byte as usize))
+                .ok_or_else(|| format!("{what}: its declared length overflows"))?;
+        }
+        Ok(len)
+    }
+
+    /// The whole of what remains, for a primitive value.
+    fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.at..]
+    }
+
+    /// Requires that the container has been read to its end.
+    ///
+    /// Trailing bytes inside a container mean the message is not what it declares itself to
+    /// be: something is being smuggled past the fields this decoder knows, and a decoder
+    /// that ignores them accepts two readings of one message.
+    fn finished(&self, what: &str) -> Result<(), String> {
+        if self.done() {
+            return Ok(());
+        }
+        Err(format!(
+            "{what}: {} byte(s) remain after its declared fields",
+            self.remaining()
+        ))
+    }
+}
+
+/// Reads one integer field.
+fn integer(reader: &mut Reader<'_>, what: &str) -> Result<i64, String> {
+    let value = reader.expect(TAG_INTEGER, what)?;
+    Ok(decode_integer_value(value.rest()))
 }
 
 pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
-    let mut offset = 0;
-    if offset >= data.len() || data[offset] != TAG_SEQUENCE {
-        return Err("Invalid SNMP message: expected SEQUENCE tag".to_string());
-    }
-    offset += 1;
-    let _msg_len = decode_length(data, &mut offset)?;
+    let mut outer = Reader::new(data);
+    let mut message = outer.expect(TAG_SEQUENCE, "the message")?;
+    // Anything after the outer SEQUENCE is not part of this message.
+    outer.finished("the datagram")?;
 
-    // 1. Version
-    if offset >= data.len() || data[offset] != TAG_INTEGER {
-        return Err("Expected version INTEGER".to_string());
-    }
-    offset += 1;
-    let vlen = decode_length(data, &mut offset)?;
-    let version = decode_integer_value(field(data, offset, vlen, "the version")?) as i32;
-    offset += vlen;
-
-    // 2. Community
-    if offset >= data.len() || data[offset] != TAG_OCTET_STRING {
-        return Err("Expected community OCTET STRING".to_string());
-    }
-    offset += 1;
-    let clen = decode_length(data, &mut offset)?;
+    let version = integer(&mut message, "the version")? as i32;
     let community =
-        String::from_utf8_lossy(field(data, offset, clen, "the community")?).to_string();
-    offset += clen;
+        String::from_utf8_lossy(message.expect(TAG_OCTET_STRING, "the community")?.rest())
+            .to_string();
 
-    // 3. PDU
-    if offset >= data.len() {
-        return Err("Missing PDU in response".to_string());
-    }
-    let pdu_type = data[offset];
-    offset += 1;
-    let _pdu_len = decode_length(data, &mut offset)?;
+    let (pdu_type, mut pdu) = message.tlv("the PDU")?;
+    message.finished("the message")?;
 
-    // PDU: request-id
-    if offset >= data.len() || data[offset] != TAG_INTEGER {
-        return Err("Expected PDU request-id".to_string());
-    }
-    offset += 1;
-    let rlen = decode_length(data, &mut offset)?;
-    let request_id = decode_integer_value(field(data, offset, rlen, "the request id")?) as i32;
-    offset += rlen;
+    let request_id = integer(&mut pdu, "the request id")? as i32;
+    let error_status = integer(&mut pdu, "the error status")? as i32;
+    let error_index = integer(&mut pdu, "the error index")? as i32;
 
-    // PDU: error-status
-    if offset >= data.len() || data[offset] != TAG_INTEGER {
-        return Err("Expected PDU error-status".to_string());
-    }
-    offset += 1;
-    let elen = decode_length(data, &mut offset)?;
-    let error_status = decode_integer_value(field(data, offset, elen, "the error status")?) as i32;
-    offset += elen;
-
-    // PDU: error-index
-    if offset >= data.len() || data[offset] != TAG_INTEGER {
-        return Err("Expected PDU error-index".to_string());
-    }
-    offset += 1;
-    let ilen = decode_length(data, &mut offset)?;
-    let error_index = decode_integer_value(field(data, offset, ilen, "the error index")?) as i32;
-    offset += ilen;
-
-    // PDU: VarBindList (SEQUENCE OF VarBind)
-    if offset >= data.len() || data[offset] != TAG_SEQUENCE {
-        return Err("Expected VarBindList SEQUENCE".to_string());
-    }
-    offset += 1;
-    let varbind_list_len = decode_length(data, &mut offset)?;
-    let varbind_end = offset + varbind_list_len;
+    let mut list = pdu.expect(TAG_SEQUENCE, "the varbind list")?;
+    pdu.finished("the PDU")?;
 
     let mut varbinds = Vec::new();
-    while offset < varbind_end && offset < data.len() {
-        if data[offset] != TAG_SEQUENCE {
-            break;
-        }
-        offset += 1;
-        let vb_len = decode_length(data, &mut offset)?;
-        let vb_end = offset + vb_len;
+    while !list.done() {
+        let mut varbind = list.expect(TAG_SEQUENCE, "a varbind")?;
+        let oid = decode_oid_value(
+            varbind
+                .expect(TAG_OBJECT_IDENTIFIER, "a varbind's OID")?
+                .rest(),
+        )?;
 
-        // OID
-        if offset >= vb_end || data[offset] != TAG_OBJECT_IDENTIFIER {
-            offset = vb_end;
-            continue;
-        }
-        offset += 1;
-        let oid_len = decode_length(data, &mut offset)?;
-        let oid = decode_oid_value(field(data, offset, oid_len, "an OID")?)?;
-        offset += oid_len;
+        let (tag, value) = varbind.tlv("a varbind's value")?;
+        varbind.finished("a varbind")?;
+        let bytes = value.rest();
 
-        // Value
-        if offset < vb_end {
-            let val_tag = data[offset];
-            offset += 1;
-            let val_len = decode_length(data, &mut offset)?;
-            let val_bytes = field(data, offset, val_len, "a varbind value")?;
+        let decoded = match tag {
+            TAG_INTEGER => BerValue::Integer(decode_integer_value(bytes)),
+            TAG_OCTET_STRING => BerValue::OctetString(bytes.to_vec()),
+            TAG_NULL => BerValue::Null,
+            TAG_OBJECT_IDENTIFIER => BerValue::Oid(decode_oid_value(bytes)?),
+            TAG_IP_ADDRESS if bytes.len() == 4 => {
+                BerValue::IpAddress(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+            }
+            TAG_COUNTER32 => BerValue::Counter32(decode_integer_value(bytes) as u32),
+            TAG_GAUGE32 => BerValue::Gauge32(decode_integer_value(bytes) as u32),
+            TAG_TIMETICKS => BerValue::TimeTicks(decode_integer_value(bytes) as u32),
+            _ => BerValue::Unknown(tag, bytes.to_vec()),
+        };
+        varbinds.push((oid, decoded));
 
-            let val = match val_tag {
-                TAG_INTEGER => BerValue::Integer(decode_integer_value(val_bytes)),
-                TAG_OCTET_STRING => BerValue::OctetString(val_bytes.to_vec()),
-                TAG_NULL => BerValue::Null,
-                TAG_OBJECT_IDENTIFIER => BerValue::Oid(decode_oid_value(val_bytes)?),
-                TAG_IP_ADDRESS if val_bytes.len() == 4 => BerValue::IpAddress(Ipv4Addr::new(
-                    val_bytes[0],
-                    val_bytes[1],
-                    val_bytes[2],
-                    val_bytes[3],
-                )),
-                TAG_COUNTER32 => BerValue::Counter32(decode_integer_value(val_bytes) as u32),
-                TAG_GAUGE32 => BerValue::Gauge32(decode_integer_value(val_bytes) as u32),
-                TAG_TIMETICKS => BerValue::TimeTicks(decode_integer_value(val_bytes) as u32),
-                _ => BerValue::Unknown(val_tag, val_bytes.to_vec()),
-            };
-            varbinds.push((oid, val));
-            offset += val_len;
+        if varbinds.len() > MAX_VARBINDS {
+            return Err(format!(
+                "the varbind list carries more than the {MAX_VARBINDS} this reads"
+            ));
         }
     }
 
@@ -593,7 +620,9 @@ async fn snmp_request(
         .map_err(|e| format!("UDP send error: {}", e))?;
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut buf = [0u8; MAX_RESPONSE_BYTES];
+    // One byte more than the bound, so an oversized datagram is detected rather than
+    // silently truncated into something that happens to parse.
+    let mut buf = [0u8; MAX_RESPONSE_BYTES + 1];
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -612,6 +641,11 @@ async fn snmp_request(
             _ => continue,
         }
 
+        if len > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "response exceeds the {MAX_RESPONSE_BYTES}-byte bound this reads"
+            ));
+        }
         let message = decode_snmp_response(&buf[..len])?;
         // Version 1 on the wire is SNMPv2c, which is what was asked.
         if message.version != 1 {
@@ -634,11 +668,22 @@ async fn snmp_request(
         if message.pdu.request_id != request_id {
             return Err("response did not carry the request id it answers".to_string());
         }
-        if message.pdu.varbinds.len() > MAX_VARBINDS {
+        // One OID was asked, so one varbind is the answer. More than one is a response to
+        // a different request, or an agent volunteering rows nobody asked for -- and taking
+        // the first would attribute an arbitrary value to the OID that was requested.
+        if message.pdu.error_status == 0 && message.pdu.varbinds.len() != 1 {
             return Err(format!(
-                "response carried {} varbinds, beyond the {MAX_VARBINDS} this reads",
+                "response carried {} varbinds where one OID was asked",
                 message.pdu.varbinds.len()
             ));
+        }
+        // A GET must answer about the OID it was given. A GETNEXT answers about the next
+        // one, which the walk checks for itself.
+        if pdu_type == PDU_GET_REQUEST
+            && message.pdu.error_status == 0
+            && message.pdu.varbinds.first().map(|(found, _)| found) != Some(oid)
+        {
+            return Err("response answered about a different OID than the one asked".to_string());
         }
         return Ok(message);
     }
@@ -706,12 +751,15 @@ pub(crate) async fn snmp_walk_target(
         }
         let _ = step;
 
+        // Never more than what is left: a per-request timeout larger than the remaining
+        // budget let one slow step consume a deadline the walk had already spent.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let message = match snmp_request(
             target,
             PDU_GET_NEXT_REQUEST,
             &current_oid,
             binding,
-            timeout,
+            timeout.min(remaining),
         )
         .await
         {
@@ -820,6 +868,25 @@ pub struct SnmpRouteEntry {
     pub dest_network: Ipv4Addr,
     pub mask: Ipv4Addr,
     pub next_hop: Ipv4Addr,
+    /// `ipRouteType`: 2 invalid, 3 direct, 4 indirect (RFC 1213).
+    ///
+    /// An invalid row is a routing table entry the device itself has struck out; treating
+    /// one as a route would put a network on the map that the device says it does not
+    /// reach. Direct and indirect stay distinguishable because they are different claims:
+    /// one says the device is on that network, the other that it forwards toward it.
+    pub route_type: Option<i64>,
+}
+
+impl SnmpRouteEntry {
+    /// Whether the device presents this row as a usable route.
+    pub fn usable(&self) -> bool {
+        !matches!(self.route_type, Some(2))
+    }
+
+    /// Whether the device says it is directly attached to the destination.
+    pub fn direct(&self) -> bool {
+        matches!(self.route_type, Some(3))
+    }
 }
 
 /// Router/Switch hardware information
@@ -827,6 +894,11 @@ pub struct SnmpRouteEntry {
 pub struct SnmpDeviceInfo {
     /// The device the answers came from, which is what every resulting fact is about.
     pub device: Option<Ipv4Addr>,
+    /// `ipForwarding.0`, where the device answered it. `Some(true)` is the device stating
+    /// that it forwards, which is the only thing that makes it a router by SNMP alone.
+    pub forwarding: Option<bool>,
+    /// Per-table walk outcomes, so a partial table is never reported as a whole one.
+    pub table_status: Vec<(&'static str, String)>,
     pub sys_descr: Option<String>,
     pub sys_name: Option<String>,
     pub arp_cache: Vec<SnmpArpEntry>,
@@ -854,15 +926,39 @@ pub async fn harvest_snmp_device(
 ///
 /// The harvesters want the table; the reason a walk ended matters to the caller that is
 /// testing the walk, and is reported there.
-async fn walk_rows(
+async fn walk_table(
     target: &SnmpTarget,
     root: &Oid,
     binding: &SocketBinding,
     timeout: Duration,
+    name: &'static str,
+    info: &mut SnmpDeviceInfo,
 ) -> Vec<(Oid, BerValue)> {
-    snmp_walk_target(target, root, binding, timeout, 512, Duration::from_secs(20))
-        .await
-        .rows
+    let walk = snmp_walk_target(target, root, binding, timeout, 512, Duration::from_secs(20)).await;
+    // Recorded whether it completed or not. A table that timed out, hit a bound or was
+    // refused mid-way has rows that are individually valid and is not the whole table, and
+    // discarding that distinction let a partial answer look complete.
+    let status = match &walk.end {
+        WalkEnd::EndOfMibView | WalkEnd::LeftSubtree => {
+            format!("{} row(s), complete", walk.rows.len())
+        }
+        WalkEnd::AgentError(status) => format!(
+            "{} row(s), incomplete: the agent reported error status {status}",
+            walk.rows.len()
+        ),
+        WalkEnd::OidDidNotAdvance => format!(
+            "{} row(s), incomplete: the agent stopped advancing the OID",
+            walk.rows.len()
+        ),
+        WalkEnd::Invalid(reason) => {
+            format!("{} row(s), incomplete: {reason}", walk.rows.len())
+        }
+        WalkEnd::Bounded(bound) => {
+            format!("{} row(s), incomplete: stopped at {bound}", walk.rows.len())
+        }
+    };
+    info.table_status.push((name, status));
+    walk.rows
 }
 
 /// Harvests one device, sending to wherever the target says.
@@ -893,8 +989,25 @@ pub(crate) async fn harvest_snmp_target(
         None
     };
 
+    // What the device says about its own forwarding. A printer and a UPS answer SNMP as
+    // readily as a router does, and sysDescr succeeding says only that something answered.
+    let forwarding = match Oid::from_str(OID_IP_FORWARDING) {
+        Ok(oid) => snmp_request(target, PDU_GET_REQUEST, &oid, binding, timeout)
+            .await
+            .ok()
+            .and_then(|msg| msg.pdu.varbinds.first().cloned())
+            .and_then(|(_, value)| match value {
+                BerValue::Integer(1) => Some(true),
+                BerValue::Integer(2) => Some(false),
+                _ => None,
+            }),
+        Err(_) => None,
+    };
+
     let mut info = SnmpDeviceInfo {
         device: Some(target.device),
+        forwarding,
+        table_status: Vec::new(),
         sys_descr,
         sys_name,
         arp_cache: Vec::new(),
@@ -907,7 +1020,15 @@ pub(crate) async fn harvest_snmp_target(
     // .2 = ipNetToMediaPhysAddress (MAC)
     // .3 = ipNetToMediaNetAddress (IP)
     if let Ok(arp_root) = Oid::from_str(OID_IP_NET_TO_MEDIA_TABLE) {
-        let arp_results = walk_rows(target, &arp_root, binding, timeout).await;
+        let arp_results = walk_table(
+            target,
+            &arp_root,
+            binding,
+            timeout,
+            "ipNetToMediaTable",
+            &mut info,
+        )
+        .await;
         let mut ip_map: std::collections::HashMap<
             Vec<u32>,
             (Option<Ipv4Addr>, Option<String>, u32),
@@ -949,8 +1070,21 @@ pub(crate) async fn harvest_snmp_target(
     // .7 = ipRouteNextHop
     // .11 = ipRouteMask
     if let Ok(route_root) = Oid::from_str(OID_IP_ROUTE_TABLE) {
-        let route_results = walk_rows(target, &route_root, binding, timeout).await;
-        type RouteTuple = (Option<Ipv4Addr>, Option<Ipv4Addr>, Option<Ipv4Addr>);
+        let route_results = walk_table(
+            target,
+            &route_root,
+            binding,
+            timeout,
+            "ipRouteTable",
+            &mut info,
+        )
+        .await;
+        type RouteTuple = (
+            Option<Ipv4Addr>,
+            Option<Ipv4Addr>,
+            Option<Ipv4Addr>,
+            Option<i64>,
+        );
         let mut route_map: std::collections::HashMap<Vec<u32>, RouteTuple> =
             std::collections::HashMap::new();
 
@@ -958,17 +1092,24 @@ pub(crate) async fn harvest_snmp_target(
             if oid.0.len() >= 11 {
                 let col = oid.0[9];
                 let key = oid.0[10..].to_vec();
-                let entry = route_map.entry(key).or_insert((None, None, None));
+                let entry = route_map.entry(key).or_insert((None, None, None, None));
                 match col {
                     1 => entry.0 = val.as_ipv4(),
                     7 => entry.2 = val.as_ipv4(),
+                    // ipRouteType, which says whether the device presents this row as a
+                    // route at all.
+                    8 => {
+                        if let BerValue::Integer(kind) = val {
+                            entry.3 = Some(kind);
+                        }
+                    }
                     11 => entry.1 = val.as_ipv4(),
                     _ => {}
                 }
             }
         }
 
-        for (_, (dest, mask, nexthop)) in route_map {
+        for (_, (dest, mask, nexthop, route_type)) in route_map {
             if let (Some(dest), Some(mask), Some(next_hop)) = (dest, mask, nexthop)
                 && !dest.is_loopback()
             {
@@ -976,6 +1117,7 @@ pub(crate) async fn harvest_snmp_target(
                     dest_network: dest,
                     mask,
                     next_hop,
+                    route_type,
                 });
             }
         }
@@ -986,7 +1128,15 @@ pub(crate) async fn harvest_snmp_target(
     // .1 = ipAdEntAddr
     // .3 = ipAdEntNetMask
     if let Ok(addr_root) = Oid::from_str(OID_IP_ADDR_TABLE) {
-        let addr_results = walk_rows(target, &addr_root, binding, timeout).await;
+        let addr_results = walk_table(
+            target,
+            &addr_root,
+            binding,
+            timeout,
+            "ipAddrTable",
+            &mut info,
+        )
+        .await;
         let mut addr_map: std::collections::HashMap<
             Vec<u32>,
             (Option<Ipv4Addr>, Option<Ipv4Addr>),
@@ -1041,7 +1191,8 @@ pub mod fake_agent {
         Varbind(Oid, BerValue),
         /// An SNMPv2c end-of-view marker.
         EndOfMibView(Oid),
-        /// An error status, as an SNMPv1 agent ends a table (noSuchName is 2).
+        /// An error status in the response PDU (noSuchName is 2). A table can end this
+        /// way; it is not the same thing as a table that ended at its own last row.
         Error(i32),
         /// A well-formed response carrying someone else's request id.
         WrongRequestId(Oid, BerValue),
@@ -1049,6 +1200,12 @@ pub mod fake_agent {
         WrongCommunity(Oid, BerValue),
         /// A response that is not a GetResponse.
         WrongPduType(Oid, BerValue),
+        /// A well-formed response whose varbind names an OID nobody asked for.
+        WrongOid(Oid, BerValue),
+        /// Two varbinds where one OID was requested.
+        TwoVarbinds(Oid, BerValue, Oid, BerValue),
+        /// A response larger than the reader's bound, padded to `bytes`.
+        Oversized(Oid, usize),
         /// Bytes that are not a decodable message.
         Malformed(Vec<u8>),
         /// No answer at all.
@@ -1137,6 +1294,32 @@ pub mod fake_agent {
                             &oid,
                             &value,
                         ),
+                        Reply::WrongOid(oid, value) => response(
+                            &community,
+                            request.pdu.request_id,
+                            PDU_GET_RESPONSE,
+                            0,
+                            &oid,
+                            &value,
+                        ),
+                        Reply::Oversized(oid, bytes) => response(
+                            &community,
+                            request.pdu.request_id,
+                            PDU_GET_RESPONSE,
+                            0,
+                            &oid,
+                            &BerValue::OctetString(vec![b'x'; bytes]),
+                        ),
+                        Reply::TwoVarbinds(first, first_value, second, second_value) => {
+                            two_varbind_response(
+                                &community,
+                                request.pdu.request_id,
+                                &first,
+                                &first_value,
+                                &second,
+                                &second_value,
+                            )
+                        }
                         Reply::WrongPduType(oid, value) => response(
                             &community,
                             request.pdu.request_id,
@@ -1166,6 +1349,14 @@ pub mod fake_agent {
         /// A target whose device address is a documentation address and whose transport is
         /// this agent: the topology describes 192.0.2.x while the datagrams stay on
         /// loopback.
+        pub(crate) fn target_for(&self, device: std::net::Ipv4Addr, community: &str) -> SnmpTarget {
+            SnmpTarget {
+                device,
+                transport: SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, self.port),
+                community: community.to_string(),
+            }
+        }
+
         pub(crate) fn target(&self, device: &str, community: &str) -> SnmpTarget {
             SnmpTarget {
                 device: device.parse().expect("a documentation address"),
@@ -1213,6 +1404,38 @@ pub mod fake_agent {
         encode_tlv(TAG_SEQUENCE, &message)
     }
 
+    /// A GetResponse carrying two varbinds, which no request of ours ever asks for.
+    fn two_varbind_response(
+        community: &str,
+        request_id: i32,
+        first: &Oid,
+        first_value: &BerValue,
+        second: &Oid,
+        second_value: &BerValue,
+    ) -> Vec<u8> {
+        let mut varbinds = Vec::new();
+        for (oid, value) in [(first, first_value), (second, second_value)] {
+            let mut varbind = Vec::new();
+            varbind.extend_from_slice(&encode_oid(oid));
+            varbind.extend_from_slice(&encode_value(value));
+            varbinds.extend_from_slice(&encode_tlv(TAG_SEQUENCE, &varbind));
+        }
+        let varbinds = encode_tlv(TAG_SEQUENCE, &varbinds);
+
+        let mut pdu = Vec::new();
+        pdu.extend_from_slice(&encode_integer(request_id as i64));
+        pdu.extend_from_slice(&encode_integer(0));
+        pdu.extend_from_slice(&encode_integer(0));
+        pdu.extend_from_slice(&varbinds);
+        let pdu = encode_tlv(PDU_GET_RESPONSE, &pdu);
+
+        let mut message = Vec::new();
+        message.extend_from_slice(&encode_integer(1));
+        message.extend_from_slice(&encode_tlv(TAG_OCTET_STRING, community.as_bytes()));
+        message.extend_from_slice(&pdu);
+        encode_tlv(TAG_SEQUENCE, &message)
+    }
+
     fn encode_value(value: &BerValue) -> Vec<u8> {
         match value {
             BerValue::Null => encode_tlv(TAG_NULL, &[]),
@@ -1252,6 +1475,39 @@ mod lifecycle {
 
     fn oid(text: &str) -> Oid {
         Oid::from_str(text).expect("a literal OID")
+    }
+
+    /// A single GET, as the harvester issues one.
+    fn get(agent: &FakeAgent, oid_text: &str) -> Result<SnmpMessage, String> {
+        let target = agent.target(DEVICE, COMMUNITY);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(snmp_request(
+                &target,
+                PDU_GET_REQUEST,
+                &oid(oid_text),
+                &binding(),
+                Duration::from_millis(400),
+            ))
+    }
+
+    /// A walk with an explicit total budget, for the tests about the budget itself.
+    fn walk_within(agent: &FakeAgent, root: &str, request: Duration, total: Duration) -> Walk {
+        let target = agent.target(DEVICE, COMMUNITY);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(snmp_walk_target(
+                &target,
+                &oid(root),
+                &binding(),
+                request,
+                16,
+                total,
+            ))
     }
 
     fn walk(agent: &FakeAgent, root: &str) -> Walk {
@@ -1319,9 +1575,11 @@ mod lifecycle {
     }
 
     #[test]
-    fn an_snmpv1_agent_ending_a_table_with_no_such_name_is_reported_as_that() {
-        // v1 has no end-of-view marker: it ends a table with an error status. Reporting it
-        // as an error rather than as a completed walk is the honest reading.
+    fn an_error_status_ends_the_walk_and_is_reported_as_an_error() {
+        // Not a v1 exchange: the decoder refuses anything but v2c, so this is a v2c agent
+        // answering noSuchName rather than an end-of-view marker. Either way the walk did
+        // not reach the end of the table, and reporting it as complete would be a lie about
+        // coverage. The rows already validated are kept; the status says incomplete.
         let agent = FakeAgent::start(
             COMMUNITY,
             vec![
@@ -1468,6 +1726,238 @@ mod lifecycle {
         assert_eq!(result.end, WalkEnd::Bounded("the walk's step limit"));
         assert_eq!(result.rows.len(), 16, "the step limit passed to the walk");
         assert!(!result.complete());
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative fixtures: an agent that is wrong, hostile, or merely truncated.
+    // Each of these produced a fact -- or a crash -- before the correlation,
+    // bounding and completion rules landed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_get_answered_with_a_different_oid_is_refused() {
+        // The failure this prevents: an agent answering sysName with sysDescr's value, or
+        // an ipRouteTable column with a neighbour's address. Without correlating the
+        // returned OID to the requested one, the value is filed under the wrong question
+        // and every fact derived from it describes something that was never asked about.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![Reply::WrongOid(
+                oid("1.3.6.1.2.1.1.1.0"),
+                BerValue::OctetString(b"an answer to a different question".to_vec()),
+            )],
+        );
+
+        let error = get(&agent, OID_SYS_NAME).expect_err("the OID does not match the request");
+        assert!(
+            error.contains("a different OID"),
+            "the diagnostic says what was wrong: {error}"
+        );
+    }
+
+    #[test]
+    fn a_response_carrying_two_varbinds_for_one_request_is_refused() {
+        // Every request this sends names exactly one OID. Two varbinds back means the
+        // response does not correspond to the request, and taking varbinds[0] would be
+        // choosing which half of a mismatched answer to believe.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![Reply::TwoVarbinds(
+                oid(OID_SYS_NAME),
+                BerValue::OctetString(b"fixture-router".to_vec()),
+                oid(OID_SYS_DESCR),
+                BerValue::OctetString(b"and one more, unasked".to_vec()),
+            )],
+        );
+
+        let error = get(&agent, OID_SYS_NAME).expect_err("one request, one varbind");
+        assert!(
+            error.contains("varbind"),
+            "the diagnostic names the varbind count: {error}"
+        );
+    }
+
+    #[test]
+    fn a_response_larger_than_the_bound_is_refused_rather_than_truncated() {
+        // A datagram larger than the buffer used to be read as its first 8192 bytes, which
+        // decodes as a truncated message -- or, worse, as a shorter valid one. It is
+        // refused instead: the reader cannot know what it did not receive.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![Reply::Oversized(oid(OID_SYS_NAME), MAX_RESPONSE_BYTES)],
+        );
+
+        let error = get(&agent, OID_SYS_NAME).expect_err("the datagram exceeds the bound");
+        assert!(
+            error.contains("exceeds"),
+            "the diagnostic says the response was too large: {error}"
+        );
+    }
+
+    #[test]
+    fn an_inner_length_that_escapes_its_container_is_refused() {
+        // The defect the bounded reader closed: child TLVs were parsed against the whole
+        // datagram rather than against the bytes of their parent. A PDU claiming more
+        // length than its message holds, or a varbind list claiming more than its PDU
+        // holds, therefore read fields belonging to nothing.
+        let mut varbind = Vec::new();
+        varbind.extend_from_slice(&encode_oid(&oid(OID_SYS_NAME)));
+        varbind.extend_from_slice(&encode_octet_string(b"fixture-router"));
+        let varbind = encode_tlv(TAG_SEQUENCE, &varbind);
+        let varbinds = encode_tlv(TAG_SEQUENCE, &varbind);
+
+        let mut pdu_body = Vec::new();
+        pdu_body.extend_from_slice(&encode_integer(1)); // request id
+        pdu_body.extend_from_slice(&encode_integer(0)); // error status
+        pdu_body.extend_from_slice(&encode_integer(0)); // error index
+        pdu_body.extend_from_slice(&varbinds);
+
+        let build = |pdu: Vec<u8>| {
+            let mut message = Vec::new();
+            message.extend_from_slice(&encode_integer(1)); // SNMPv2c
+            message.extend_from_slice(&encode_octet_string(COMMUNITY.as_bytes()));
+            message.extend_from_slice(&pdu);
+            encode_tlv(TAG_SEQUENCE, &message)
+        };
+
+        // Well formed, as the control: the same bytes decode when no length lies.
+        let honest = encode_tlv(PDU_GET_RESPONSE, &pdu_body);
+        assert!(
+            decode_snmp_response(&build(honest.clone())).is_ok(),
+            "the control message is the one being mutated, so it must decode"
+        );
+
+        // The PDU claims more bytes than the message contains.
+        let mut long_pdu = honest.clone();
+        assert!(
+            long_pdu[1] < 0x80,
+            "short-form length, so this test can bump it"
+        );
+        long_pdu[1] += 8;
+        let error = decode_snmp_response(&build(long_pdu))
+            .expect_err("the PDU claims bytes the message does not hold");
+        assert!(!error.is_empty());
+
+        // And the varbind list claims more bytes than the PDU contains.
+        let list_at = honest
+            .windows(varbinds.len())
+            .position(|window| window == varbinds.as_slice())
+            .expect("the varbind list is in the PDU");
+        let mut long_list = honest;
+        assert!(long_list[list_at + 1] < 0x80);
+        long_list[list_at + 1] += 8;
+        let error = decode_snmp_response(&build(long_list))
+            .expect_err("the varbind list claims bytes the PDU does not hold");
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn an_exhausted_total_budget_stops_the_walk_before_it_sends() {
+        // The budget is checked before each step, so a walk with none left sends nothing.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.1.0.0.0.0"),
+                BerValue::Integer(1),
+            )],
+        );
+
+        let result = walk_within(
+            &agent,
+            "1.3.6.1.2.1.4.21.1",
+            Duration::from_millis(400),
+            Duration::ZERO,
+        );
+        assert_eq!(result.end, WalkEnd::Bounded("the walk's total time budget"));
+        assert!(result.rows.is_empty());
+        assert_eq!(agent.served(), 0, "nothing was sent");
+    }
+
+    #[test]
+    fn a_request_timeout_larger_than_the_remaining_budget_is_clamped_to_it() {
+        // Before the clamp, a per-request timeout larger than the total budget made the
+        // total meaningless: one silent step waited out its own timeout regardless of how
+        // little of the walk's budget was left. Rows already validated are kept.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![
+                Reply::Varbind(
+                    oid("1.3.6.1.2.1.4.21.1.1.192.0.2.0"),
+                    BerValue::IpAddress("192.0.2.0".parse().unwrap()),
+                ),
+                Reply::Silence,
+            ],
+        );
+
+        let started = std::time::Instant::now();
+        let result = walk_within(
+            &agent,
+            "1.3.6.1.2.1.4.21.1",
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(result.rows.len(), 1, "the answered row is still evidence");
+        assert!(!result.complete(), "the table did not reach its end");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the walk honoured its budget rather than the request timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_that_stops_early_keeps_its_rows_and_reports_itself_incomplete() {
+        // Rows validated individually stay evidence; the coverage claim does not. Absence
+        // of a route in a truncated table is absence of an answer, not absence of a route,
+        // and the status is what keeps those two readings apart.
+        let agent = FakeAgent::start(
+            COMMUNITY,
+            vec![
+                Reply::Varbind(
+                    oid(OID_SYS_DESCR),
+                    BerValue::OctetString(b"Synthetic router, fixture only".to_vec()),
+                ),
+                Reply::Varbind(
+                    oid(OID_SYS_NAME),
+                    BerValue::OctetString(b"fixture-router".to_vec()),
+                ),
+                Reply::Varbind(oid(OID_IP_FORWARDING), BerValue::Integer(1)),
+                // ipNetToMediaTable: one row, then the agent gives up on the table.
+                Reply::Varbind(
+                    oid("1.3.6.1.2.1.4.22.1.3.1.192.0.2.50"),
+                    BerValue::IpAddress("192.0.2.50".parse().unwrap()),
+                ),
+                Reply::Error(5), // genErr, mid-table
+            ],
+        );
+
+        let target = agent.target(DEVICE, COMMUNITY);
+        let info = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(harvest_snmp_target(
+                &target,
+                &binding(),
+                Duration::from_millis(400),
+            ))
+            .expect("sysDescr answered, so the device is harvested");
+
+        assert!(
+            info.table_status
+                .iter()
+                .any(|(_, status)| status.contains("incomplete")),
+            "a table that stopped early says so: {:?}",
+            info.table_status
+        );
+        assert!(
+            info.table_status
+                .iter()
+                .all(|(_, status)| !status.contains("row(s), complete")),
+            "no table reached its own end here: {:?}",
+            info.table_status
+        );
     }
 }
 

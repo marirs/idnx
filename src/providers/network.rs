@@ -372,15 +372,16 @@ impl DiscoveryProvider for SnmpProvider {
     }
 
     fn discover<'a>(&'a self, context: &'a DiscoveryContext) -> ProviderFuture<'a> {
-        Box::pin(crate::providers::attempted(async move {
-            let mut out = Vec::new();
+        Box::pin(async move {
             let Some(IpAddr::V4(target)) = context.target else {
-                return out;
+                return ProviderOutput::not_applicable("no IPv4 target for this pass");
             };
             let vantage = &context.vantage.interface;
 
+            let communities = Self::communities(context);
+            let tried = communities.len();
             let mut info = None;
-            for community in Self::communities(context) {
+            for community in communities {
                 if let Some(found) = crate::probes::snmp::harvest_snmp_device(
                     target,
                     161,
@@ -396,11 +397,32 @@ impl DiscoveryProvider for SnmpProvider {
             }
 
             let Some(info) = info else {
-                return out;
+                // Community strings are never named in diagnostics: the notes reach exported
+                // reports, and a credential does not belong in one.
+                return ProviderOutput {
+                    evidence: Vec::new(),
+                    notes: vec![format!(
+                        "{target}:161 did not answer SNMP with any of {tried} community string(s)"
+                    )],
+                    attempted: true,
+                };
             };
-            out.extend(snmp_evidence(&info, target, vantage));
-            out
-        }))
+
+            // Walk completion is coverage, not decoration. A table that stopped early still
+            // contributes its validated rows, but the report must not let a truncated table
+            // look like an exhaustive one -- absence of a row is otherwise read as absence
+            // of the route or neighbour it would have described.
+            let mut notes = vec![format!("{target}:161 answered SNMP")];
+            for (table, status) in &info.table_status {
+                notes.push(format!("{target}:161 {table}: {status}"));
+            }
+
+            ProviderOutput {
+                evidence: snmp_evidence(&info, target, vantage),
+                notes,
+                attempted: true,
+            }
+        })
     }
 }
 
@@ -794,18 +816,35 @@ pub(crate) fn snmp_evidence(
         vantage,
     ));
 
-    out.push(
-        TopologyEvidence::new(
-            Fact::DeviceRoleSignal {
-                device: device.clone(),
-                signal: RoleSignal::SnmpForwarding,
-            },
-            EvidenceSource::Snmp,
-            Confidence::Advertised,
-            vantage,
-        )
-        .with_detail("returned MIB-II routing state"),
-    );
+    // Answering SNMP is not routing. A printer, a UPS and a thermostat answer sysDescr as
+    // readily as a router does, and emitting a forwarding signal for every responder made
+    // each of them infrastructure. The signal now needs the device to say it forwards, or
+    // to hand over a routing table with a usable row in it -- and the detail says which,
+    // rather than claiming "returned MIB-II routing state" for a device whose walks all
+    // came back empty.
+    let usable_routes = info.routes.iter().filter(|route| route.usable()).count();
+    let forwarding_basis = match (info.forwarding, usable_routes) {
+        (Some(true), 0) => Some("reports ipForwarding(1)".to_string()),
+        (Some(true), rows) => Some(format!(
+            "reports ipForwarding(1) and {rows} usable route(s)"
+        )),
+        (_, rows) if rows > 0 => Some(format!("returned {rows} usable route(s) from ipRouteTable")),
+        _ => None,
+    };
+    if let Some(basis) = forwarding_basis {
+        out.push(
+            TopologyEvidence::new(
+                Fact::DeviceRoleSignal {
+                    device: device.clone(),
+                    signal: RoleSignal::SnmpForwarding,
+                },
+                EvidenceSource::Snmp,
+                Confidence::Advertised,
+                vantage,
+            )
+            .with_detail(basis),
+        );
+    }
 
     if let Some(name) = info.sys_name.clone() {
         out.push(TopologyEvidence::new(
@@ -822,8 +861,13 @@ pub(crate) fn snmp_evidence(
     // ipAddrTable: networks this router is directly attached to, with its exact
     // interface address on each. Prefix-bearing, so these become real networks.
     for (addr, mask) in &info.local_ips {
-        let prefix_len = u32::from(*mask).count_ones() as u8;
-        if !(1..=30).contains(&prefix_len) {
+        // Contiguous masks only. count_ones() read 255.0.255.0 as a /16 and built a network
+        // around it that the device never described. /31 is included: RFC 3021 makes it a
+        // routed point-to-point network, and excluding it dropped real links.
+        let Some(prefix_len) = crate::net::interface::contiguous_prefix_len(*mask) else {
+            continue;
+        };
+        if !(1..=31).contains(&prefix_len) {
             continue;
         }
         let Ok(net) = ipnet::Ipv4Net::new(*addr, prefix_len) else {
@@ -849,8 +893,15 @@ pub(crate) fn snmp_evidence(
 
     // ipRouteTable: everything it forwards toward.
     for entry in &info.routes {
-        let prefix_len = u32::from(entry.mask).count_ones() as u8;
-        if !(1..=30).contains(&prefix_len) || entry.dest_network.is_unspecified() {
+        // A row the device itself marks invalid is not a route: recording one would put a
+        // network on the map that the device says it does not reach.
+        if !entry.usable() {
+            continue;
+        }
+        let Some(prefix_len) = crate::net::interface::contiguous_prefix_len(entry.mask) else {
+            continue;
+        };
+        if !(1..=31).contains(&prefix_len) || entry.dest_network.is_unspecified() {
             continue;
         }
         let Ok(net) = ipnet::Ipv4Net::new(entry.dest_network, prefix_len) else {
@@ -1850,7 +1901,7 @@ mod tests {
     /// produced describes a documentation address, which is what makes this testable without
     /// asserting anything false about the topology.
     #[test]
-    fn the_snmp_path_runs_from_scripted_agent_to_graph() {
+    fn the_snmp_harvest_reaches_the_graph() {
         use crate::probes::snmp::fake_agent::{FakeAgent, Reply};
         use crate::probes::snmp::{BerValue, Oid, SnmpTarget, harvest_snmp_target};
         use crate::topology::TopologyGraph;
@@ -1869,6 +1920,9 @@ mod tests {
                 oid("1.3.6.1.2.1.1.5.0"),
                 BerValue::OctetString(b"fixture-router".to_vec()),
             ),
+            // ipForwarding.0: the device saying it forwards, which is what makes it a
+            // router rather than merely something that answers SNMP.
+            Reply::Varbind(oid("1.3.6.1.2.1.4.1.0"), BerValue::Integer(1)),
             // ipNetToMediaTable: a neighbour, by address and hardware address.
             Reply::Varbind(
                 oid("1.3.6.1.2.1.4.22.1.2.1.192.0.2.50"),
@@ -1887,6 +1941,10 @@ mod tests {
             Reply::Varbind(
                 oid("1.3.6.1.2.1.4.21.1.7.198.51.100.0"),
                 BerValue::IpAddress("192.0.2.254".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.8.198.51.100.0"),
+                BerValue::Integer(4), // ipRouteType: indirect
             ),
             Reply::Varbind(
                 oid("1.3.6.1.2.1.4.21.1.11.198.51.100.0"),
@@ -1925,6 +1983,14 @@ mod tests {
             .expect("the agent answered sysDescr, so the device is harvested");
 
         assert_eq!(info.sys_name.as_deref(), Some("fixture-router"));
+        assert_eq!(info.forwarding, Some(true), "the device said it forwards");
+        assert!(
+            info.table_status
+                .iter()
+                .all(|(_, status)| status.contains("complete")),
+            "every table ended at its own end: {:?}",
+            info.table_status
+        );
         assert_eq!(info.local_ips.len(), 1, "{:?}", info.local_ips);
         assert_eq!(info.routes.len(), 1, "{:?}", info.routes);
         assert_eq!(info.arp_cache.len(), 1, "{:?}", info.arp_cache);
@@ -2176,5 +2242,179 @@ mod tests {
         let targeted = ctx(VantageKind::Wired, true).for_target("10.0.0.1".parse().unwrap());
         assert!(!SsdpProvider.applies(&targeted));
         assert!(!MndpProvider.applies(&targeted));
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative fixtures for the SNMP -> evidence conversion. Each of these
+    // described a network the device never claimed.
+    // -----------------------------------------------------------------------
+
+    /// A device with nothing but an identity, for tests that add one field at a time.
+    fn bare_info(device: std::net::Ipv4Addr) -> crate::probes::snmp::SnmpDeviceInfo {
+        crate::probes::snmp::SnmpDeviceInfo {
+            device: Some(device),
+            sys_descr: Some("Synthetic device, fixture only".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn graph_of(info: &crate::probes::snmp::SnmpDeviceInfo) -> crate::topology::TopologyGraph {
+        let device = info.device.expect("the fixtures all name their device");
+        let mut graph = crate::topology::TopologyGraph::new();
+        for item in snmp_evidence(info, device, "test0") {
+            graph.absorb(item);
+        }
+        graph.finalize_roles();
+        graph
+    }
+
+    fn networks_of(info: &crate::probes::snmp::SnmpDeviceInfo) -> Vec<String> {
+        graph_of(info)
+            .network_refs()
+            .into_iter()
+            .map(|net| net.prefix.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_device_that_answers_snmp_without_forwarding_anything_is_not_a_router() {
+        // The defect: answering SNMP at all set the router role. A printer, a NAS or a
+        // managed access point running an SNMP agent was therefore drawn as infrastructure
+        // and its neighbours read as one hop further out than they are.
+        use crate::probes::snmp::fake_agent::{FakeAgent, Reply};
+        use crate::probes::snmp::{BerValue, Oid, harvest_snmp_target};
+        use std::str::FromStr;
+
+        let oid = |text: &str| Oid::from_str(text).expect("a literal OID");
+        let device: std::net::Ipv4Addr = "192.0.2.9".parse().unwrap();
+
+        let agent = FakeAgent::start(
+            "fixture-community",
+            vec![
+                Reply::Varbind(
+                    oid("1.3.6.1.2.1.1.1.0"),
+                    BerValue::OctetString(b"Synthetic print server, fixture only".to_vec()),
+                ),
+                Reply::Varbind(
+                    oid("1.3.6.1.2.1.1.5.0"),
+                    BerValue::OctetString(b"fixture-printer".to_vec()),
+                ),
+                // ipForwarding.0 = 2: not-forwarding, in the device's own words.
+                Reply::Varbind(oid("1.3.6.1.2.1.4.1.0"), BerValue::Integer(2)),
+                // Every table is empty, which is what a host looks like.
+                Reply::EndOfMibView(oid("1.3.6.1.2.1.4.23")),
+            ],
+        );
+        let target = agent.target_for(device, "fixture-community");
+
+        let info = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(harvest_snmp_target(
+                &target,
+                &crate::net::socket::SocketBinding::unbound(),
+                std::time::Duration::from_millis(400),
+            ))
+            .expect("it answered sysDescr, so it is a device");
+
+        assert_eq!(info.forwarding, Some(false));
+        assert!(info.routes.is_empty());
+
+        let graph = graph_of(&info);
+        assert!(
+            !graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&IpAddr::V4(device))),
+            "answering SNMP is not forwarding traffic"
+        );
+    }
+
+    #[test]
+    fn a_non_contiguous_route_mask_creates_no_network() {
+        // 255.0.255.0 has sixteen bits set, so count_ones() read it as a /16 and invented
+        // 198.51.0.0/16 -- a network no device described and no packet would follow.
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let mut info = bare_info(device);
+        info.routes = vec![crate::probes::snmp::SnmpRouteEntry {
+            dest_network: "198.51.100.0".parse().unwrap(),
+            mask: "255.0.255.0".parse().unwrap(),
+            next_hop: "192.0.2.254".parse().unwrap(),
+            route_type: Some(4),
+        }];
+
+        assert!(
+            networks_of(&info).is_empty(),
+            "a mask that is not a prefix names no network: {:?}",
+            networks_of(&info)
+        );
+    }
+
+    #[test]
+    fn a_non_contiguous_interface_mask_creates_no_network() {
+        // The same rule on the device's own address: an interface whose mask is not a
+        // prefix tells us the address exists, and nothing about the network around it.
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let mut info = bare_info(device);
+        info.local_ips = vec![(
+            "192.0.2.1".parse().unwrap(),
+            "255.255.0.255".parse().unwrap(),
+        )];
+
+        assert!(
+            networks_of(&info).is_empty(),
+            "a mask that is not a prefix names no network: {:?}",
+            networks_of(&info)
+        );
+    }
+
+    #[test]
+    fn a_thirty_one_bit_route_is_a_real_network_and_is_kept() {
+        // The boundary the contiguity rule must not overshoot: /31 is the ordinary mask on
+        // a routed point-to-point link (RFC 3021), not a degenerate one to filter out.
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let mut info = bare_info(device);
+        info.routes = vec![crate::probes::snmp::SnmpRouteEntry {
+            dest_network: "198.51.100.2".parse().unwrap(),
+            mask: "255.255.255.254".parse().unwrap(),
+            next_hop: "192.0.2.254".parse().unwrap(),
+            route_type: Some(4),
+        }];
+
+        assert!(
+            networks_of(&info).contains(&"198.51.100.2/31".to_string()),
+            "a point-to-point link is a network: {:?}",
+            networks_of(&info)
+        );
+    }
+
+    #[test]
+    fn a_route_the_device_marks_invalid_creates_nothing() {
+        // ipRouteType invalid(2) is the device striking the row out. Reading it as a route
+        // put a network on the map that the device says it does not reach, and -- because
+        // the row still has a next hop -- a forwarding relationship with it.
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let mut info = bare_info(device);
+        info.routes = vec![crate::probes::snmp::SnmpRouteEntry {
+            dest_network: "198.51.100.0".parse().unwrap(),
+            mask: "255.255.255.0".parse().unwrap(),
+            next_hop: "192.0.2.254".parse().unwrap(),
+            route_type: Some(2), // invalid
+        }];
+
+        assert!(
+            networks_of(&info).is_empty(),
+            "a struck-out row is not a route: {:?}",
+            networks_of(&info)
+        );
+        let graph = graph_of(&info);
+        assert!(
+            !graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&IpAddr::V4(device))),
+            "an invalid row is not routing evidence either"
+        );
     }
 }

@@ -460,8 +460,10 @@ fn convert(
                 // Option 1 with an assigned address is the only DHCP evidence that
                 // establishes a prefix.
                 if let (Some(addr), Some(mask)) = (assigned, subnet_mask) {
-                    let prefix_len = u32::from(*mask).count_ones() as u8;
-                    if (1..=32).contains(&prefix_len)
+                    // The same rule as everywhere else: a discontiguous option 1 mask is
+                    // not a prefix, whatever a server sent.
+                    if let Some(prefix_len) = crate::net::interface::contiguous_prefix_len(*mask)
+                        && (1..=32).contains(&prefix_len)
                         && let Ok(net) = Ipv4Net::new(*addr, prefix_len)
                     {
                         out.push(

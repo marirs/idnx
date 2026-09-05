@@ -296,7 +296,11 @@ pub fn parse_windows_route_print(output: &str) -> Vec<KernelRoute> {
             && let (Ok(dest), Ok(mask)) =
                 (Ipv4Addr::from_str(parts[0]), Ipv4Addr::from_str(parts[1]))
         {
-            let prefix = u32::from(mask).count_ones() as u8;
+            // Contiguous only: a discontiguous mask in a routing table is not a prefix,
+            // and rounding it would invent the network it describes.
+            let Some(prefix) = crate::net::interface::contiguous_prefix_len(mask) else {
+                continue;
+            };
             let Ok(cidr) = Ipv4Net::new(dest, prefix) else {
                 continue;
             };

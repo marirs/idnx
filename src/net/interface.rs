@@ -14,9 +14,27 @@ pub struct LocalNetworkInfo {
     pub default_gateway: Option<Ipv4Addr>,
 }
 
+/// The prefix length a netmask represents, if it represents one.
+///
+/// `count_ones()` is not that: it reads 255.0.255.0 as a /16 and 0.255.255.0 as a /24, so a
+/// discontiguous mask -- from a misconfigured device, a malformed response, or a hostile one
+/// -- silently produced a network nobody described. A mask is a prefix only when it is a run
+/// of ones followed by a run of zeros, and anything else is refused rather than rounded.
+pub fn contiguous_prefix_len(netmask: Ipv4Addr) -> Option<u8> {
+    let bits = u32::from(netmask);
+    (bits.leading_ones() + bits.trailing_zeros() == 32).then_some(bits.leading_ones() as u8)
+}
+
+/// The IPv6 form of the same rule.
+pub fn contiguous_prefix_len_v6(netmask: std::net::Ipv6Addr) -> Option<u8> {
+    let bits = u128::from(netmask);
+    (bits.leading_ones() + bits.trailing_zeros() == 128).then_some(bits.leading_ones() as u8)
+}
+
 impl LocalNetworkInfo {
     pub fn new(interface_name: String, ip: Ipv4Addr, netmask: Ipv4Addr) -> Result<Self, String> {
-        let prefix_len = u32::from(netmask).count_ones() as u8;
+        let prefix_len = contiguous_prefix_len(netmask)
+            .ok_or_else(|| format!("{netmask} is not a contiguous netmask"))?;
         let cidr = Ipv4Net::new(ip, prefix_len)
             .map_err(|e| format!("Invalid CIDR for {}/{}: {}", ip, prefix_len, e))?
             .trunc();
@@ -157,10 +175,12 @@ fn list_addresses(purpose: AddressUse) -> Vec<InterfaceAddress> {
                 if v4.ip.is_link_local() {
                     continue;
                 }
-                (
-                    std::net::IpAddr::V4(v4.ip),
-                    u32::from(v4.netmask).count_ones() as u8,
-                )
+                let Some(prefix_len) = contiguous_prefix_len(v4.netmask) else {
+                    // A discontiguous mask describes no network; deriving one would be
+                    // choosing which bits the kernel meant.
+                    continue;
+                };
+                (std::net::IpAddr::V4(v4.ip), prefix_len)
             }
             IfAddr::V6(v6) => {
                 if v6.ip.is_unspecified() {
@@ -171,8 +191,10 @@ fn list_addresses(purpose: AddressUse) -> Vec<InterfaceAddress> {
                 {
                     continue;
                 }
-                let bits: u32 = u128::from(v6.netmask).count_ones();
-                (std::net::IpAddr::V6(v6.ip), bits as u8)
+                let Some(prefix_len) = contiguous_prefix_len_v6(v6.netmask) else {
+                    continue;
+                };
+                (std::net::IpAddr::V6(v6.ip), prefix_len)
             }
         };
 

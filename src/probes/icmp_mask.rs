@@ -72,8 +72,7 @@ pub fn request(query: MaskQuery) -> Vec<u8> {
 /// choosing which bits the device meant, which is the difference between reading a network
 /// and inventing one.
 pub fn prefix_length(mask: Ipv4Addr) -> Option<u8> {
-    let bits = u32::from(mask);
-    (bits.leading_ones() + bits.trailing_zeros() == 32).then_some(bits.leading_ones() as u8)
+    crate::net::interface::contiguous_prefix_len(mask)
 }
 
 /// Validates a datagram as the reply to `query` and reads the mask it carried.
