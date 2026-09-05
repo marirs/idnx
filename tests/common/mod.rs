@@ -40,6 +40,14 @@ pub fn local(text: &str) -> NetworkRef {
     }
 }
 
+/// Every host address in a /24, as the fixture's providers would have probed them.
+pub fn every_host(prefix: &str) -> Vec<IpAddr> {
+    let IpNet::V4(subnet) = net(prefix) else {
+        panic!("the fixture's scopes are IPv4");
+    };
+    subnet.hosts().map(IpAddr::V4).collect()
+}
+
 pub fn advertised(fact: Fact) -> TopologyEvidence {
     TopologyEvidence::new(fact, EvidenceSource::Snmp, Confidence::Advertised, VANTAGE)
 }
@@ -167,7 +175,7 @@ impl ScriptedNetwork {
             net("192.0.2.0/24"),
             NetworkReachability::probed(
                 vec![addr("192.0.2.1")],
-                254,
+                every_host("192.0.2.0/24"),
                 0,
                 vec!["swept the attached network".to_string()],
             )
@@ -197,7 +205,7 @@ impl ScriptedNetwork {
             net("198.51.100.0/24"),
             NetworkReachability::probed(
                 vec![addr("198.51.100.1")],
-                254,
+                every_host("198.51.100.0/24"),
                 0,
                 vec!["swept the disclosed subnet".to_string()],
             )
@@ -251,7 +259,7 @@ impl ScriptedNetwork {
             net("203.0.113.0/24"),
             NetworkReachability::probed(
                 vec![addr("203.0.113.9"), addr("203.0.113.254")],
-                254,
+                every_host("203.0.113.0/24"),
                 0,
                 vec!["swept the second subnet".to_string()],
             )
@@ -264,7 +272,7 @@ impl ScriptedNetwork {
             net("198.18.0.0/24"),
             NetworkReachability::probed(
                 Vec::new(),
-                254,
+                every_host("198.18.0.0/24"),
                 0,
                 vec!["254 address(es) swept; nothing answered".to_string()],
             )

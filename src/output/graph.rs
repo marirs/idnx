@@ -137,7 +137,7 @@ fn build_data(report: &DiscoveryReport) -> GraphData {
                 ));
                 detail.push(format!(
                     "coverage: {} address(es) probed, {} responder(s), {} probe(s) not sent",
-                    reachability.attempted,
+                    reachability.attempted(),
                     reachability.responders.len(),
                     reachability.not_sent
                 ));

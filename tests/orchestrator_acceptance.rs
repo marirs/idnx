@@ -120,7 +120,7 @@ fn what_could_not_be_resolved_survives_the_run_unresolved() {
         ReachabilityState::ProbedUnreachable,
         "probes went out and nothing answered: {unreachable:?}"
     );
-    assert_eq!(unreachable.attempted, 254);
+    assert_eq!(unreachable.attempted(), 254);
     assert!(unreachable.responders.is_empty());
     // How it was discovered is held apart from what answered: a failed sweep says nothing
     // about whether a router advertised the prefix.
@@ -140,7 +140,11 @@ fn what_could_not_be_resolved_survives_the_run_unresolved() {
         .expect("recorded");
     assert_eq!(reached.state(), ReachabilityState::Reachable);
     assert_eq!(reached.responders.len(), 2);
-    assert_eq!(reached.attempted, 254, "the sweep's coverage is not erased");
+    assert_eq!(
+        reached.attempted(),
+        254,
+        "the sweep's coverage is not erased"
+    );
     // The human sentence is rendered from the state and is never the state itself.
     assert!(unreachable.describe().contains("none answered"));
 

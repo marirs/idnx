@@ -617,7 +617,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             let mut reasons = vec![format!(
                 "{} port(s) swept across {} address(es)",
                 self.ports.len(),
-                summary.addresses_probed
+                summary.probed_addresses.len()
             )];
             if summary.probes_not_sent > 0 {
                 reasons.push(format!(
@@ -627,7 +627,7 @@ impl DiscoveryProvider for HostEnrichmentProvider {
             }
             let outcome = crate::providers::NetworkReachability::probed(
                 responders,
-                summary.addresses_probed,
+                summary.probed_addresses.iter().copied().map(IpAddr::V4),
                 summary.probes_not_sent,
                 reasons,
             );
@@ -818,7 +818,7 @@ impl DiscoveryProvider for ArpLivenessProvider {
                     IpNet::V4(scope),
                     crate::providers::NetworkReachability::probed(
                         Vec::new(),
-                        0,
+                        Vec::new(),
                         crate::engine::orchestrator::enumerable_host_count(&IpNet::V4(scope)),
                         vec![attempt_line],
                     )
@@ -854,13 +854,24 @@ fn arp_reachability(
     responders.sort();
     responders.dedup();
 
+    // Only the addresses that answered count as probed.
+    //
+    // `asked` counts requests the raw channel accepted for transmission, which this project
+    // has already established does not prove a frame left the machine, let alone reached
+    // the medium. Treating it as coverage would inflate "addresses probed" with frames
+    // nobody can show were sent -- and would turn a silent sweep into a claim that 254
+    // addresses were asked and found quiet. The request count stays where it belongs: in
+    // the provider's diagnostics, labelled as what it is.
+    let probed = responders.clone();
+
     crate::providers::NetworkReachability::probed(
         responders,
-        sweep.asked.len(),
+        probed,
         0,
         vec![format!(
-            "raw ARP asked {} address(es) on the attached link",
-            sweep.asked.len()
+            "raw ARP: {} request(s) accepted for transmission, {} correlated reply/replies",
+            sweep.asked.len(),
+            sweep.replies.len()
         )],
     )
     .discovered_by(format!("attached to {vantage}"))
@@ -2516,18 +2527,30 @@ mod tests {
             vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10))]
         );
         assert_eq!(
-            reachability.attempted, 254,
-            "and the coverage of the sweep travels with it"
+            reachability.attempted(),
+            1,
+            "and only the address that answered counts as probed: BPF accepting 254 \
+             requests does not prove 254 frames left this machine"
         );
 
-        // Silence from every address is still silence, not an absent result.
+        // A sweep that correlated nothing establishes no coverage at all. The requests were
+        // accepted by the raw channel, which does not prove any frame left this machine --
+        // so the network has not been found silent, it has not been shown to be asked.
         let silent = ArpSweep {
             asked: sweep.asked.clone(),
             ..Default::default()
         };
+        let nothing = arp_reachability(&silent, "test0");
         assert_eq!(
-            arp_reachability(&silent, "test0").state(),
-            crate::providers::ReachabilityState::ProbedUnreachable
+            nothing.state(),
+            crate::providers::ReachabilityState::NotEnumerated,
+            "accepted-for-transmission is not evidence that anything was asked"
+        );
+        assert_eq!(nothing.attempted(), 0);
+        assert!(
+            nothing.reasons[0].contains("accepted for transmission"),
+            "and the request count survives as a labelled diagnostic: {:?}",
+            nothing.reasons
         );
     }
 
@@ -2554,7 +2577,9 @@ mod tests {
         let cache_only = ScanSummary {
             total_hosts: 254,
             active_hosts: vec![host(10, HostLiveness::Remembered)],
-            addresses_probed: 254,
+            probed_addresses: (1..=254u8)
+                .map(|host| std::net::Ipv4Addr::new(192, 0, 2, host))
+                .collect(),
             probes_sent: 254,
             probes_not_sent: 0,
             not_sent_reasons: Vec::new(),
@@ -2567,7 +2592,7 @@ mod tests {
         assert_eq!(
             crate::providers::NetworkReachability::probed(
                 fresh_responders(&cache_only),
-                cache_only.addresses_probed,
+                cache_only.probed_addresses.iter().copied().map(IpAddr::V4),
                 cache_only.probes_not_sent,
                 Vec::new(),
             )
@@ -2598,7 +2623,7 @@ mod tests {
         // advertisement that failed to verify. How it was discovered is separate, and kept.
         let attached = crate::providers::NetworkReachability::probed(
             Vec::new(),
-            254,
+            (1..=254u8).map(|host| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, host))),
             0,
             vec!["swept the attached link".to_string()],
         )

@@ -1628,7 +1628,8 @@ mod cross_realm_leaks {
             },
             NetworkReachability::probed(
                 Vec::new(),
-                254,
+                (1..=254u8)
+                    .map(|host| std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, host))),
                 0,
                 vec!["swept the local link; nothing answered".to_string()],
             )

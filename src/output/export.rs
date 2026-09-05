@@ -316,7 +316,7 @@ impl ReachabilityExport {
                 .iter()
                 .map(|address| address.to_string())
                 .collect(),
-            attempted: reachability.attempted,
+            attempted: reachability.attempted(),
             not_sent: reachability.not_sent,
             reasons: reachability.reasons.clone(),
             discovery: reachability.discovery.clone(),
@@ -1221,7 +1221,8 @@ mod tests {
             },
             crate::providers::NetworkReachability::probed(
                 Vec::new(),
-                254,
+                (1..=254u8)
+                    .map(|host| std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, host))),
                 0,
                 vec!["swept; nothing answered".to_string()],
             )

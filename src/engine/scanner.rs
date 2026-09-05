@@ -77,12 +77,13 @@ pub struct HostResult {
 pub struct ScanSummary {
     pub total_hosts: usize,
     pub active_hosts: Vec<HostResult>,
-    /// Addresses at least one probe actually left this machine for.
+    /// The addresses at least one probe actually left this machine for.
     ///
-    /// Counted rather than assumed from the subnet size: a socket that would not bind
-    /// sends nothing, and reporting the address as probed turned a local misconfiguration
-    /// into a claim that the remote network was silent.
-    pub addresses_probed: usize,
+    /// The addresses rather than their count, and observed rather than assumed from the
+    /// subnet size: a socket that would not bind sends nothing, and reporting the address
+    /// as probed turned a local misconfiguration into a claim that the remote network was
+    /// silent. Callers merge these across passes, which a count cannot support.
+    pub probed_addresses: Vec<Ipv4Addr>,
     pub probes_sent: usize,
     pub probes_not_sent: usize,
     /// Why probes could not be sent, deduplicated. Empty when everything went out.
@@ -398,6 +399,17 @@ pub async fn scan_subnet(
     .await
 }
 
+/// Whether an address still needs an echo after the TCP pass.
+///
+/// Anything this run has not actually heard from. The earlier rule -- "no entry in the
+/// results" -- excluded every host the neighbour cache had seeded, which is precisely the
+/// set worth asking: the cache says a station was there at some point, and an echo is the
+/// cheapest way to learn whether it still is. Those hosts stayed `Remembered` for the whole
+/// run and could never become responders.
+fn needs_echo(existing: Option<&HostResult>) -> bool {
+    existing.is_none_or(|host| host.liveness != HostLiveness::Answered)
+}
+
 /// Records one echo attempt against the sweep's counters.
 ///
 /// Split out because it is the part that must not be wrong: an address whose probe never
@@ -553,7 +565,13 @@ pub async fn scan_subnet_ext(
         }
     }
 
-    // ICMP for hosts with no open TCP port: many devices answer an echo and nothing else.
+    // ICMP for every host this run has not actually heard from: hosts with no open TCP
+    // port, and hosts the neighbour cache merely remembers.
+    //
+    // Excluding addresses already present in the results excluded every ARP-cache entry,
+    // which is exactly the set most in need of asking: the cache says a station was there
+    // once, and an echo is the cheapest way to find out whether it still is. Those hosts
+    // stayed `Remembered` for the whole run and never contributed a responder.
     //
     // The interface-bound correlated path, not the system `ping` command. That spawned one
     // external process per address -- hundreds for a /24 -- ignored the selected interface
@@ -563,7 +581,7 @@ pub async fn scan_subnet_ext(
     let missing_liveness: Vec<Ipv4Addr> = hosts
         .iter()
         .copied()
-        .filter(|ip| !host_results.contains_key(ip))
+        .filter(|ip| needs_echo(host_results.get(ip)))
         .collect();
 
     if !missing_liveness.is_empty() {
@@ -844,7 +862,7 @@ pub async fn scan_subnet_ext(
     ScanSummary {
         total_hosts,
         active_hosts,
-        addresses_probed: probed_addresses.len(),
+        probed_addresses: probed_addresses.into_iter().collect(),
         probes_sent,
         probes_not_sent,
         not_sent_reasons: not_sent_reasons.into_iter().collect(),
@@ -855,6 +873,34 @@ pub async fn scan_subnet_ext(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cache_remembered_host_is_still_asked() {
+        // The bug: only addresses absent from the results were echoed, and an ARP-cache
+        // entry put the address in the results. Every remembered host was therefore skipped
+        // by the one probe that could have confirmed it, and stayed remembered for the run.
+        let host = |liveness| HostResult {
+            ip: Ipv4Addr::new(192, 0, 2, 10),
+            is_alive: true,
+            liveness,
+            hostname: None,
+            mac_address: Some("02:00:5e:00:00:01".to_string()),
+            vendor: None,
+            open_ports: Vec::new(),
+            min_latency: None,
+            ipv6_addrs: Vec::new(),
+        };
+
+        assert!(
+            needs_echo(Some(&host(HostLiveness::Remembered))),
+            "a cache entry is a reason to ask, not an answer"
+        );
+        assert!(needs_echo(None), "an unknown address is asked");
+        assert!(
+            !needs_echo(Some(&host(HostLiveness::Answered))),
+            "a host that already answered is not asked again"
+        );
+    }
 
     #[test]
     fn an_echo_that_never_left_is_counted_as_not_sent() {

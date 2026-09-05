@@ -12,6 +12,7 @@ pub mod passive;
 pub mod target;
 pub mod vendor;
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -61,8 +62,12 @@ pub struct NetworkReachability {
     /// Never a neighbour-cache entry. The kernel remembers stations long after they are
     /// gone, and counting a memory as an answer made empty networks reachable.
     pub responders: Vec<IpAddr>,
-    /// Unique addresses at least one probe actually left this machine for.
-    pub attempted: usize,
+    /// The addresses at least one probe actually left this machine for.
+    ///
+    /// A set, not a count. Counts cannot be merged truthfully: two passes that each probed
+    /// 127 addresses may have probed 254 distinct ones or the same 127 twice, and neither
+    /// summing nor taking the larger can tell those apart. The union can.
+    pub probed: BTreeSet<IpAddr>,
     /// Probes that never left: a socket that would not bind, a source address the vantage
     /// does not hold. Kept apart from silence, which is a fact about the network.
     pub not_sent: usize,
@@ -99,20 +104,31 @@ impl ReachabilityState {
 }
 
 impl NetworkReachability {
-    /// A completed sweep: what answered, what was actually probed, and what never left.
+    /// A completed sweep: what answered, which addresses were actually probed, and how
+    /// many probes never left.
+    ///
+    /// Responders are folded into the probed set: an address that answered was necessarily
+    /// asked, so a caller cannot report an answer from an address it did not probe.
     pub fn probed(
         responders: Vec<IpAddr>,
-        attempted: usize,
+        probed: impl IntoIterator<Item = IpAddr>,
         not_sent: usize,
         reasons: Vec<String>,
     ) -> Self {
+        let mut addresses: BTreeSet<IpAddr> = probed.into_iter().collect();
+        addresses.extend(responders.iter().copied());
         Self {
             responders,
-            attempted,
+            probed: addresses,
             not_sent,
             reasons,
             discovery: Vec::new(),
         }
+    }
+
+    /// How many distinct addresses were actually probed.
+    pub fn attempted(&self) -> usize {
+        self.probed.len()
     }
 
     /// Nothing was probed, and why.
@@ -138,7 +154,7 @@ impl NetworkReachability {
     pub fn state(&self) -> ReachabilityState {
         if !self.responders.is_empty() {
             ReachabilityState::Reachable
-        } else if self.attempted > 0 {
+        } else if !self.probed.is_empty() {
             ReachabilityState::ProbedUnreachable
         } else {
             ReachabilityState::NotEnumerated
@@ -151,17 +167,19 @@ impl NetworkReachability {
     /// so one responder among 254 attempts erased the 253 that answered nothing, and the
     /// coverage of the sweep -- most of what the result is worth -- went with it.
     ///
-    /// Coverage takes the widest pass rather than the sum. Several providers probe the same
-    /// network from this vantage -- an ARP sweep and a port sweep both cover the whole /24 --
-    /// and adding their counts claimed 508 addresses probed in a network holding 254.
-    /// Understating coverage is the safe error; overstating it is a false claim about how
-    /// thoroughly the network was examined.
+    /// Coverage is the union of the addresses each pass probed. Adding the counts claimed
+    /// 508 addresses probed in a network holding 254; taking the larger count reported 127
+    /// when two partially overlapping passes had between them covered 254. Only the
+    /// addresses themselves answer the question, so the addresses are what is kept.
+    ///
+    /// `not_sent` is a count of probes rather than of addresses, so it does add: two passes
+    /// that each failed to send is two probes that never left.
     pub fn merge(&mut self, other: NetworkReachability) {
         self.responders.extend(other.responders);
         self.responders.sort();
         self.responders.dedup();
-        self.attempted = self.attempted.max(other.attempted);
-        self.not_sent = self.not_sent.max(other.not_sent);
+        self.probed.extend(other.probed);
+        self.not_sent += other.not_sent;
         self.reasons.extend(other.reasons);
         self.reasons.dedup();
         self.discovery.extend(other.discovery);
@@ -179,11 +197,11 @@ impl NetworkReachability {
             ReachabilityState::Reachable => format!(
                 "reachable; {} of {} address(es) probed answered{detail}",
                 self.responders.len(),
-                self.attempted.max(self.responders.len())
+                self.attempted()
             ),
             ReachabilityState::ProbedUnreachable => format!(
                 "{} address(es) probed, none answered{detail}",
-                self.attempted
+                self.attempted()
             ),
             ReachabilityState::NotEnumerated => {
                 let unsent = if self.not_sent > 0 {
@@ -459,15 +477,17 @@ mod reachability_tests {
         // The defect this replaced: a rank-based merge kept only the strongest state, so a
         // single answer erased the 253 addresses that answered nothing. "1 of 254" and
         // "1 of 1" are different results, and only the coverage tells them apart.
+        let whole_subnet =
+            || (1..=254u8).map(|host| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, host)));
         let mut held = NetworkReachability::probed(
             Vec::new(),
-            254,
+            whole_subnet(),
             0,
             vec!["254 swept by the port sweep; silent".to_string()],
         );
         held.merge(NetworkReachability::probed(
             vec![ip("192.0.2.5")],
-            254,
+            whole_subnet(),
             0,
             vec!["254 asked by the ARP sweep; one answered".to_string()],
         ));
@@ -475,7 +495,8 @@ mod reachability_tests {
         assert_eq!(held.state(), ReachabilityState::Reachable);
         assert_eq!(held.responders, vec![ip("192.0.2.5")]);
         assert_eq!(
-            held.attempted, 254,
+            held.attempted(),
+            254,
             "the sweep's coverage survives, and two passes over the same /24 are not 508"
         );
         assert_eq!(held.reasons.len(), 2, "both accounts are kept");
@@ -489,7 +510,7 @@ mod reachability_tests {
         // network.
         let nothing_sent = NetworkReachability::probed(
             Vec::new(),
-            0,
+            Vec::new(),
             254,
             vec!["no usable source address on this vantage".to_string()],
         );
@@ -497,7 +518,8 @@ mod reachability_tests {
         assert!(nothing_sent.describe().contains("never left this machine"));
 
         // One probe that did leave makes the silence real, for that one address.
-        let one_sent = NetworkReachability::probed(Vec::new(), 1, 253, Vec::new());
+        let one_sent =
+            NetworkReachability::probed(Vec::new(), vec![ip("192.0.2.1")], 253, Vec::new());
         assert_eq!(one_sent.state(), ReachabilityState::ProbedUnreachable);
     }
 
@@ -505,9 +527,19 @@ mod reachability_tests {
     fn how_a_network_was_discovered_survives_a_failed_sweep() {
         // Probing establishes what answered. It never establishes what the network is, so
         // a silent sweep must not overwrite the provenance that put it on the map.
-        let mut held = NetworkReachability::probed(Vec::new(), 254, 0, Vec::new())
-            .discovered_by("advertised by 198.51.100.1");
-        held.merge(NetworkReachability::probed(Vec::new(), 0, 0, Vec::new()));
+        let mut held = NetworkReachability::probed(
+            Vec::new(),
+            (1..=254u8).map(|host| IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, host))),
+            0,
+            Vec::new(),
+        )
+        .discovered_by("advertised by 198.51.100.1");
+        held.merge(NetworkReachability::probed(
+            Vec::new(),
+            Vec::new(),
+            0,
+            Vec::new(),
+        ));
 
         assert_eq!(held.state(), ReachabilityState::ProbedUnreachable);
         assert_eq!(
@@ -518,22 +550,71 @@ mod reachability_tests {
 
     #[test]
     fn responders_accumulate_once_each() {
-        let mut held = NetworkReachability::probed(vec![ip("192.0.2.5")], 1, 0, Vec::new());
+        let mut held =
+            NetworkReachability::probed(vec![ip("192.0.2.5")], Vec::new(), 0, Vec::new());
         held.merge(NetworkReachability::probed(
             vec![ip("192.0.2.9"), ip("192.0.2.5")],
-            2,
+            Vec::new(),
             0,
             Vec::new(),
         ));
         assert_eq!(held.responders, vec![ip("192.0.2.5"), ip("192.0.2.9")]);
-        assert_eq!(held.attempted, 2, "the widest pass, not the sum");
+        assert_eq!(
+            held.attempted(),
+            2,
+            "an address that answered was necessarily probed"
+        );
+    }
+
+    #[test]
+    fn partially_overlapping_passes_union_their_coverage() {
+        // Counts cannot merge truthfully. Two passes that each probed 127 addresses may
+        // have covered 254 distinct ones or the same 127 twice; summing claims 254 for
+        // both, and taking the larger claims 127 for both. Only the addresses know.
+        let lower = || (1..=127u8).map(|host| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, host)));
+        let upper =
+            || (100..=226u8).map(|host| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, host)));
+
+        let mut held = NetworkReachability::probed(Vec::new(), lower(), 0, Vec::new());
+        held.merge(NetworkReachability::probed(
+            Vec::new(),
+            upper(),
+            0,
+            Vec::new(),
+        ));
+
+        // 1..=127 and 100..=226 overlap on 28 addresses: 127 + 127 - 28 = 226.
+        assert_eq!(
+            held.attempted(),
+            226,
+            "the union, not the sum and not the larger"
+        );
+
+        // The same pass twice adds nothing.
+        let mut twice = NetworkReachability::probed(Vec::new(), lower(), 0, Vec::new());
+        twice.merge(NetworkReachability::probed(
+            Vec::new(),
+            lower(),
+            0,
+            Vec::new(),
+        ));
+        assert_eq!(
+            twice.attempted(),
+            127,
+            "probing the same addresses twice is not 254"
+        );
     }
 
     #[test]
     fn silence_and_never_having_asked_read_differently() {
         // The whole reason this is state rather than prose: both produce an identical
         // absence of hosts, and only one is a statement about the network.
-        let silent = NetworkReachability::probed(Vec::new(), 254, 0, Vec::new());
+        let silent = NetworkReachability::probed(
+            Vec::new(),
+            (1..=254u8).map(|host| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, host))),
+            0,
+            Vec::new(),
+        );
         let unasked = NetworkReachability::not_enumerated("65534 addresses exceeds the budget");
         assert_ne!(silent.state(), unasked.state());
         assert!(silent.describe().contains("none answered"));
