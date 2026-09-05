@@ -44,6 +44,13 @@ pub struct HttpIdentity {
     /// Tracked apart from `redirect_target`, which the final response clears -- so a
     /// successfully followed redirect was being reported as though none had happened.
     pub redirect_chain: Vec<String>,
+    /// A fingerprint of the normalised body.
+    ///
+    /// Exists to recognise one representation served under many paths. A device that
+    /// answers 200 to every guess -- a catch-all handler, or a single-page shell that
+    /// renders client-side -- is not eight endpoints, and reporting it as eight successful
+    /// reads overstates what was found by a factor of eight.
+    pub body_fingerprint: Option<u64>,
     /// Links the document published, as written.
     ///
     /// Kept so a bounded audit can read what the device offers rather than guessing at
@@ -649,6 +656,9 @@ pub fn parse_http_identity(response: &str) -> Option<HttpIdentity> {
     }
 
     identity.title = extract_title(response);
+    identity.body_fingerprint = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| normalised_body_fingerprint(body));
     identity.links = response
         .split_once("\r\n\r\n")
         .map(|(_, body)| document_links(body))
@@ -660,6 +670,37 @@ pub fn parse_http_identity(response: &str) -> Option<HttpIdentity> {
         .map(|(_, body)| prefix_candidates(body))
         .unwrap_or_default();
     Some(identity)
+}
+
+/// A fingerprint of a body with its incidental variation removed.
+///
+/// Case and whitespace are normalised away, because a catch-all page reformatted between
+/// two requests is still the same page. Nothing else is stripped: a body that genuinely
+/// differs -- a status page carrying an address where another carries none -- must not
+/// collapse onto its neighbour, which is the failure that would matter.
+///
+/// FNV-1a, because this needs to be stable within a run and cheap, not cryptographic.
+pub fn normalised_body_fingerprint(body: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET;
+    let mut last_was_space = false;
+    for byte in body.bytes() {
+        let normalised = if byte.is_ascii_whitespace() {
+            if last_was_space {
+                continue;
+            }
+            last_was_space = true;
+            b' '
+        } else {
+            last_was_space = false;
+            byte.to_ascii_lowercase()
+        };
+        hash ^= u64::from(normalised);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// Every `href` and `src` value a document carries, in the order it wrote them.

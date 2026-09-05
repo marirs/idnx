@@ -61,7 +61,13 @@ const ACTION_WORDS: [&str; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathOutcome {
     /// Fetched, with the status the device returned.
-    Answered { status: u16, prefixes: usize },
+    Answered {
+        status: u16,
+        prefixes: usize,
+        /// The normalised body, so one representation served under many paths is
+        /// recognisable as one.
+        fingerprint: Option<u64>,
+    },
     /// Fetched and the device demanded credentials, which are never supplied.
     AuthenticationRequired { status: u16 },
     /// Asked and nothing came back.
@@ -73,9 +79,9 @@ pub enum PathOutcome {
 impl PathOutcome {
     pub fn label(&self) -> String {
         match self {
-            PathOutcome::Answered { status, prefixes } => {
-                format!("{status}, {prefixes} prefix candidate(s)")
-            }
+            PathOutcome::Answered {
+                status, prefixes, ..
+            } => format!("{status}, {prefixes} prefix candidate(s)"),
             PathOutcome::AuthenticationRequired { status } => {
                 format!("{status}, credentials demanded and not supplied")
             }
@@ -103,6 +109,40 @@ impl ManagementAudit {
             .iter()
             .filter(|(_, outcome)| matches!(outcome, PathOutcome::Answered { .. }))
             .count()
+    }
+
+    /// Paths that returned the same representation, most numerous first.
+    ///
+    /// Reported because eight paths answering 200 with one body is a catch-all handler or a
+    /// single-page shell, not eight endpoints, and calling it eight successful reads
+    /// overstates what was found. Grouped on status and body together: a 404 page and a
+    /// 200 page are different answers even if their bodies match.
+    pub fn identical_responses(&self) -> Vec<(u16, usize, usize)> {
+        let mut groups: Vec<(u16, u64, usize, usize)> = Vec::new();
+        for (_, outcome) in &self.attempted {
+            let PathOutcome::Answered {
+                status,
+                prefixes,
+                fingerprint: Some(fingerprint),
+            } = outcome
+            else {
+                continue;
+            };
+            match groups
+                .iter_mut()
+                .find(|(seen, hash, _, _)| seen == status && hash == fingerprint)
+            {
+                Some((_, _, count, _)) => *count += 1,
+                None => groups.push((*status, *fingerprint, 1, *prefixes)),
+            }
+        }
+        groups.retain(|(_, _, count, _)| *count > 1);
+        // Most numerous first: the largest group is the one that most overstates coverage.
+        groups.sort_by_key(|group| std::cmp::Reverse(group.2));
+        groups
+            .into_iter()
+            .map(|(status, _, count, prefixes)| (status, count, prefixes))
+            .collect()
     }
 
     /// Candidates the page labelled as its own addressing or as a route, which are the only
@@ -253,6 +293,7 @@ pub async fn audit(
                     PathOutcome::Answered {
                         status: response.status,
                         prefixes,
+                        fingerprint: response.body_fingerprint,
                     }
                 }
             }
@@ -437,6 +478,70 @@ mod tests {
     }
 
     #[test]
+    fn one_representation_under_many_paths_is_reported_as_one() {
+        // 192.168.70.1 answered 200 to all eight guesses with one body. That is a
+        // catch-all handler or a single-page shell, not eight endpoints, and calling it
+        // eight successful reads overstates what was found by a factor of eight.
+        let catch_all = ManagementAudit {
+            attempted: UNIVERSAL_PATHS
+                .iter()
+                .map(|path| {
+                    (
+                        path.to_string(),
+                        PathOutcome::Answered {
+                            status: 200,
+                            prefixes: 0,
+                            fingerprint: Some(0xdead_beef),
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let groups = catch_all.identical_responses();
+        assert_eq!(groups, vec![(200, 8, 0)]);
+        assert_eq!(catch_all.answered(), 8, "the reads did happen");
+
+        // Bodies that genuinely differ must not collapse: a status page carrying an
+        // address and one carrying none are two answers, and that is the failure that
+        // would matter.
+        let distinct = ManagementAudit {
+            attempted: vec![
+                (
+                    "/status".to_string(),
+                    PathOutcome::Answered {
+                        status: 200,
+                        prefixes: 1,
+                        fingerprint: Some(1),
+                    },
+                ),
+                (
+                    "/info".to_string(),
+                    PathOutcome::Answered {
+                        status: 200,
+                        prefixes: 0,
+                        fingerprint: Some(2),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        assert!(distinct.identical_responses().is_empty());
+
+        // Normalisation covers reformatting and case, and nothing else.
+        use crate::probes::http::normalised_body_fingerprint as fingerprint;
+        assert_eq!(
+            fingerprint("<html>\n  <body>Status</body>\n</html>"),
+            fingerprint("<HTML> <body>status</body> </html>")
+        );
+        assert_ne!(
+            fingerprint("<td>192.168.51.1</td>"),
+            fingerprint("<td>192.168.70.1</td>")
+        );
+    }
+
+    #[test]
     fn every_attempt_and_refusal_is_recorded() {
         let audit = ManagementAudit {
             attempted: vec![
@@ -445,6 +550,7 @@ mod tests {
                     PathOutcome::Answered {
                         status: 200,
                         prefixes: 2,
+                        fingerprint: Some(7),
                     },
                 ),
                 ("/info".to_string(), PathOutcome::NoResponse),

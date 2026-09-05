@@ -925,7 +925,28 @@ async fn confirm_protocols(
             )
             .await;
 
+            // One representation under many paths is one finding. Listing eight identical
+            // 200s as eight successful reads overstates what was found by a factor of
+            // eight: the eight guesses were never eight endpoints.
+            let repeated = audit.identical_responses();
+            for (status, count, prefixes) in &repeated {
+                coverage.protocols_confirmed.push(format!(
+                    "http/{port} audit: {count} paths returned the same catch-all \
+                     representation ({status}); {}",
+                    if *prefixes == 0 {
+                        "no prefix disclosed".to_string()
+                    } else {
+                        format!("{prefixes} prefix candidate(s) in it")
+                    }
+                ));
+            }
             for (path, outcome) in &audit.attempted {
+                // A path already accounted for by a catch-all group is not repeated.
+                if let crate::probes::management::PathOutcome::Answered { status, .. } = outcome
+                    && repeated.iter().any(|(grouped, _, _)| grouped == status)
+                {
+                    continue;
+                }
                 coverage
                     .protocols_confirmed
                     .push(format!("http/{port} audit {path}: {}", outcome.label()));
