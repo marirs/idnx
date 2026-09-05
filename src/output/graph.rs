@@ -203,6 +203,21 @@ pub fn export_interactive_topology_html(
     report: &DiscoveryReport,
     output_path: &Path,
 ) -> Result<(), String> {
+    let html = topology_html(report)?;
+    let mut file =
+        File::create(output_path).map_err(|e| format!("Cannot create {output_path:?}: {e}"))?;
+    file.write_all(html.as_bytes())
+        .map_err(|e| format!("Cannot write {output_path:?}: {e}"))?;
+
+    Ok(())
+}
+
+/// The page itself, as a string.
+///
+/// Separate from writing it so the page can be snapshotted: a function that only ever
+/// writes to a path cannot be compared against a golden without a temporary file, and the
+/// page is as much an output format as the JSON is.
+pub fn topology_html(report: &DiscoveryReport) -> Result<String, String> {
     let data = build_data(report);
     let json =
         serde_json::to_string(&data).map_err(|e| format!("Graph serialisation failed: {e}"))?;
@@ -230,12 +245,7 @@ pub fn export_interactive_topology_html(
         .replace("{{SUMMARY}}", &summary)
         .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
 
-    let mut file =
-        File::create(output_path).map_err(|e| format!("Cannot create {output_path:?}: {e}"))?;
-    file.write_all(html.as_bytes())
-        .map_err(|e| format!("Cannot write {output_path:?}: {e}"))?;
-
-    Ok(())
+    Ok(html)
 }
 
 /// The page. A small hand-written force simulation keeps this dependency-free, which

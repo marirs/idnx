@@ -1,0 +1,317 @@
+
+Vantage: test0 (wired) — scripted fixture
+    Active probes: unbound (ordinary routing)
+    Not visible from here: switched unicast between other hosts (without a mirror port)
+
+Networks
+  ├── 192.0.2.0/24
+  │     reachable; 1 of 254 address(es) probed answered (swept the attached network)
+  ├── 198.18.0.0/24
+  │     254 address(es) probed, none answered (254 address(es) swept; nothing answered)
+  ├── 198.51.100.0/24
+  │     reachable; 1 of 254 address(es) probed answered (swept the disclosed subnet)
+  ├── 203.0.113.0/24
+  │     reachable; 2 of 254 address(es) probed answered (swept the second subnet)
+
+VLANs carrying a known prefix
+  ├── VLAN 77 192.0.2.0/24 (from DHCP lease)
+
+VLANs
+  ├── VLAN 42 observed; prefix unknown
+
+Routers & gateways (2)
+  ├── 192.0.2.1 [192.0.2.1] 
+  │     currently live (SNMP) · role confirmed by 1 signal(s)
+  │     • is this machine's default gateway
+  │     └── routes to 198.51.100.0/24 [advertised]
+  ├── 198.51.100.1 [198.51.100.1] 
+  │     currently live (SNMP) · role confirmed by 2 signal(s)
+  │     • SNMP reports IP forwarding
+  │     • emits spanning-tree BPDUs
+  │     └── routes to 198.18.0.0/24 [advertised]
+  │     └── routes to 203.0.113.0/24 [advertised]
+
+Forwarding interfaces (routing confirmed, ownership unknown) (1)
+  ├── 203.0.113.254 [203.0.113.254] 
+  │     currently live (SNMP) · role confirmed by 1 signal(s)
+  │     • observed forwarding traffic on a path
+  │     downstream prefixes unresolved: no source disclosed a network behind this interface
+
+AI agents & runtimes (0) no protocol-confirmed AI runtime, agent or MCP server
+
+Hosts (1)
+  |-- 203.0.113.9              -                      
+
+Device inventory
+┌──────────────────────────────────────────┬───────────────┬──────┬───────────────┬──────────────┬──────────┬───────────────────────────────────────┐
+│ Role                                     ┆ Address       ┆ Name ┆ MAC / Vendor  ┆ Capabilities ┆ Services ┆ Evidence                              │
+╞══════════════════════════════════════════╪═══════════════╪══════╪═══════════════╪══════════════╪══════════╪═══════════════════════════════════════╡
+│ router                                   ┆ 192.0.2.1     ┆ -    ┆ 192.0.2.1     ┆ -            ┆ -        ┆ is this machine's default gateway     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ router                                   ┆ 198.51.100.1  ┆ -    ┆ 198.51.100.1  ┆ -            ┆ -        ┆ SNMP reports IP forwarding            │
+│                                          ┆               ┆      ┆               ┆              ┆          ┆ emits spanning-tree BPDUs             │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ host                                     ┆ 203.0.113.9   ┆ -    ┆ 203.0.113.9   ┆ -            ┆ -        ┆ -                                     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ forwarding interface (ownership unknown) ┆ 203.0.113.254 ┆ -    ┆ 203.0.113.254 ┆ -            ┆ -        ┆ observed forwarding traffic on a path │
+└──────────────────────────────────────────┴───────────────┴──────┴───────────────┴──────────────┴──────────┴───────────────────────────────────────┘
+
+Discovery coverage
+  local machine
+    scripted-seed      seeded from scripted local state
+  192.0.2.0/24
+    scripted-network   192.0.2.0/24 examined; 1 occupant fact(s)
+  198.51.100.0/24
+    scripted-network   198.51.100.0/24 examined; 3 occupant fact(s)
+  198.18.0.0/24
+    scripted-network   198.18.0.0/24 examined; 0 occupant fact(s)
+  203.0.113.0/24
+    scripted-network   203.0.113.0/24 examined; 3 occupant fact(s)
+  192.0.2.1
+    device-enrichment  1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    networks learned: 198.51.100.0/24
+  198.51.100.1
+    device-enrichment  2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    networks learned: 198.18.0.0/24, 203.0.113.0/24
+  203.0.113.254
+    device-enrichment  2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    no network established; interrogation incomplete (device-enrichment)
+
+Device coverage
+  4 device(s) interrogated in DURATIONms wall clock (DURATIONms if run one at a time), 215 probes
+  192.0.2.1 router; queued infrastructure first
+    discovered by      kernel route
+    interrogation      1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    adapter outcome    192.0.2.1 disclosed 2 fact(s)
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:11434
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:1234
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:139
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:161
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:21
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:22
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:23
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:25
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:443
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:445
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:53
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:554
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:80
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:8000
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:8080
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:8443
+    not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:9100
+    not attempted      192.0.2.1: stage 2 (45 ports) not run: liveness never confirmed and no stage 1 port answered
+  198.51.100.1 router; queued infrastructure first
+    discovered by      SNMP
+    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    adapter outcome    198.51.100.1 disclosed 4 fact(s)
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:11434
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:1234
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:139
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:161
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:21
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:22
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:23
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:25
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:443
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:445
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:53
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:554
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:80
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8000
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8080
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8443
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9100
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:10000
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:1080
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:110
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:143
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:1883
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:2000
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:2049
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3000
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3128
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:32400
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3306
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3389
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:389
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:4443
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:49152
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:49153
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5000
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5001
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5060
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:515
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5222
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5357
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5432
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:548
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:587
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5900
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:631
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:6379
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:7547
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8006
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8008
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8081
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:81
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8123
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8181
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8728
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:873
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:88
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8888
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9000
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:902
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9090
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9200
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:993
+    not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:995
+  203.0.113.9 host; queued normal
+    discovered by      SNMP
+    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    adapter outcome    203.0.113.9 answered nothing
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:11434
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:1234
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:139
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:161
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:21
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:22
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:23
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:25
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:443
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:445
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:53
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:554
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:80
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8000
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8080
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8443
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9100
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:10000
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:1080
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:110
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:143
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:1883
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:2000
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:2049
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3000
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3128
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:32400
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3306
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3389
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:389
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:4443
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:49152
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:49153
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5000
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5001
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5060
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:515
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5222
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5357
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5432
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:548
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:587
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5900
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:631
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:6379
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:7547
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8006
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8008
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8081
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:81
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8123
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8181
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8728
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:873
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:88
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8888
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9000
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:902
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9090
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9200
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:993
+    not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:995
+  203.0.113.254 forwarding interface (ownership unknown); queued infrastructure first
+    discovered by      SNMP
+    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    adapter outcome    203.0.113.254 forwarded traffic and disclosed nothing
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:11434
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:1234
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:139
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:161
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:21
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:22
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:23
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:25
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:443
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:445
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:53
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:554
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:80
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8000
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8080
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8443
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9100
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:10000
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:1080
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:110
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:143
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:1883
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:2000
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:2049
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3000
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3128
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:32400
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3306
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3389
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:389
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:4443
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:49152
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:49153
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5000
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5001
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5060
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:515
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5222
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5357
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5432
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:548
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:587
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5900
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:631
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:6379
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:7547
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8006
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8008
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8081
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:81
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8123
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8181
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8728
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:873
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:88
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8888
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9000
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:902
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9090
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9200
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:993
+    not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:995
+
+Topology summary
+  Devices:        4
+    Routers       2
+    Switches      0
+    Forwarding    1
+    AI systems    0
+    Other hosts   1
+  Networks:       4
+  VLANs:          2
+  Services:       0
+  Interfaces:     0
+  Graph nodes:    10 (devices plus networks, interfaces and services)
+  by grade:       4 observed · 6 advertised · 0 inferred
+  Facts:          7 observed · 21 advertised · 0 inferred
+  Relationships:  1 observed · 3 advertised · 0 inferred

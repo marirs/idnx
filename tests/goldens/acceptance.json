@@ -1,0 +1,846 @@
+{
+  "tool": "idNX",
+  "version": "0.3.1",
+  "generated_at": "GENERATED-AT",
+  "vantage": {
+    "interface": "test0",
+    "kind": "wired",
+    "blind_to": [
+      "switched unicast between other hosts (without a mirror port)"
+    ],
+    "unavailable": [],
+    "binding_mode": "unbound (ordinary routing)",
+    "observed_frames": null,
+    "accepted_facts": null
+  },
+  "networks": [
+    {
+      "cidr": "192.0.2.0/24",
+      "kind": "physical",
+      "interfaces": [],
+      "confidence": "observed",
+      "enumerated": true,
+      "identity_domain": {
+        "kind": "local"
+      },
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "locally_observed": true,
+      "reachability": {
+        "state": "reachable",
+        "responders": [
+          "192.0.2.1"
+        ],
+        "attempted": 254,
+        "not_sent": 0,
+        "reasons": [
+          "swept the attached network"
+        ],
+        "discovery": [
+          "attached to this vantage"
+        ],
+        "note": "reachable; 1 of 254 address(es) probed answered (swept the attached network)"
+      },
+      "evidence": [
+        {
+          "source": "kernel route",
+          "confidence": "observed",
+          "vantage": "test0",
+          "detail": null
+        },
+        {
+          "source": "DHCP lease",
+          "confidence": "observed",
+          "vantage": "test0",
+          "detail": "client-facing DHCP ACK, tagged, with option 1"
+        }
+      ]
+    },
+    {
+      "cidr": "198.18.0.0/24",
+      "kind": "physical",
+      "interfaces": [],
+      "confidence": "advertised",
+      "enumerated": true,
+      "identity_domain": {
+        "kind": "local"
+      },
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "locally_observed": true,
+      "reachability": {
+        "state": "probed_unreachable",
+        "responders": [],
+        "attempted": 254,
+        "not_sent": 0,
+        "reasons": [
+          "254 address(es) swept; nothing answered"
+        ],
+        "discovery": [
+          "advertised by 198.51.100.1"
+        ],
+        "note": "254 address(es) probed, none answered (254 address(es) swept; nothing answered)"
+      },
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "cidr": "198.51.100.0/24",
+      "kind": "physical",
+      "interfaces": [],
+      "confidence": "advertised",
+      "enumerated": true,
+      "identity_domain": {
+        "kind": "local"
+      },
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "locally_observed": true,
+      "reachability": {
+        "state": "reachable",
+        "responders": [
+          "198.51.100.1"
+        ],
+        "attempted": 254,
+        "not_sent": 0,
+        "reasons": [
+          "swept the disclosed subnet"
+        ],
+        "discovery": [
+          "routed by 192.0.2.1"
+        ],
+        "note": "reachable; 1 of 254 address(es) probed answered (swept the disclosed subnet)"
+      },
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "cidr": "203.0.113.0/24",
+      "kind": "physical",
+      "interfaces": [],
+      "confidence": "advertised",
+      "enumerated": true,
+      "identity_domain": {
+        "kind": "local"
+      },
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "locally_observed": true,
+      "reachability": {
+        "state": "reachable",
+        "responders": [
+          "203.0.113.9",
+          "203.0.113.254"
+        ],
+        "attempted": 254,
+        "not_sent": 0,
+        "reasons": [
+          "swept the second subnet"
+        ],
+        "discovery": [
+          "routed by 198.51.100.1"
+        ],
+        "note": "reachable; 2 of 254 address(es) probed answered (swept the second subnet)"
+      },
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    }
+  ],
+  "vlans": [
+    {
+      "id": 42,
+      "observed_in": {
+        "kind": "local"
+      },
+      "prefix": null,
+      "evidence": [],
+      "note": "observed on the wire; no prefix evidence"
+    },
+    {
+      "id": 77,
+      "observed_in": {
+        "kind": "local"
+      },
+      "prefix": "192.0.2.0/24",
+      "evidence": [
+        {
+          "source": "DHCP lease",
+          "confidence": "observed",
+          "vantage": "test0",
+          "detail": "client-facing DHCP ACK, tagged, with option 1"
+        }
+      ],
+      "note": "one observation stated both the tag and the prefix"
+    }
+  ],
+  "devices": [
+    {
+      "id": "192.0.2.1",
+      "kind": "router",
+      "category": "router",
+      "addresses": [
+        "192.0.2.1"
+      ],
+      "hostnames": [],
+      "vendor": null,
+      "descriptions": [],
+      "role_evidence": [
+        "is this machine's default gateway"
+      ],
+      "capabilities": [],
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "opaque_reason": null,
+      "confidence": "observed",
+      "evidence": [
+        {
+          "source": "kernel route",
+          "confidence": "observed",
+          "vantage": "test0",
+          "detail": null
+        },
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "id": "198.51.100.1",
+      "kind": "router",
+      "category": "router",
+      "addresses": [
+        "198.51.100.1"
+      ],
+      "hostnames": [],
+      "vendor": null,
+      "descriptions": [],
+      "role_evidence": [
+        "SNMP reports IP forwarding",
+        "emits spanning-tree BPDUs"
+      ],
+      "capabilities": [],
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "opaque_reason": null,
+      "confidence": "advertised",
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "id": "203.0.113.254",
+      "kind": "host",
+      "category": "forwarding interface (ownership unknown)",
+      "addresses": [
+        "203.0.113.254"
+      ],
+      "hostnames": [],
+      "vendor": null,
+      "descriptions": [],
+      "role_evidence": [
+        "observed forwarding traffic on a path"
+      ],
+      "capabilities": [],
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "opaque_reason": null,
+      "confidence": "advertised",
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "id": "203.0.113.9",
+      "kind": "host",
+      "category": "host",
+      "addresses": [
+        "203.0.113.9"
+      ],
+      "hostnames": [],
+      "vendor": null,
+      "descriptions": [],
+      "role_evidence": [],
+      "capabilities": [],
+      "observed_by": [
+        {
+          "kind": "local"
+        }
+      ],
+      "opaque_reason": null,
+      "confidence": "advertised",
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "from": "192.0.2.1",
+      "to": "198.51.100.0/24",
+      "relationship": "routes to",
+      "confidence": "advertised",
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "from": "198.51.100.1",
+      "to": "198.18.0.0/24",
+      "relationship": "routes to",
+      "confidence": "advertised",
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "from": "198.51.100.1",
+      "to": "203.0.113.0/24",
+      "relationship": "routes to",
+      "confidence": "advertised",
+      "evidence": [
+        {
+          "source": "SNMP",
+          "confidence": "advertised",
+          "vantage": "test0",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "from": "VLAN 77",
+      "to": "192.0.2.0/24",
+      "relationship": "carries",
+      "confidence": "observed",
+      "evidence": [
+        {
+          "source": "DHCP lease",
+          "confidence": "observed",
+          "vantage": "test0",
+          "detail": "client-facing DHCP ACK, tagged, with option 1"
+        }
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "scope": "local machine",
+      "providers": [
+        {
+          "provider": "scripted-seed",
+          "facts": 4,
+          "note": "seeded from scripted local state"
+        }
+      ],
+      "networks_learned": []
+    },
+    {
+      "scope": "192.0.2.0/24",
+      "providers": [
+        {
+          "provider": "scripted-network",
+          "facts": 1,
+          "note": "192.0.2.0/24 examined; 1 occupant fact(s)"
+        }
+      ],
+      "networks_learned": []
+    },
+    {
+      "scope": "198.51.100.0/24",
+      "providers": [
+        {
+          "provider": "scripted-network",
+          "facts": 3,
+          "note": "198.51.100.0/24 examined; 3 occupant fact(s)"
+        }
+      ],
+      "networks_learned": []
+    },
+    {
+      "scope": "198.18.0.0/24",
+      "providers": [
+        {
+          "provider": "scripted-network",
+          "facts": 0,
+          "note": "198.18.0.0/24 examined; 0 occupant fact(s)"
+        }
+      ],
+      "networks_learned": []
+    },
+    {
+      "scope": "203.0.113.0/24",
+      "providers": [
+        {
+          "provider": "scripted-network",
+          "facts": 3,
+          "note": "203.0.113.0/24 examined; 3 occupant fact(s)"
+        }
+      ],
+      "networks_learned": []
+    },
+    {
+      "scope": "192.0.2.1",
+      "providers": [
+        {
+          "provider": "device-enrichment",
+          "facts": 1,
+          "note": "1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms"
+        }
+      ],
+      "networks_learned": [
+        "198.51.100.0/24"
+      ]
+    },
+    {
+      "scope": "198.51.100.1",
+      "providers": [
+        {
+          "provider": "device-enrichment",
+          "facts": 1,
+          "note": "2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms"
+        }
+      ],
+      "networks_learned": [
+        "198.18.0.0/24",
+        "203.0.113.0/24"
+      ]
+    },
+    {
+      "scope": "203.0.113.254",
+      "providers": [
+        {
+          "provider": "device-enrichment",
+          "facts": 0,
+          "note": "2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms"
+        }
+      ],
+      "networks_learned": []
+    }
+  ],
+  "device_coverage": [
+    {
+      "device": "192.0.2.1",
+      "addresses": [
+        "192.0.2.1"
+      ],
+      "primary_address": "192.0.2.1",
+      "tier": "pivot",
+      "discovery_sources": [
+        "kernel route"
+      ],
+      "stages_run": 1,
+      "tcp_attempted": 17,
+      "tcp_responsive": [],
+      "udp_attempted": [
+        5351,
+        53,
+        520
+      ],
+      "protocols_confirmed": [
+        "scripted-network"
+      ],
+      "auth_required": [],
+      "vendor_adapters": [],
+      "adapter_outcomes": [
+        "192.0.2.1 disclosed 2 fact(s)"
+      ],
+      "not_sent": [
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:11434",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:1234",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:139",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:161",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:21",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:22",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:23",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:25",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:443",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:445",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:53",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:554",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:80",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:8000",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:8080",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:8443",
+        "192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:9100"
+      ],
+      "omissions": [
+        "192.0.2.1: stage 2 (45 ports) not run: liveness never confirmed and no stage 1 port answered"
+      ],
+      "skipped": null,
+      "silent": false,
+      "elapsed_ms": DURATION
+    },
+    {
+      "device": "198.51.100.1",
+      "addresses": [
+        "198.51.100.1"
+      ],
+      "primary_address": "198.51.100.1",
+      "tier": "pivot",
+      "discovery_sources": [
+        "SNMP"
+      ],
+      "stages_run": 2,
+      "tcp_attempted": 62,
+      "tcp_responsive": [],
+      "udp_attempted": [
+        5351,
+        53,
+        520
+      ],
+      "protocols_confirmed": [
+        "scripted-network"
+      ],
+      "auth_required": [],
+      "vendor_adapters": [],
+      "adapter_outcomes": [
+        "198.51.100.1 disclosed 4 fact(s)"
+      ],
+      "not_sent": [
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:11434",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:1234",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:139",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:161",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:21",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:22",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:23",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:25",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:443",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:445",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:53",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:554",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:80",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8000",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8080",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8443",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9100",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:10000",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:1080",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:110",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:143",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:1883",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:2000",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:2049",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3000",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3128",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:32400",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3306",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:3389",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:389",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:4443",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:49152",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:49153",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5000",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5001",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5060",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:515",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5222",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5357",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5432",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:548",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:587",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:5900",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:631",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:6379",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:7547",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8006",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8008",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8081",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:81",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8123",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8181",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8728",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:873",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:88",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:8888",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9000",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:902",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9090",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:9200",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:993",
+        "198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:995"
+      ],
+      "omissions": [],
+      "skipped": null,
+      "silent": false,
+      "elapsed_ms": DURATION
+    },
+    {
+      "device": "203.0.113.254",
+      "addresses": [
+        "203.0.113.254"
+      ],
+      "primary_address": "203.0.113.254",
+      "tier": "pivot",
+      "discovery_sources": [
+        "SNMP"
+      ],
+      "stages_run": 2,
+      "tcp_attempted": 62,
+      "tcp_responsive": [],
+      "udp_attempted": [
+        5351,
+        53,
+        520
+      ],
+      "protocols_confirmed": [],
+      "auth_required": [],
+      "vendor_adapters": [],
+      "adapter_outcomes": [
+        "203.0.113.254 forwarded traffic and disclosed nothing"
+      ],
+      "not_sent": [
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:11434",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:1234",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:139",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:161",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:21",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:22",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:23",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:25",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:443",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:445",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:53",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:554",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:80",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8000",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8080",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8443",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9100",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:10000",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:1080",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:110",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:143",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:1883",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:2000",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:2049",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3000",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3128",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:32400",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3306",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:3389",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:389",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:4443",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:49152",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:49153",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5000",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5001",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5060",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:515",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5222",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5357",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5432",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:548",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:587",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:5900",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:631",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:6379",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:7547",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8006",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8008",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8081",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:81",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8123",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8181",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8728",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:873",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:88",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:8888",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9000",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:902",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9090",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:9200",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:993",
+        "203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:995"
+      ],
+      "omissions": [],
+      "skipped": null,
+      "silent": false,
+      "elapsed_ms": DURATION
+    },
+    {
+      "device": "203.0.113.9",
+      "addresses": [
+        "203.0.113.9"
+      ],
+      "primary_address": "203.0.113.9",
+      "tier": "host",
+      "discovery_sources": [
+        "SNMP"
+      ],
+      "stages_run": 2,
+      "tcp_attempted": 62,
+      "tcp_responsive": [],
+      "udp_attempted": [
+        5351,
+        53,
+        520
+      ],
+      "protocols_confirmed": [],
+      "auth_required": [],
+      "vendor_adapters": [],
+      "adapter_outcomes": [
+        "203.0.113.9 answered nothing"
+      ],
+      "not_sent": [
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:11434",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:1234",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:139",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:161",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:21",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:22",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:23",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:25",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:443",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:445",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:53",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:554",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:80",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8000",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8080",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8443",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9100",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:10000",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:1080",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:110",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:143",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:1883",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:2000",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:2049",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3000",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3128",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:32400",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3306",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:3389",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:389",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:4443",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:49152",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:49153",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5000",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5001",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5060",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:515",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5222",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5357",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5432",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:548",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:587",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:5900",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:631",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:6379",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:7547",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8006",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8008",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8081",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:81",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8123",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8181",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8728",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:873",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:88",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:8888",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9000",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:902",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9090",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:9200",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:993",
+        "203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:995"
+      ],
+      "omissions": [],
+      "skipped": null,
+      "silent": false,
+      "elapsed_ms": DURATION
+    }
+  ],
+  "summary": {
+    "devices": 4,
+    "routers": 2,
+    "switches": 0,
+    "opaque_boundaries": 0,
+    "forwarding_interfaces": 1,
+    "ai_systems": 0,
+    "other_hosts": 1,
+    "networks": 4,
+    "vlans": 2,
+    "services": 0,
+    "interfaces": 0,
+    "nodes_by_kind": {
+      "host": 2,
+      "network": 4,
+      "router": 2,
+      "vlan": 2
+    },
+    "observed": 4,
+    "advertised": 6,
+    "inferred": 0,
+    "user_supplied": 0,
+    "total_nodes": 10,
+    "converged": true
+  }
+}

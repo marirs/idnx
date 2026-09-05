@@ -15,22 +15,41 @@ use crate::topology::graph::{DeviceCategory, NetworkRef};
 use crate::topology::graph::{NodeKind, Relationship};
 use crate::topology::{NodeId, TopologyGraph};
 
-/// Prints the complete topology view.
-pub fn render(report: &DiscoveryReport, start: &StartingScope) {
-    render_vantage(report, start);
-    render_networks(report);
-    let vantage = report.visibility.vantage.interface.as_str();
-    render_infrastructure(&report.graph, vantage);
-    render_hosts(&report.graph, vantage);
-    render_egress_path(&report.graph, vantage);
-    render_boundaries(&report.graph, vantage);
-    render_device_table(&report.graph, vantage);
-    render_coverage(report);
+/// Writes one line into the sink.
+///
+/// Rendering goes through a writer rather than straight to stdout so the whole terminal
+/// view can be captured verbatim and compared against a golden file. A `println!` is
+/// unobservable to a test in the same process, which left the view -- the output an
+/// operator actually reads -- as the one surface with no regression cover at all.
+macro_rules! emit {
+    ($out:expr) => {{ let _ = writeln!($out); }};
+    ($out:expr, $($arg:tt)*) => {{ let _ = writeln!($out, $($arg)*); }};
 }
 
-fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
+/// Prints the complete topology view.
+pub fn render(report: &DiscoveryReport, start: &StartingScope) {
+    let mut rendered = String::new();
+    render_to(&mut rendered, report, start);
+    print!("{rendered}");
+}
+
+/// The same view, into any sink.
+pub fn render_to(out: &mut dyn std::fmt::Write, report: &DiscoveryReport, start: &StartingScope) {
+    render_vantage(out, report, start);
+    render_networks(out, report);
+    let vantage = report.visibility.vantage.interface.as_str();
+    render_infrastructure(out, &report.graph, vantage);
+    render_hosts(out, &report.graph, vantage);
+    render_egress_path(out, &report.graph, vantage);
+    render_boundaries(out, &report.graph, vantage);
+    render_device_table(out, &report.graph, vantage);
+    render_coverage(out, report);
+}
+
+fn render_vantage(out: &mut dyn std::fmt::Write, report: &DiscoveryReport, start: &StartingScope) {
     let v = &report.visibility.vantage;
-    println!(
+    emit!(
+        out,
         "\n{} {} — {}",
         "Vantage:".bold(),
         v.label().cyan().bold(),
@@ -40,21 +59,23 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
     // Says which guarantee actually applies to active probes, rather than implying the
     // strongest one. Source binding constrains egress only as far as the routing table
     // agrees; the kernel pinning the interface is stronger and is not available everywhere.
-    println!(
+    emit!(
+        out,
         "    {} {}",
         "Active probes:".dimmed(),
         report.visibility.binding_mode.label().dimmed()
     );
 
     if !report.visibility.blind_to.is_empty() {
-        println!(
+        emit!(
+            out,
             "    {} {}",
             "Not visible from here:".dimmed(),
             report.visibility.blind_to.join(", ").dimmed()
         );
     }
     for note in &report.visibility.unavailable {
-        println!("    {} {}", "Unavailable:".dimmed(), note.dimmed());
+        emit!(out, "    {} {}", "Unavailable:".dimmed(), note.dimmed());
     }
 
     // An empty capture and an absent capture produce identical topology, so the two are
@@ -68,14 +89,20 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
             (f, 0) => format!("active; {f} frames observed, no topology evidence among them"),
             (f, a) => format!("active; {f} frames observed, {a} facts accepted"),
         };
-        println!("    {} {}", "Passive capture:".dimmed(), detail.dimmed());
+        emit!(
+            out,
+            "    {} {}",
+            "Passive capture:".dimmed(),
+            detail.dimmed()
+        );
     }
 
     // The routing control plane gets its own line. A link where no router speaks RIP and a
     // build where RIP was never decoded produce the same empty graph, and only the first is
     // a statement about the network.
     if let Some(routing) = &report.visibility.routing_updates {
-        println!(
+        emit!(
+            out,
             "    {} {}",
             "Passive RIPv2/RIPng:".dimmed(),
             routing.dimmed()
@@ -84,7 +111,8 @@ fn render_vantage(report: &DiscoveryReport, start: &StartingScope) {
     // OSPF and IS-IS get their own line: a link can carry an enterprise's whole prefix list
     // in IS-IS while no router on it speaks RIP at all.
     if let Some(control) = &report.visibility.control_plane {
-        println!(
+        emit!(
+            out,
             "    {} {}",
             "Passive OSPF/IS-IS:".dimmed(),
             control.dimmed()
@@ -114,7 +142,7 @@ fn network_origin(graph: &TopologyGraph, net: &NetworkRef) -> Option<String> {
     ))
 }
 
-fn render_networks(report: &DiscoveryReport) {
+fn render_networks(out: &mut dyn std::fmt::Write, report: &DiscoveryReport) {
     let graph = &report.graph;
     let mut physical: Vec<NetworkRef> = Vec::new();
     let mut virtual_nets: Vec<NetworkRef> = Vec::new();
@@ -131,7 +159,7 @@ fn render_networks(report: &DiscoveryReport) {
     virtual_nets.sort();
 
     if !physical.is_empty() {
-        println!("\n{}", "Networks".bold().green());
+        emit!(out, "\n{}", "Networks".bold().green());
         for net in &physical {
             let oversized = report.oversized_scopes.contains(&net.prefix);
             let note = if net.prefix.addr().is_ipv6() {
@@ -143,36 +171,43 @@ fn render_networks(report: &DiscoveryReport) {
             } else {
                 String::new()
             };
-            println!("  ├── {}{}", net.to_string().cyan().bold(), note.dimmed());
+            emit!(
+                out,
+                "  ├── {}{}",
+                net.to_string().cyan().bold(),
+                note.dimmed()
+            );
             for iface in graph.interfaces_for_network(net) {
-                println!("  │     via {}", iface.dimmed());
+                emit!(out, "  │     via {}", iface.dimmed());
             }
             // A network this machine cannot reach, reported by a peer that can, must not
             // be presented as though this vantage had seen it.
             if let Some(origin) = network_origin(graph, net) {
-                println!("  │     {}", origin.magenta());
+                emit!(out, "  │     {}", origin.magenta());
             }
             // Rendered from the run's reachability state, not from any provider's prose.
             // An advertised prefix nothing answered on stays listed and says so; silence
             // and never having asked are different lines because they are different
             // findings.
             if let Some(outcome) = report.network_reachability.get(net) {
-                println!("  │     {}", outcome.describe().dimmed());
+                emit!(out, "  │     {}", outcome.describe().dimmed());
             }
         }
     }
 
-    render_prefix_disclosure(report, &physical);
+    render_prefix_disclosure(out, report, &physical);
 
     // Virtualisation plumbing is shown separately and never as cascaded physical topology.
     if !virtual_nets.is_empty() {
-        println!(
+        emit!(
+            out,
             "\n{}",
             "Virtual & VPN networks (local to this machine)".bold()
         );
         for net in &virtual_nets {
             let ifaces = graph.interfaces_for_network(net).join(", ");
-            println!(
+            emit!(
+                out,
                 "  ├── {} {}",
                 net.to_string().yellow(),
                 format!("via {}", ifaces).dimmed()
@@ -185,7 +220,7 @@ fn render_networks(report: &DiscoveryReport) {
     // names a network.
     let bound = graph.vlan_networks();
     if !bound.is_empty() {
-        println!("\n{}", "VLANs carrying a known prefix".bold());
+        emit!(out, "\n{}", "VLANs carrying a known prefix".bold());
         for (vlan, prefix, provenance) in &bound {
             let domain = if vlan.realm.is_local() {
                 String::new()
@@ -201,7 +236,8 @@ fn render_networks(report: &DiscoveryReport) {
                 .into_iter()
                 .collect::<Vec<_>>()
                 .join(", ");
-            println!(
+            emit!(
+                out,
                 "  ├── VLAN {}{} {} {}",
                 vlan.to_string().cyan().bold(),
                 domain.magenta(),
@@ -213,7 +249,7 @@ fn render_networks(report: &DiscoveryReport) {
 
     let vlans: Vec<&crate::topology::graph::VlanRef> = graph.vlans_without_prefix().collect();
     if !vlans.is_empty() {
-        println!("\n{}", "VLANs".bold());
+        emit!(out, "\n{}", "VLANs".bold());
         for vlan in vlans {
             // A tag proves the VLAN exists and nothing more. Never a synthesised prefix.
             // The domain is shown for a remote one, because VLAN 20 here and VLAN 20 on a
@@ -223,7 +259,8 @@ fn render_networks(report: &DiscoveryReport) {
             } else {
                 format!(" [{}]", vlan.realm.label())
             };
-            println!(
+            emit!(
+                out,
                 "  ├── VLAN {}{} {}",
                 vlan.to_string().cyan().bold(),
                 domain.magenta(),
@@ -241,7 +278,11 @@ fn render_networks(report: &DiscoveryReport) {
 /// routing source, or another response carrying a prefix outright. When none of them
 /// disclosed anything, the honest report names what was asked rather than leaving an empty
 /// section that reads as "there is nothing there".
-fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
+fn render_prefix_disclosure(
+    out: &mut dyn std::fmt::Write,
+    report: &DiscoveryReport,
+    physical: &[NetworkRef],
+) {
     let attached: Vec<&NetworkRef> = physical
         .iter()
         .filter(|net| {
@@ -305,7 +346,8 @@ fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
         .graph
         .devices_in(DeviceCategory::ForwardingInterface)
         .len();
-    println!(
+    emit!(
+        out,
         "  {} {}",
         "IPv4 beyond this link:".dimmed(),
         format!(
@@ -324,7 +366,8 @@ fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
         .dimmed()
     );
     if boundaries > 0 {
-        println!(
+        emit!(
+            out,
             "  {} {}",
             "".dimmed(),
             format!(
@@ -336,7 +379,7 @@ fn render_prefix_disclosure(report: &DiscoveryReport, physical: &[NetworkRef]) {
     }
 }
 
-fn render_infrastructure(graph: &TopologyGraph, vantage: &str) {
+fn render_infrastructure(out: &mut dyn std::fmt::Write, graph: &TopologyGraph, vantage: &str) {
     use crate::topology::graph::DeviceCategory;
 
     // Sections are mutually exclusive, so their counts sum to the unique device total. A
@@ -358,20 +401,22 @@ fn render_infrastructure(graph: &TopologyGraph, vantage: &str) {
         if devices.is_empty() {
             continue;
         }
-        println!(
+        emit!(
+            out,
             "\n{} ({})",
             heading.bold().green(),
             devices.len().to_string().bold()
         );
         for node in devices {
-            print_device(graph, node, vantage);
+            print_device(out, graph, node, vantage);
         }
     }
 
     // Stated explicitly when absent, so "no AI found" is distinguishable from "AI was
     // never looked for".
     if graph.devices_in(DeviceCategory::AiSystem).is_empty() {
-        println!(
+        emit!(
+            out,
             "\n{} {}",
             "AI agents & runtimes (0)".bold(),
             "no protocol-confirmed AI runtime, agent or MCP server".dimmed()
@@ -379,9 +424,15 @@ fn render_infrastructure(graph: &TopologyGraph, vantage: &str) {
     }
 }
 
-fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &str) {
+fn print_device(
+    out: &mut dyn std::fmt::Write,
+    graph: &TopologyGraph,
+    node: &crate::topology::Node,
+    vantage: &str,
+) {
     let addrs = display_addresses(node, vantage);
-    println!(
+    emit!(
+        out,
         "  ├── {} {} {}",
         node.display_name().cyan().bold(),
         if addrs.is_empty() {
@@ -399,7 +450,8 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
     // Capabilities first: they say what the device does, which is more precise than the
     // single word its role collapses to.
     if !node.capabilities.is_empty() {
-        println!(
+        emit!(
+            out,
             "  │     {} {}",
             "Capabilities:".bold(),
             safe::all(node.capabilities.iter()).join(", ").green()
@@ -410,7 +462,8 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
     // A device rendered with no qualifier read as though its presence and its function had
     // both been established. Neither may be inferred from the other, and neither may be
     // inferred from the manufacturer or from where the scheduler put it in the queue.
-    println!(
+    emit!(
+        out,
         "  │     {} · {}",
         liveness_label(node),
         role_label(node).dimmed()
@@ -418,22 +471,24 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
     for address in &node.contested_addresses {
         // Two stations answered for this address and both answers validated. Naming one of
         // them as its holder would report a device identity that is half the truth.
-        println!(
+        emit!(
+            out,
             "  │     {} {}",
             "contested:".yellow(),
             format!("{address} is also answered for by another station").yellow()
         );
     }
     for (address, holder) in &node.superseded_addresses {
-        println!(
+        emit!(
+            out,
             "  │     {} {}",
             "reassigned:".dimmed(),
             format!("{address} now answers as {}", safe::text(holder)).dimmed()
         );
     }
-    render_peer_origin(node, "  │     ");
+    render_peer_origin(out, node, "  │     ");
     for signal in &node.role_signals {
-        println!("  │     • {}", safe::text(signal).dimmed());
+        emit!(out, "  │     • {}", safe::text(signal).dimmed());
     }
 
     // Networks this device serves, with the relationship that established it.
@@ -448,7 +503,8 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
         ) && let NodeId::Network(net, _) = &edge.to
         {
             serves += 1;
-            println!(
+            emit!(
+                out,
                 "  │     └── {} {} [{}]",
                 edge.relationship.label().dimmed(),
                 net.to_string().cyan(),
@@ -464,7 +520,8 @@ fn print_device(graph: &TopologyGraph, node: &crate::topology::Node, vantage: &s
     // a finished branch of the topology, which is the difference between "there is nothing
     // there" and "nothing told us what is there".
     if serves == 0 && crate::topology::graph::forwards_traffic(node) {
-        println!(
+        emit!(
+            out,
             "  │     {}",
             "downstream prefixes unresolved: no source disclosed a network behind this \
              interface"
@@ -556,7 +613,11 @@ fn display_addresses(node: &crate::topology::graph::Node, vantage: &str) -> Vec<
 /// Never blended into the surrounding output. A fact observed on this link and a fact a
 /// peer asserted about a network this machine cannot reach are different kinds of claim,
 /// and presenting them identically would make the second look verified by this vantage.
-fn render_peer_origin(node: &crate::topology::graph::Node, indent: &str) {
+fn render_peer_origin(
+    out: &mut dyn std::fmt::Write,
+    node: &crate::topology::graph::Node,
+    indent: &str,
+) {
     let origins = node.peer_origins();
     if origins.is_empty() {
         return;
@@ -566,13 +627,14 @@ fn render_peer_origin(node: &crate::topology::graph::Node, indent: &str) {
     } else {
         "also reported by"
     };
-    println!(
+    emit!(
+        out,
         "{indent}{}",
         format!("{label} {}", origins.join(", ")).magenta()
     );
 }
 
-fn render_hosts(graph: &TopologyGraph, vantage: &str) {
+fn render_hosts(out: &mut dyn std::fmt::Write, graph: &TopologyGraph, vantage: &str) {
     use crate::topology::graph::DeviceCategory;
 
     let all_hosts = graph.devices_in(DeviceCategory::Host);
@@ -584,7 +646,8 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
     // as "this machine's plumbing", which they are not: they are discovered devices on the
     // link, several of which answer TCP probes. The count and the list disagreeing was the
     // visible symptom.
-    println!(
+    emit!(
+        out,
         "\n{} ({})",
         "Hosts".bold().green(),
         all_hosts.len().to_string().bold()
@@ -603,16 +666,17 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
             .next()
             .map(|h| safe::text(h))
             .unwrap_or_else(|| "-".to_string());
-        println!(
+        emit!(
+            out,
             "  |-- {:<24} {:<22} {}",
             addrs.first().cloned().unwrap_or_default().cyan(),
             name.green(),
             node.vendor.as_deref().unwrap_or("").dimmed()
         );
         for extra in addrs.iter().skip(1) {
-            println!("  |     {}", extra.dimmed());
+            emit!(out, "  |     {}", extra.dimmed());
         }
-        render_peer_origin(node, "  |     ");
+        render_peer_origin(out, node, "  |     ");
         // A shared hostname across two MACs is usually one computer with two interfaces,
         // but a hostname is self-reported and reused, so it is offered as a possibility
         // rather than acted on by merging the devices.
@@ -622,7 +686,8 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
                 .iter()
                 .flat_map(|n| display_addresses(n, vantage))
                 .collect();
-            println!(
+            emit!(
+                out,
                 "  |     {}",
                 format!(
                     "possibly the same machine as {} (shared hostname; unconfirmed)",
@@ -632,7 +697,8 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
             );
         }
         if !node.capabilities.is_empty() {
-            println!(
+            emit!(
+                out,
                 "  |     {}",
                 safe::all(node.capabilities.iter()).join(", ").green()
             );
@@ -647,14 +713,15 @@ fn render_hosts(graph: &TopologyGraph, vantage: &str) {
 /// to a carrier, and hop count cannot tell them apart. Listing them among discovered
 /// infrastructure would imply they are part of the network being mapped, and that they
 /// expose something of it.
-fn render_egress_path(graph: &TopologyGraph, vantage: &str) {
+fn render_egress_path(out: &mut dyn std::fmt::Write, graph: &TopologyGraph, vantage: &str) {
     let hops = graph.egress_path();
     if hops.is_empty() {
         return;
     }
 
-    println!("\n{}", "Egress path".bold());
-    println!(
+    emit!(out, "\n{}", "Egress path".bold());
+    emit!(
+        out,
         "    {}",
         "routers that forwarded a probe out of this vantage; ownership unknown, and none \
          has disclosed a network"
@@ -668,7 +735,8 @@ fn render_egress_path(graph: &TopologyGraph, vantage: &str) {
         } else {
             services.join(", ")
         };
-        println!(
+        emit!(
+            out,
             "  ├── hop {} {} {}",
             distance,
             addresses.cyan().bold(),
@@ -677,25 +745,26 @@ fn render_egress_path(graph: &TopologyGraph, vantage: &str) {
     }
 }
 
-fn render_boundaries(graph: &TopologyGraph, vantage: &str) {
+fn render_boundaries(out: &mut dyn std::fmt::Write, graph: &TopologyGraph, vantage: &str) {
     let boundaries: Vec<_> = graph.nodes_of_kind(NodeKind::OpaqueBoundary).collect();
     if boundaries.is_empty() {
         return;
     }
 
-    println!("\n{}", "Opaque boundaries".bold().yellow());
+    emit!(out, "\n{}", "Opaque boundaries".bold().yellow());
     for node in boundaries {
         let addrs = display_addresses(node, vantage);
-        println!(
+        emit!(
+            out,
             "  ├── {} {}",
             node.display_name().cyan().bold(),
             format!("[{}]", addrs.join(", ")).yellow()
         );
         for signal in &node.role_signals {
-            println!("  │     • {}", safe::text(signal).dimmed());
+            emit!(out, "  │     • {}", safe::text(signal).dimmed());
         }
         if let Some(reason) = &node.opaque_reason {
-            println!("  │     └── {}", safe::text(reason).yellow());
+            emit!(out, "  │     └── {}", safe::text(reason).yellow());
         }
     }
 }
@@ -705,7 +774,7 @@ fn render_boundaries(graph: &TopologyGraph, vantage: &str) {
 /// The tree shows relationships; this shows the inventory. Services live on their own nodes
 /// in the graph, so they are gathered back onto their owning device here rather than being
 /// stored twice.
-fn render_device_table(graph: &TopologyGraph, vantage: &str) {
+fn render_device_table(out: &mut dyn std::fmt::Write, graph: &TopologyGraph, vantage: &str) {
     let mut devices: Vec<&crate::topology::Node> = graph
         .nodes()
         // No reachability filter. A device known only by a link-local address -- the IPv6
@@ -795,8 +864,8 @@ fn render_device_table(graph: &TopologyGraph, vantage: &str) {
         ]);
     }
 
-    println!("\n{}", "Device inventory".bold().green());
-    println!("{table}");
+    emit!(out, "\n{}", "Device inventory".bold().green());
+    emit!(out, "{table}");
 }
 
 /// Service descriptions belonging to a device, gathered from its addresses.
@@ -898,13 +967,14 @@ fn classified_as(
     crate::topology::graph::categorize(node).map(|category| category.label().to_string())
 }
 
-fn render_device_coverage(report: &DiscoveryReport) {
+fn render_device_coverage(out: &mut dyn std::fmt::Write, report: &DiscoveryReport) {
     if report.coverage.is_empty() {
         return;
     }
 
-    println!("\n{}", "Device coverage".bold());
-    println!(
+    emit!(out, "\n{}", "Device coverage".bold());
+    emit!(
+        out,
         "  {} device(s) interrogated in {}ms wall clock ({}ms if run one at a time), {} probes",
         report.coverage.len(),
         report.enrichment_elapsed.as_millis(),
@@ -921,7 +991,8 @@ fn render_device_coverage(report: &DiscoveryReport) {
     });
 
     for record in records {
-        println!(
+        emit!(
+            out,
             "  {} {}",
             record
                 .primary_endpoint()
@@ -938,22 +1009,30 @@ fn render_device_coverage(report: &DiscoveryReport) {
             .dimmed()
         );
         if record.addresses.len() > 1 {
-            println!(
+            emit!(
+                out,
                 "    {:<18} {}",
                 "addresses",
                 record.addresses.join(", ").dimmed()
             );
         }
         if !record.discovery_sources.is_empty() {
-            println!(
+            emit!(
+                out,
                 "    {:<18} {}",
                 "discovered by",
                 record.discovery_sources.join(", ").dimmed()
             );
         }
-        println!("    {:<18} {}", "interrogation", record.summary().dimmed());
+        emit!(
+            out,
+            "    {:<18} {}",
+            "interrogation",
+            record.summary().dimmed()
+        );
         if !record.vendor_adapters.is_empty() {
-            println!(
+            emit!(
+                out,
                 "    {:<18} {}",
                 "vendor adapters",
                 record.vendor_adapters.join(", ").dimmed()
@@ -968,21 +1047,22 @@ fn render_device_coverage(report: &DiscoveryReport) {
             } else {
                 outcome.dimmed()
             };
-            println!("    {:<18} {}", "adapter outcome", rendered);
+            emit!(out, "    {:<18} {}", "adapter outcome", rendered);
         }
         for failure in record.local_failures() {
             // A probe that never left this machine is a local fault, not remote silence.
-            println!("    {:<18} {}", "not sent", failure.red());
+            emit!(out, "    {:<18} {}", "not sent", failure.red());
         }
         for omission in record.omissions() {
             // Stated rather than glossed: a pass that left work out must not read as
             // complete exploration.
-            println!("    {:<18} {}", "not attempted", omission.dimmed());
+            emit!(out, "    {:<18} {}", "not attempted", omission.dimmed());
         }
         if record.silent() {
             // A device that was asked and stayed silent is a finding about the device;
             // one that was never asked is a gap in coverage. They must not read alike.
-            println!(
+            emit!(
+                out,
                 "    {:<18} {}",
                 "outcome",
                 "asked, no response on any probed port".dimmed()
@@ -1042,8 +1122,8 @@ fn unfinished_work(
     (!unfinished.is_empty()).then(|| unfinished.join("; "))
 }
 
-fn render_coverage(report: &DiscoveryReport) {
-    println!("\n{}", "Discovery coverage".bold());
+fn render_coverage(out: &mut dyn std::fmt::Write, report: &DiscoveryReport) {
+    emit!(out, "\n{}", "Discovery coverage".bold());
 
     // Per-scope provider outcomes. Reported before pivots so it is clear which sources
     // examined each network, including the ones that returned nothing.
@@ -1052,26 +1132,26 @@ fn render_coverage(report: &DiscoveryReport) {
             Some(net) => net.to_string(),
             None => "local machine".to_string(),
         };
-        println!("  {}", label.cyan().bold());
+        emit!(out, "  {}", label.cyan().bold());
         for run in &scope.runs {
             let outcome = match &run.note {
                 Some(note) => note.clone(),
                 None => format!("{} facts", run.evidence_count),
             };
-            println!("    {:<18} {}", run.provider, outcome.dimmed());
+            emit!(out, "    {:<18} {}", run.provider, outcome.dimmed());
         }
     }
 
     // Every pivot is accounted for, including the ones that disclosed nothing. Silent
     // failure is what made an incomplete map look finished.
     for pivot in &report.pivot_runs {
-        println!("  {}", pivot.address.to_string().cyan().bold());
+        emit!(out, "  {}", pivot.address.to_string().cyan().bold());
         for run in &pivot.runs {
             let outcome = match &run.note {
                 Some(note) => note.clone(),
                 None => format!("{} facts", run.evidence_count),
             };
-            println!("    {:<18} {}", run.provider, outcome.dimmed());
+            emit!(out, "    {:<18} {}", run.provider, outcome.dimmed());
         }
         if pivot.networks_learned.is_empty() {
             // "None" is a conclusion, and it can only be drawn once everything applicable
@@ -1079,8 +1159,9 @@ fn render_coverage(report: &DiscoveryReport) {
             // honest statement is that the interrogation is incomplete -- otherwise an
             // operator reads a gap in our coverage as a fact about their network.
             match incomplete_for_pivot(pivot, report) {
-                None => println!("    {}", "networks disclosed: none".dimmed()),
-                Some(unfinished) => println!(
+                None => emit!(out, "    {}", "networks disclosed: none".dimmed()),
+                Some(unfinished) => emit!(
+                    out,
                     "    {} {}",
                     "no network established; interrogation incomplete".yellow(),
                     format!("({unfinished})").dimmed()
@@ -1092,11 +1173,11 @@ fn render_coverage(report: &DiscoveryReport) {
                 .iter()
                 .map(|n| n.to_string())
                 .collect();
-            println!("    networks learned: {}", list.join(", ").green());
+            emit!(out, "    networks learned: {}", list.join(", ").green());
         }
     }
 
-    render_device_coverage(report);
+    render_device_coverage(out, report);
 
     // Three separate tallies. A node carries only its strongest supporting grade, so
     // counting nodes alone reported "0 advertised" on a run that was displaying advertised
@@ -1109,51 +1190,61 @@ fn render_coverage(report: &DiscoveryReport) {
     // total is reported alongside so the difference is explained rather than looking wrong.
     let counts = report.graph.counts();
 
-    println!("\n{}", "Topology summary".bold());
-    println!(
+    emit!(out, "\n{}", "Topology summary".bold());
+    emit!(
+        out,
         "  {:<16}{}",
         "Devices:".bold(),
         counts.devices().to_string().bold()
     );
-    println!("    {:<14}{}", "Routers", counts.routers);
-    println!("    {:<14}{}", "Switches", counts.switches);
+    emit!(out, "    {:<14}{}", "Routers", counts.routers);
+    emit!(out, "    {:<14}{}", "Switches", counts.switches);
     if counts.opaque_boundaries > 0 {
-        println!("    {:<14}{}", "Boundaries", counts.opaque_boundaries);
+        emit!(out, "    {:<14}{}", "Boundaries", counts.opaque_boundaries);
     }
     if counts.forwarding_interfaces > 0 {
         // Named for the behaviour that was confirmed, not for an owner nobody established.
-        println!("    {:<14}{}", "Forwarding", counts.forwarding_interfaces);
+        emit!(
+            out,
+            "    {:<14}{}",
+            "Forwarding",
+            counts.forwarding_interfaces
+        );
     }
-    println!("    {:<14}{}", "AI systems", counts.ai_systems);
-    println!("    {:<14}{}", "Other hosts", counts.other_hosts);
-    println!("  {:<16}{}", "Networks:".bold(), counts.networks);
+    emit!(out, "    {:<14}{}", "AI systems", counts.ai_systems);
+    emit!(out, "    {:<14}{}", "Other hosts", counts.other_hosts);
+    emit!(out, "  {:<16}{}", "Networks:".bold(), counts.networks);
     if counts.vlans > 0 {
-        println!("  {:<16}{}", "VLANs:".bold(), counts.vlans);
+        emit!(out, "  {:<16}{}", "VLANs:".bold(), counts.vlans);
     }
-    println!("  {:<16}{}", "Services:".bold(), counts.services);
-    println!("  {:<16}{}", "Interfaces:".bold(), counts.interfaces);
-    println!(
+    emit!(out, "  {:<16}{}", "Services:".bold(), counts.services);
+    emit!(out, "  {:<16}{}", "Interfaces:".bold(), counts.interfaces);
+    emit!(
+        out,
         "  {:<16}{} {}",
         "Graph nodes:".bold(),
         counts.graph_nodes,
         "(devices plus networks, interfaces and services)".dimmed()
     );
 
-    println!(
+    emit!(
+        out,
         "  {:<16}{} observed · {} advertised · {} inferred",
         "by grade:".dimmed(),
         nodes.observed.to_string().green().bold(),
         nodes.advertised.to_string().cyan().bold(),
         nodes.inferred.to_string().yellow().bold(),
     );
-    println!(
+    emit!(
+        out,
         "  {:<16}{} observed · {} advertised · {} inferred",
         "Facts:".bold(),
         facts.observed.to_string().green().bold(),
         facts.advertised.to_string().cyan().bold(),
         facts.inferred.to_string().yellow().bold(),
     );
-    println!(
+    emit!(
+        out,
         "  {:<16}{} observed · {} advertised · {} inferred",
         "Relationships:".bold(),
         edges.observed.to_string().green().bold(),
@@ -1161,7 +1252,7 @@ fn render_coverage(report: &DiscoveryReport) {
         edges.inferred.to_string().yellow().bold(),
     );
     if !report.converged {
-        println!("  {}", "(stopped at the safety budget)".dimmed());
+        emit!(out, "  {}", "(stopped at the safety budget)".dimmed());
     }
 }
 

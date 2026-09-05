@@ -1,0 +1,54 @@
+idNX 0.3.1 - topology from test0 (wired)
+Generated: GENERATED-AT
+
+Not visible from this vantage: switched unicast between other hosts (without a mirror port)
+
+NETWORKS
+  192.0.2.0/24             physical   observed     
+      reachable; 1 of 254 address(es) probed answered (swept the attached network)
+  198.18.0.0/24            physical   advertised   
+      254 address(es) probed, none answered (254 address(es) swept; nothing answered)
+  198.51.100.0/24          physical   advertised   
+      reachable; 1 of 254 address(es) probed answered (swept the disclosed subnet)
+  203.0.113.0/24           physical   advertised   
+      reachable; 2 of 254 address(es) probed answered (swept the second subnet)
+
+VLANS
+  VLAN 42     -                    observed on the wire; no prefix evidence
+  VLAN 77     192.0.2.0/24         one observation stated both the tag and the prefix
+
+DEVICES
+  router             observed     192.0.2.1                    192.0.2.1
+      role: is this machine's default gateway
+  router             advertised   198.51.100.1                 198.51.100.1
+      role: SNMP reports IP forwarding
+      role: emits spanning-tree BPDUs
+  host               advertised   203.0.113.254                203.0.113.254
+      role: observed forwarding traffic on a path
+  host               advertised   203.0.113.9                  203.0.113.9
+
+RELATIONSHIPS
+  192.0.2.1 --routes to--> 198.51.100.0/24  [advertised]
+  198.51.100.1 --routes to--> 198.18.0.0/24  [advertised]
+  198.51.100.1 --routes to--> 203.0.113.0/24  [advertised]
+  VLAN 77 --carries--> 192.0.2.0/24  [observed]
+
+COVERAGE
+  local machine
+    scripted-seed        seeded from scripted local state
+  192.0.2.0/24
+    scripted-network     192.0.2.0/24 examined; 1 occupant fact(s)
+  198.51.100.0/24
+    scripted-network     198.51.100.0/24 examined; 3 occupant fact(s)
+  198.18.0.0/24
+    scripted-network     198.18.0.0/24 examined; 0 occupant fact(s)
+  203.0.113.0/24
+    scripted-network     203.0.113.0/24 examined; 3 occupant fact(s)
+  192.0.2.1
+    device-enrichment    1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+  198.51.100.1
+    device-enrichment    2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+  203.0.113.254
+    device-enrichment    2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+
+4 observed, 6 advertised, 0 inferred, 10 nodes

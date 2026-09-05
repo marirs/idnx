@@ -1,0 +1,5 @@
+Kind,Name,Addresses,Hostnames,Vendor,Confidence,Capabilities,Role Evidence,Evidence Sources,Observed By,Opaque Reason
+router,192.0.2.1,192.0.2.1,,,observed,,is this machine's default gateway,kernel route; SNMP,local,
+router,198.51.100.1,198.51.100.1,,,advertised,,SNMP reports IP forwarding; emits spanning-tree BPDUs,SNMP,local,
+host,203.0.113.254,203.0.113.254,,,advertised,,observed forwarding traffic on a path,SNMP,local,
+host,203.0.113.9,203.0.113.9,,,advertised,,,SNMP,local,

@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>idNX topology</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background:#0f172a; color:#e2e8f0; }
+  header { padding:14px 20px; border-bottom:1px solid #1e293b; display:flex; gap:18px;
+           align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; font-weight:600; }
+  .meta { color:#94a3b8; font-size:12px; }
+  main { display:flex; height:calc(100vh - 58px); }
+  canvas { flex:1; display:block; cursor:grab; }
+  aside { width:330px; border-left:1px solid #1e293b; padding:16px; overflow-y:auto; }
+  aside h2 { font-size:13px; margin:0 0 8px; text-transform:uppercase; letter-spacing:.06em;
+             color:#94a3b8; }
+  .legend span { display:inline-flex; align-items:center; gap:6px; margin:0 10px 6px 0;
+                 font-size:12px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  .row { margin:2px 0; font-size:12px; color:#cbd5e1; word-break:break-word; }
+  .warn { color:#fbbf24; font-size:12px; margin:3px 0; }
+  .empty { color:#64748b; font-style:italic; }
+  code { background:#1e293b; padding:1px 5px; border-radius:4px; font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>idNX topology</h1>
+  <span class="meta">v0.3.1</span>
+  <span class="meta">4 observed &middot; 6 advertised &middot; 0 inferred</span>
+</header>
+<main>
+  <canvas id="c"></canvas>
+  <aside>
+    <h2>Vantage</h2>
+    <div class="row" id="vantage"></div>
+    <div id="limits"></div>
+    <h2 style="margin-top:18px">Legend</h2>
+    <div class="legend" id="legend"></div>
+    <h2 style="margin-top:18px">Selection</h2>
+    <div id="sel"><div class="empty">Click a node.</div></div>
+  </aside>
+</main>
+<script>
+const DATA = {"nodes":[{"id":"net:192.0.2.0/24","label":"192.0.2.0/24","kind":"network","confidence":"observed","detail":[],"evidence":["DHCP lease (observed)","kernel route (observed)"],"color":"#22c55e","radius":20.0},{"id":"net:198.18.0.0/24","label":"198.18.0.0/24","kind":"network","confidence":"advertised","detail":[],"evidence":["SNMP (advertised)"],"color":"#22c55e","radius":20.0},{"id":"net:198.51.100.0/24","label":"198.51.100.0/24","kind":"network","confidence":"advertised","detail":[],"evidence":["SNMP (advertised)"],"color":"#22c55e","radius":20.0},{"id":"net:203.0.113.0/24","label":"203.0.113.0/24","kind":"network","confidence":"advertised","detail":[],"evidence":["SNMP (advertised)"],"color":"#22c55e","radius":20.0},{"id":"vlan:42","label":"VLAN 42","kind":"vlan","confidence":"observed","detail":[],"evidence":["kernel route (observed)"],"color":"#eab308","radius":16.0},{"id":"vlan:77","label":"VLAN 77","kind":"vlan","confidence":"observed","detail":[],"evidence":["DHCP lease (observed)"],"color":"#eab308","radius":16.0},{"id":"dev:192.0.2.1","label":"192.0.2.1","kind":"router","confidence":"observed","detail":["192.0.2.1","role: is this machine's default gateway"],"evidence":["SNMP (advertised)","kernel route (observed)"],"color":"#38bdf8","radius":24.0},{"id":"dev:198.51.100.1","label":"198.51.100.1","kind":"router","confidence":"advertised","detail":["198.51.100.1","role: SNMP reports IP forwarding","role: emits spanning-tree BPDUs"],"evidence":["SNMP (advertised)"],"color":"#38bdf8","radius":24.0},{"id":"dev:203.0.113.9","label":"203.0.113.9","kind":"host","confidence":"advertised","detail":["203.0.113.9"],"evidence":["SNMP (advertised)"],"color":"#e2e8f0","radius":12.0},{"id":"dev:203.0.113.254","label":"203.0.113.254","kind":"host","confidence":"advertised","detail":["203.0.113.254","role: observed forwarding traffic on a path"],"evidence":["SNMP (advertised)"],"color":"#e2e8f0","radius":12.0}],"links":[{"source":"vlan:77","target":"net:192.0.2.0/24","label":"carries","confidence":"observed"},{"source":"dev:192.0.2.1","target":"net:198.51.100.0/24","label":"routes to","confidence":"advertised"},{"source":"dev:198.51.100.1","target":"net:198.18.0.0/24","label":"routes to","confidence":"advertised"},{"source":"dev:198.51.100.1","target":"net:203.0.113.0/24","label":"routes to","confidence":"advertised"}],"vantage":"test0 (wired)","blind_to":["switched unicast between other hosts (without a mirror port)"],"unavailable":[]};
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+document.getElementById('vantage').textContent = DATA.vantage;
+const limits = document.getElementById('limits');
+for (const b of DATA.blind_to) {
+  const d = document.createElement('div');
+  d.className = 'warn'; d.textContent = 'Not visible: ' + b; limits.appendChild(d);
+}
+for (const u of DATA.unavailable) {
+  const d = document.createElement('div');
+  d.className = 'warn'; d.textContent = u; limits.appendChild(d);
+}
+
+const kinds = {};
+for (const n of DATA.nodes) kinds[n.kind] = n.color;
+const legend = document.getElementById('legend');
+for (const [kind, color] of Object.entries(kinds)) {
+  // The colour is ours, but the kind is a graph value; built rather than concatenated.
+  const s = document.createElement('span');
+  const dot = document.createElement('i');
+  dot.className = 'dot';
+  dot.style.background = color;
+  s.appendChild(dot);
+  s.appendChild(document.createTextNode(kind));
+  legend.appendChild(s);
+}
+
+let W = 0, H = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', () => { resize(); });
+
+// Seed positions deterministically so the same topology lays out the same way twice.
+let seed = 42;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+
+const nodes = DATA.nodes.map(n => ({...n, x: 0, y: 0, vx: 0, vy: 0}));
+const index = new Map(nodes.map((n, i) => [n.id, i]));
+const links = DATA.links
+  .map(l => ({...l, s: index.get(l.source), t: index.get(l.target)}))
+  .filter(l => l.s !== undefined && l.t !== undefined);
+
+resize();
+for (const n of nodes) { n.x = W / 2 + (rnd() - 0.5) * W * 0.7; n.y = H / 2 + (rnd() - 0.5) * H * 0.7; }
+
+let view = {x: 0, y: 0, k: 1};
+let selected = null, dragging = null, panning = false, last = null;
+
+function step() {
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let d2 = dx*dx + dy*dy || 0.01;
+      if (d2 > 90000) continue;
+      const f = 2400 / d2;
+      const d = Math.sqrt(d2);
+      const ux = dx/d, uy = dy/d;
+      a.vx -= ux*f; a.vy -= uy*f; b.vx += ux*f; b.vy += uy*f;
+    }
+  }
+  for (const l of links) {
+    const a = nodes[l.s], b = nodes[l.t];
+    const dx = b.x-a.x, dy = b.y-a.y;
+    const d = Math.sqrt(dx*dx+dy*dy) || 0.01;
+    const f = (d - 130) * 0.012;
+    const ux = dx/d, uy = dy/d;
+    a.vx += ux*f; a.vy += uy*f; b.vx -= ux*f; b.vy -= uy*f;
+  }
+  for (const n of nodes) {
+    n.vx += (W/2 - n.x) * 0.0012;
+    n.vy += (H/2 - n.y) * 0.0012;
+    n.vx *= 0.86; n.vy *= 0.86;
+    if (n !== dragging) { n.x += n.vx; n.y += n.vy; }
+  }
+}
+
+function draw() {
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
+
+  ctx.lineWidth = 1;
+  for (const l of links) {
+    const a = nodes[l.s], b = nodes[l.t];
+    ctx.strokeStyle = l.confidence === 'observed' ? '#334155' : '#1e293b';
+    ctx.setLineDash(l.confidence === 'advertised' || l.confidence === 'inferred' ? [4, 4] : []);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  for (const n of nodes) {
+    ctx.beginPath(); ctx.arc(n.x, n.y, n.radius, 0, Math.PI*2);
+    ctx.fillStyle = n.color; ctx.fill();
+    if (n === selected) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5; ctx.stroke(); }
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '11px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(n.label, n.x, n.y + n.radius + 13);
+  }
+  ctx.restore();
+}
+
+function loop() { step(); draw(); requestAnimationFrame(loop); }
+loop();
+
+function at(ev) {
+  const r = canvas.getBoundingClientRect();
+  const x = (ev.clientX - r.left - view.x) / view.k;
+  const y = (ev.clientY - r.top - view.y) / view.k;
+  return nodes.find(n => (n.x-x)**2 + (n.y-y)**2 <= (n.radius+5)**2) || null;
+}
+
+canvas.addEventListener('mousedown', ev => {
+  const n = at(ev);
+  if (n) { dragging = n; selected = n; show(n); }
+  else { panning = true; }
+  last = {x: ev.clientX, y: ev.clientY};
+});
+window.addEventListener('mousemove', ev => {
+  if (dragging) {
+    const r = canvas.getBoundingClientRect();
+    dragging.x = (ev.clientX - r.left - view.x) / view.k;
+    dragging.y = (ev.clientY - r.top - view.y) / view.k;
+  } else if (panning && last) {
+    view.x += ev.clientX - last.x; view.y += ev.clientY - last.y;
+    last = {x: ev.clientX, y: ev.clientY};
+  }
+});
+window.addEventListener('mouseup', () => { dragging = null; panning = false; last = null; });
+canvas.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const f = ev.deltaY < 0 ? 1.1 : 0.9;
+  view.k = Math.max(0.15, Math.min(4, view.k * f));
+}, {passive: false});
+
+// Every value below is chosen by the device it describes, or by a federated peer.
+// Built as elements with textContent rather than concatenated into innerHTML: a device
+// named '<img src=x onerror=...>' would otherwise execute the moment its node is clicked.
+// Escaping the JSON stops it terminating the script block; it does nothing about this.
+function row(text, className) {
+  const d = document.createElement('div');
+  d.className = className || 'row';
+  d.textContent = text;
+  return d;
+}
+
+function labelled(label, value) {
+  const d = document.createElement('div');
+  d.className = 'row';
+  d.appendChild(document.createTextNode(label));
+  const code = document.createElement('code');
+  code.textContent = value;
+  d.appendChild(code);
+  return d;
+}
+
+function show(n) {
+  const el = document.getElementById('sel');
+  el.replaceChildren();
+
+  const title = document.createElement('div');
+  title.className = 'row';
+  const strong = document.createElement('strong');
+  strong.textContent = n.label;
+  title.appendChild(strong);
+  el.appendChild(title);
+
+  el.appendChild(labelled('kind: ', n.kind));
+  el.appendChild(labelled('confidence: ', n.confidence));
+  for (const d of n.detail) el.appendChild(row(d));
+
+  if (n.evidence.length) {
+    const heading = document.createElement('h2');
+    heading.style.marginTop = '14px';
+    heading.textContent = 'Evidence';
+    el.appendChild(heading);
+    for (const e of n.evidence) el.appendChild(row(e));
+  }
+}
+</script>
+</body>
+</html>
