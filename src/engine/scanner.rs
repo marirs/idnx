@@ -85,6 +85,8 @@ pub struct ScanSummary {
     pub addresses_probed: usize,
     pub probes_sent: usize,
     pub probes_not_sent: usize,
+    /// Why probes could not be sent, deduplicated. Empty when everything went out.
+    pub not_sent_reasons: Vec<String>,
     pub elapsed: Duration,
 }
 
@@ -372,43 +374,6 @@ pub async fn scan_host_tcp(
     }
 }
 
-/// Fast ICMP ping probe for discovering live hosts across routed/cascaded subnets
-pub async fn ping_host(ip: Ipv4Addr, timeout_duration: Duration) -> bool {
-    let timeout_ms = (timeout_duration.as_millis() as u64).clamp(300, 1500);
-
-    #[cfg(target_os = "macos")]
-    let cmd = tokio::process::Command::new("ping")
-        .args(["-c", "1", "-W", &timeout_ms.to_string(), &ip.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    #[cfg(target_os = "windows")]
-    let cmd = tokio::process::Command::new("ping")
-        .args(["-n", "1", "-w", &timeout_ms.to_string(), &ip.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let cmd = tokio::process::Command::new("ping")
-        .args([
-            "-c",
-            "1",
-            "-W",
-            &(timeout_ms / 1000).max(1).to_string(),
-            &ip.to_string(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match tokio::time::timeout(timeout_duration, cmd).await {
-        Ok(Ok(s)) => s.success(),
-        _ => false,
-    }
-}
-
 /// Scans an entire CIDR network block using combined ARP + TCP discovery
 pub async fn scan_subnet(
     cidr: Ipv4Net,
@@ -431,6 +396,30 @@ pub async fn scan_subnet(
         true,
     )
     .await
+}
+
+/// Records one echo attempt against the sweep's counters.
+///
+/// Split out because it is the part that must not be wrong: an address whose probe never
+/// left this machine has not been found silent, and counting it as probed is what turned a
+/// missing ICMP socket into a report that a network answered nothing.
+fn account_echo(
+    address: Ipv4Addr,
+    outcome: &crate::probes::reach::EchoOutcome,
+    sent: &mut usize,
+    not_sent: &mut usize,
+    probed: &mut std::collections::BTreeSet<Ipv4Addr>,
+    reasons: &mut std::collections::BTreeSet<String>,
+) {
+    if outcome.transmitted() {
+        *sent += 1;
+        probed.insert(address);
+    } else {
+        *not_sent += 1;
+        if let Some(reason) = outcome.describe_failure() {
+            reasons.insert(reason);
+        }
+    }
 }
 
 /// Core asynchronous scanning engine with optional IPv6 discovery control
@@ -522,13 +511,16 @@ pub async fn scan_subnet_ext(
     // Merge TCP probe findings, and count what actually went out.
     let mut probes_sent = 0usize;
     let mut probes_not_sent = 0usize;
-    let mut addresses_probed = 0usize;
+    let mut probed_addresses: std::collections::BTreeSet<Ipv4Addr> =
+        std::collections::BTreeSet::new();
+    let mut not_sent_reasons: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for task in tcp_tasks {
         if let Ok((ip, scan)) = task.await {
             probes_sent += scan.sent;
             probes_not_sent += scan.not_sent;
             if scan.sent > 0 {
-                addresses_probed += 1;
+                probed_addresses.insert(ip);
             }
             if scan.alive || !scan.open_ports.is_empty() {
                 let entry = host_results.entry(ip).or_insert_with(|| HostResult {
@@ -561,7 +553,13 @@ pub async fn scan_subnet_ext(
         }
     }
 
-    // ICMP Ping Sweep fallback for stealth hosts with no open TCP ports (e.g. Mac-mini, Mac, routers)
+    // ICMP for hosts with no open TCP port: many devices answer an echo and nothing else.
+    //
+    // The interface-bound correlated path, not the system `ping` command. That spawned one
+    // external process per address -- hundreds for a /24 -- ignored the selected interface
+    // entirely, so its answers could arrive over a different vantage than the run claims,
+    // and returned a bare bool, so a socket that never opened was indistinguishable from an
+    // address that stayed silent. Every send and every failure to send is counted here.
     let missing_liveness: Vec<Ipv4Addr> = hosts
         .iter()
         .copied()
@@ -571,21 +569,36 @@ pub async fn scan_subnet_ext(
     if !missing_liveness.is_empty() {
         let ping_sem = Arc::clone(&channel.permits);
         let mut ping_tasks = Vec::with_capacity(missing_liveness.len());
-        for &ip in &missing_liveness {
+        // One identifier for the run, one sequence per address, so a reply can be tied to
+        // the request that provoked it rather than to any echo in flight.
+        let identifier = std::process::id() as u16;
+        for (sequence, &ip) in missing_liveness.iter().enumerate() {
             let p_sem = Arc::clone(&ping_sem);
+            let binding = Arc::clone(&channel.binding);
             let to = timeout_duration.max(Duration::from_millis(750));
             ping_tasks.push(tokio::spawn(async move {
-                let _permit = p_sem.acquire().await.unwrap();
-                if ping_host(ip, to).await {
-                    Some(ip)
-                } else {
-                    None
-                }
+                let _permit = p_sem.acquire().await.ok()?;
+                let outcome =
+                    crate::probes::reach::echo(ip, identifier, sequence as u16, &binding, to).await;
+                Some((ip, outcome))
             }));
         }
 
         for task in ping_tasks {
-            if let Ok(Some(ip)) = task.await {
+            let Ok(Some((ip, outcome))) = task.await else {
+                continue;
+            };
+            // Transmitted or not, recorded either way: an address nothing was sent to has
+            // not been found silent.
+            account_echo(
+                ip,
+                &outcome,
+                &mut probes_sent,
+                &mut probes_not_sent,
+                &mut probed_addresses,
+                &mut not_sent_reasons,
+            );
+            if outcome.result().is_some() {
                 let entry = host_results.entry(ip).or_insert_with(|| HostResult {
                     ip,
                     is_alive: true,
@@ -831,9 +844,10 @@ pub async fn scan_subnet_ext(
     ScanSummary {
         total_hosts,
         active_hosts,
-        addresses_probed,
+        addresses_probed: probed_addresses.len(),
         probes_sent,
         probes_not_sent,
+        not_sent_reasons: not_sent_reasons.into_iter().collect(),
         elapsed: start_time.elapsed(),
     }
 }
@@ -841,6 +855,90 @@ pub async fn scan_subnet_ext(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_echo_that_never_left_is_counted_as_not_sent() {
+        // The defect: the ICMP fallback shelled out to `ping` and returned a bool, so a
+        // socket that could not be opened and an address that ignored the request were the
+        // same value -- and neither reached the sweep's counters at all.
+        use crate::probes::reach::EchoOutcome;
+
+        let address = Ipv4Addr::new(192, 0, 2, 10);
+        let mut sent = 0;
+        let mut not_sent = 0;
+        let mut probed = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeSet::new();
+
+        for outcome in [
+            EchoOutcome::unavailable("no ICMP socket on this host"),
+            EchoOutcome::not_sent("the socket could not be bound to the selected interface"),
+        ] {
+            account_echo(
+                address,
+                &outcome,
+                &mut sent,
+                &mut not_sent,
+                &mut probed,
+                &mut reasons,
+            );
+        }
+        assert_eq!((sent, not_sent), (0, 2));
+        assert!(
+            probed.is_empty(),
+            "an address nothing was sent to has not been probed"
+        );
+        assert_eq!(
+            reasons.len(),
+            2,
+            "and each local fault is named: {reasons:?}"
+        );
+
+        // A silent address, by contrast, was asked.
+        account_echo(
+            address,
+            &EchoOutcome::NoResponse {
+                sent: "ICMP echo request to 192.0.2.10".to_string(),
+            },
+            &mut sent,
+            &mut not_sent,
+            &mut probed,
+            &mut reasons,
+        );
+        assert_eq!((sent, not_sent), (1, 2));
+        assert_eq!(probed.len(), 1, "silence is a result about the network");
+    }
+
+    #[tokio::test]
+    async fn the_icmp_probe_is_bound_to_the_selected_interface() {
+        // It must not follow ordinary routing: an answer that arrived over a different
+        // interface would be attributed to a vantage that never carried it. A binding to an
+        // interface this machine does not have therefore has to fail to send rather than
+        // quietly leave through another one.
+        let binding = crate::net::socket::SocketBinding::for_interface(
+            "idnx-nonexistent0",
+            &[crate::net::interface::InterfaceAddress {
+                interface_name: "idnx-nonexistent0".to_string(),
+                ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                cidr: "192.0.2.0/24".parse().expect("a literal prefix"),
+            }],
+            0,
+        );
+
+        let outcome = crate::probes::reach::echo(
+            Ipv4Addr::new(192, 0, 2, 10),
+            1,
+            1,
+            &binding,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            !outcome.transmitted(),
+            "an unbindable interface cannot produce a transmitted probe: {outcome:?}"
+        );
+        assert!(outcome.describe_failure().is_some());
+    }
 
     #[test]
     fn test_parse_ports_single_and_ranges() {

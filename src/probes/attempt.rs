@@ -72,6 +72,19 @@ impl<T> AttemptOutcome<T> {
         }
     }
 
+    /// Why nothing was transmitted, where nothing was.
+    ///
+    /// `None` once a request reached the wire, so a caller cannot accidentally report a
+    /// local fault for a probe that was actually sent.
+    pub fn describe_failure(&self) -> Option<String> {
+        match self {
+            AttemptOutcome::Unavailable { reason }
+            | AttemptOutcome::NotApplicable { reason }
+            | AttemptOutcome::NotSent { reason } => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
     /// One line naming the probe and what became of it. Distinct per state, so the five
     /// cases stay distinguishable in output as well as in the type.
     pub fn describe(&self, probe: &str) -> String {

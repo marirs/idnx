@@ -1,5 +1,5 @@
 idNX 0.3.1 - topology from test0 (wired)
-Generated: GENERATED-AT
+Generated: 2020-01-01T00:00:00+00:00
 
 Not visible from this vantage: switched unicast between other hosts (without a mirror port)
 
@@ -20,7 +20,7 @@ VLANS
 DEVICES
   router             observed     192.0.2.1                    192.0.2.1
       role: is this machine's default gateway
-  router             advertised   198.51.100.1                 198.51.100.1
+  layer-3 switch     advertised   198.51.100.1                 198.51.100.1
       role: SNMP reports IP forwarding
       role: emits spanning-tree BPDUs
   host               advertised   203.0.113.254                203.0.113.254
@@ -45,10 +45,10 @@ COVERAGE
   203.0.113.0/24
     scripted-network     203.0.113.0/24 examined; 3 occupant fact(s)
   192.0.2.1
-    device-enrichment    1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    device-enrichment    1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
   198.51.100.1
-    device-enrichment    2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    device-enrichment    2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
   203.0.113.254
-    device-enrichment    2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    device-enrichment    2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, 0ms
 
 4 observed, 6 advertised, 0 inferred, 10 nodes

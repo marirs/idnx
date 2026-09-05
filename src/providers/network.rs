@@ -714,7 +714,10 @@ impl DiscoveryProvider for ArpLivenessProvider {
             .await;
 
             let attempted = outcome.transmitted();
-            let mut notes = vec![outcome.describe(self.name())];
+            // Kept before the outcome is consumed: the same line describes why nothing was
+            // sent, where nothing was.
+            let attempt_line = outcome.describe(self.name());
+            let mut notes = vec![attempt_line.clone()];
             let mut out = Vec::new();
 
             // What the outcome means for the rest of address resolution on this link, and
@@ -743,7 +746,10 @@ impl DiscoveryProvider for ArpLivenessProvider {
             }
             notes.push(describe_resolution(&resolution));
 
+            let mut reachability = Vec::new();
             if let Some(sweep) = outcome.result() {
+                reachability.push((IpNet::V4(scope), arp_reachability(&sweep, vantage)));
+
                 notes.push(format!(
                     "{} reply/replies from {} asked; the other {} are not confirmed, which is \
                      not the same as absent",
@@ -804,14 +810,60 @@ impl DiscoveryProvider for ArpLivenessProvider {
                 }
             }
 
+            // Nothing left this machine: the link has not been found quiet, it has not been
+            // asked. Recorded so the run says so rather than leaving the network absent
+            // from the reachability map for two different reasons.
+            if !attempted && reachability.is_empty() {
+                reachability.push((
+                    IpNet::V4(scope),
+                    crate::providers::NetworkReachability::probed(
+                        Vec::new(),
+                        0,
+                        crate::engine::orchestrator::enumerable_host_count(&IpNet::V4(scope)),
+                        vec![attempt_line],
+                    )
+                    .discovered_by(format!("attached to {vantage}")),
+                ));
+            }
+
             ProviderOutput {
                 evidence: out,
                 notes,
                 attempted,
-                reachability: Vec::new(),
+                reachability,
             }
         })
     }
+}
+
+/// What a completed ARP sweep says about the network's reachability.
+///
+/// A station that answers ARP and ignores TCP and ICMP is answering: it is on the link and
+/// it responded to us this run. Without this the same network could hold validated ARP
+/// replies in its device list and be reported as probed-unreachable in the same output,
+/// which is a contradiction rather than a limitation.
+fn arp_reachability(
+    sweep: &crate::probes::arp::ArpSweep,
+    vantage: &str,
+) -> crate::providers::NetworkReachability {
+    let mut responders: Vec<IpAddr> = sweep
+        .replies
+        .iter()
+        .map(|reply| IpAddr::V4(reply.address))
+        .collect();
+    responders.sort();
+    responders.dedup();
+
+    crate::providers::NetworkReachability::probed(
+        responders,
+        sweep.asked.len(),
+        0,
+        vec![format!(
+            "raw ARP asked {} address(es) on the attached link",
+            sweep.asked.len()
+        )],
+    )
+    .discovered_by(format!("attached to {vantage}"))
 }
 
 /// How an ARP resolution decision is reported, in words that match what was done.
@@ -2433,6 +2485,53 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_arp_reply_makes_the_network_reachable() {
+        // ARP was emitting validated device evidence and no reachability at all, so a host
+        // answering fresh ARP while ignoring TCP and ICMP left the network reported as
+        // probed-unreachable -- in the same output that listed the host it had just
+        // confirmed.
+        use crate::probes::arp::{ArpReply, ArpSweep};
+
+        let sweep = ArpSweep {
+            asked: (1..=254u8)
+                .map(|host| std::net::Ipv4Addr::new(192, 0, 2, host))
+                .collect(),
+            replies: vec![ArpReply {
+                address: std::net::Ipv4Addr::new(192, 0, 2, 10),
+                mac: [0x02, 0x00, 0x5e, 0x00, 0x00, 0x01],
+                vlan: None,
+                raw: Vec::new(),
+            }],
+            ..Default::default()
+        };
+
+        let reachability = arp_reachability(&sweep, "test0");
+        assert_eq!(
+            reachability.state(),
+            crate::providers::ReachabilityState::Reachable,
+            "a correlated ARP reply is an answer: {reachability:?}"
+        );
+        assert_eq!(
+            reachability.responders,
+            vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10))]
+        );
+        assert_eq!(
+            reachability.attempted, 254,
+            "and the coverage of the sweep travels with it"
+        );
+
+        // Silence from every address is still silence, not an absent result.
+        let silent = ArpSweep {
+            asked: sweep.asked.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            arp_reachability(&silent, "test0").state(),
+            crate::providers::ReachabilityState::ProbedUnreachable
+        );
+    }
+
+    #[test]
     fn a_remembered_host_is_not_a_reachability_response() {
         // The sweep seeds its host list from the kernel's ARP table. Those entries outlive
         // the stations that made them, so a network nobody has spoken to since a reboot
@@ -2458,6 +2557,7 @@ mod tests {
             addresses_probed: 254,
             probes_sent: 254,
             probes_not_sent: 0,
+            not_sent_reasons: Vec::new(),
             elapsed: Duration::ZERO,
         };
         assert!(

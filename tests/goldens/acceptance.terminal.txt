@@ -19,11 +19,13 @@ VLANs carrying a known prefix
 VLANs
   ├── VLAN 42 observed; prefix unknown
 
-Routers & gateways (2)
+Routers & gateways (1)
   ├── 192.0.2.1 [192.0.2.1] 
   │     currently live (SNMP) · role confirmed by 1 signal(s)
   │     • is this machine's default gateway
   │     └── routes to 198.51.100.0/24 [advertised]
+
+Layer-3 switches (bridging and routing) (1)
   ├── 198.51.100.1 [198.51.100.1] 
   │     currently live (SNMP) · role confirmed by 2 signal(s)
   │     • SNMP reports IP forwarding
@@ -48,7 +50,7 @@ Device inventory
 ╞══════════════════════════════════════════╪═══════════════╪══════╪═══════════════╪══════════════╪══════════╪═══════════════════════════════════════╡
 │ router                                   ┆ 192.0.2.1     ┆ -    ┆ 192.0.2.1     ┆ -            ┆ -        ┆ is this machine's default gateway     │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ router                                   ┆ 198.51.100.1  ┆ -    ┆ 198.51.100.1  ┆ -            ┆ -        ┆ SNMP reports IP forwarding            │
+│ layer-3 switch (bridges and routes)      ┆ 198.51.100.1  ┆ -    ┆ 198.51.100.1  ┆ -            ┆ -        ┆ SNMP reports IP forwarding            │
 │                                          ┆               ┆      ┆               ┆              ┆          ┆ emits spanning-tree BPDUs             │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ host                                     ┆ 203.0.113.9   ┆ -    ┆ 203.0.113.9   ┆ -            ┆ -        ┆ -                                     │
@@ -68,20 +70,20 @@ Discovery coverage
   203.0.113.0/24
     scripted-network   203.0.113.0/24 examined; 3 occupant fact(s)
   192.0.2.1
-    device-enrichment  1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    device-enrichment  1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
     networks learned: 198.51.100.0/24
   198.51.100.1
-    device-enrichment  2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    device-enrichment  2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
     networks learned: 198.18.0.0/24, 203.0.113.0/24
   203.0.113.254
-    device-enrichment  2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    device-enrichment  2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, 0ms
     no network established; interrogation incomplete (device-enrichment)
 
 Device coverage
-  4 device(s) interrogated in DURATIONms wall clock (DURATIONms if run one at a time), 215 probes
+  4 device(s) interrogated in 0ms wall clock (0ms if run one at a time), 215 probes
   192.0.2.1 router; queued infrastructure first
     discovered by      kernel route
-    interrogation      1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    interrogation      1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
     adapter outcome    192.0.2.1 disclosed 2 fact(s)
     not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:11434
     not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:1234
@@ -101,9 +103,9 @@ Device coverage
     not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:8443
     not sent           192.0.2.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 192.0.2.1:9100
     not attempted      192.0.2.1: stage 2 (45 ports) not run: liveness never confirmed and no stage 1 port answered
-  198.51.100.1 router; queued infrastructure first
+  198.51.100.1 layer-3 switch (bridges and routes); queued infrastructure first
     discovered by      SNMP
-    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
     adapter outcome    198.51.100.1 disclosed 4 fact(s)
     not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:11434
     not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:1234
@@ -169,7 +171,7 @@ Device coverage
     not sent           198.51.100.1: 1 probe(s) not sent: test0 has no IPv4 source address to reach 198.51.100.1:995
   203.0.113.9 host; queued normal
     discovered by      SNMP
-    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, 0ms
     adapter outcome    203.0.113.9 answered nothing
     not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:11434
     not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:1234
@@ -235,7 +237,7 @@ Device coverage
     not sent           203.0.113.9: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.9:995
   203.0.113.254 forwarding interface (ownership unknown); queued infrastructure first
     discovered by      SNMP
-    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    interrogation      2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, 0ms
     adapter outcome    203.0.113.254 forwarded traffic and disclosed nothing
     not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:11434
     not sent           203.0.113.254: 1 probe(s) not sent: test0 has no IPv4 source address to reach 203.0.113.254:1234
@@ -302,8 +304,9 @@ Device coverage
 
 Topology summary
   Devices:        4
-    Routers       2
+    Routers       1
     Switches      0
+    L3 switches   1
     Forwarding    1
     AI systems    0
     Other hosts   1

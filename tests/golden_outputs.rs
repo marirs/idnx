@@ -26,78 +26,32 @@ mod common;
 use common::run_scripted;
 
 use idnx::net::vantage::StartingScope;
-use idnx::output::export::{OutputFormat, build_export, render};
+use idnx::output::export::{OutputFormat, TopologyExport, build_export, render};
 
 use std::path::PathBuf;
 
-/// Replaces the values that legitimately differ between two identical runs.
+/// Makes the run's own nondeterminism go away structurally, before anything is rendered.
 ///
-/// Only these. A placeholder for anything else would hide the very drift this file exists
-/// to catch, so the list is deliberately short: the generation timestamp, and measured
-/// durations. Everything else that differs between two runs is a real nondeterminism.
-fn normalise(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        out.push_str(&replace_durations(&mask_timestamps(line)));
-        out.push('\n');
+/// Not by masking text. The previous approach scanned rendered output for numbers near the
+/// word "elapsed" and replaced them -- and XML is a single line, so every address, prefix,
+/// VLAN id, count and version number on it matched and was replaced: 1,415 substitutions,
+/// leaving a golden that proved almost nothing. The fixture is fixed at the source instead,
+/// so the rendered bytes are compared exactly as they are produced.
+fn make_deterministic(report: &mut idnx::engine::orchestrator::DiscoveryReport) {
+    report.enrichment_elapsed = std::time::Duration::ZERO;
+    report.enrichment_sequential_equivalent = std::time::Duration::ZERO;
+    for record in &mut report.coverage {
+        record.elapsed = std::time::Duration::ZERO;
     }
-    out
 }
 
-/// Masks anything shaped like an RFC 3339 timestamp, in whatever field a format spells it.
-fn mask_timestamps(line: &str) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let mut out = String::with_capacity(line.len());
-    let mut at = 0;
-    while at < chars.len() {
-        // YYYY-MM-DDT... is the only shape any of these formats emits.
-        let looks_like_date = at + 10 < chars.len()
-            && chars[at..at + 4].iter().all(|c| c.is_ascii_digit())
-            && chars[at + 4] == '-'
-            && chars[at + 5..at + 7].iter().all(|c| c.is_ascii_digit())
-            && chars[at + 7] == '-'
-            && chars[at + 8..at + 10].iter().all(|c| c.is_ascii_digit());
-        if looks_like_date {
-            out.push_str("GENERATED-AT");
-            while at < chars.len()
-                && (chars[at].is_ascii_digit()
-                    || matches!(chars[at], '-' | ':' | '.' | '+' | 'T' | 'Z'))
-            {
-                at += 1;
-            }
-            continue;
-        }
-        out.push(chars[at]);
-        at += 1;
-    }
-    out
-}
+/// The one value that cannot be fixed in the report, because the exporter stamps it.
+const FIXED_GENERATED_AT: &str = "2020-01-01T00:00:00+00:00";
 
-/// Measured times, wherever they appear.
-fn replace_durations(line: &str) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let mut out = String::with_capacity(line.len());
-    let mut at = 0;
-    while at < chars.len() {
-        if chars[at].is_ascii_digit() {
-            let start = at;
-            while at < chars.len() && (chars[at].is_ascii_digit() || chars[at] == '.') {
-                at += 1;
-            }
-            let number: String = chars[start..at].iter().collect();
-            let suffix: String = chars[at..].iter().take(4).collect();
-            let elapsed_field = line.contains("elapsed") || line.contains("Elapsed");
-            if suffix.starts_with("ms") || elapsed_field {
-                out.push_str("DURATION");
-            } else {
-                out.push_str(&number);
-            }
-            continue;
-        }
-        out.push(chars[at]);
-        at += 1;
-    }
-    out
+fn fixed_export(report: &idnx::engine::orchestrator::DiscoveryReport) -> TopologyExport {
+    let mut data = build_export(report);
+    data.generated_at = FIXED_GENERATED_AT.to_string();
+    data
 }
 
 fn goldens_dir() -> PathBuf {
@@ -107,7 +61,7 @@ fn goldens_dir() -> PathBuf {
 /// Compares one rendered output against its golden, or writes it when asked to.
 fn assert_golden(name: &str, rendered: &str) {
     let path = goldens_dir().join(name);
-    let normalised = normalise(rendered);
+    let normalised = rendered.to_string();
 
     if std::env::var("UPDATE_GOLDENS").is_ok() {
         std::fs::write(&path, &normalised).expect("the golden is writable");
@@ -164,8 +118,9 @@ fn every_output_format_matches_its_golden() {
     // the goldens unreadable and machine-dependent besides.
     colored::control::set_override(false);
 
-    let (report, _) = run_scripted();
-    let data = build_export(&report);
+    let (mut report, _) = run_scripted();
+    make_deterministic(&mut report);
+    let data = fixed_export(&report);
 
     for (format, name) in [
         (OutputFormat::Json, "acceptance.json"),
@@ -189,14 +144,19 @@ fn every_output_format_matches_its_golden() {
 }
 
 #[test]
-fn the_run_renders_identically_twice() {
+fn every_format_renders_identically_twice() {
     // A golden that only matches its own generation proves nothing. Two runs of the same
     // fixture must produce the same bytes, or the goldens are recording one arbitrary
-    // ordering out of many.
+    // ordering out of many -- and that includes the terminal view and the HTML page, which
+    // are built from different traversals than the serialised formats.
     colored::control::set_override(false);
 
-    let first = build_export(&run_scripted().0);
-    let second = build_export(&run_scripted().0);
+    let (mut first_report, _) = run_scripted();
+    let (mut second_report, _) = run_scripted();
+    make_deterministic(&mut first_report);
+    make_deterministic(&mut second_report);
+    let first = fixed_export(&first_report);
+    let second = fixed_export(&second_report);
 
     for format in [
         OutputFormat::Json,
@@ -206,9 +166,189 @@ fn the_run_renders_identically_twice() {
         OutputFormat::Text,
     ] {
         assert_eq!(
-            normalise(&render(&first, format).expect("renders")),
-            normalise(&render(&second, format).expect("renders")),
+            render(&first, format).expect("renders"),
+            render(&second, format).expect("renders"),
             "{format:?} is not deterministic"
         );
     }
+
+    let mut first_terminal = String::new();
+    let mut second_terminal = String::new();
+    idnx::output::topology_view::render_to(&mut first_terminal, &first_report, &starting_scope());
+    idnx::output::topology_view::render_to(&mut second_terminal, &second_report, &starting_scope());
+    assert_eq!(
+        first_terminal, second_terminal,
+        "the terminal view is not deterministic"
+    );
+
+    assert_eq!(
+        idnx::output::graph::topology_html(&first_report).expect("renders"),
+        idnx::output::graph::topology_html(&second_report).expect("renders"),
+        "the HTML page is not deterministic"
+    );
+}
+
+#[test]
+fn the_xml_golden_retains_the_literal_topology() {
+    // The previous harness scanned rendered text for numbers near the word "elapsed" and
+    // replaced them. XML is one line, so every address, prefix, VLAN id and count on it
+    // matched: 1,415 substitutions, and a golden that proved almost nothing. Nothing is
+    // masked now, and this states what the file has to contain.
+    colored::control::set_override(false);
+
+    let (mut report, _) = run_scripted();
+    make_deterministic(&mut report);
+    let xml = render(&fixed_export(&report), OutputFormat::Xml).expect("renders");
+
+    for literal in [
+        "192.0.2.0/24",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "198.18.0.0/24",
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.254",
+        "<id>42</id>",
+        "<id>77</id>",
+        "probed_unreachable",
+        "reachable",
+    ] {
+        assert!(
+            xml.contains(literal),
+            "the XML must carry {literal} literally, not a placeholder"
+        );
+    }
+    assert!(
+        !xml.contains("DURATION"),
+        "nothing in the topology is masked any more"
+    );
+}
+
+#[test]
+fn the_html_page_carries_each_network_s_reachability() {
+    // The page's network nodes had empty detail arrays: an operator opening the map could
+    // not tell a network that answered from one that was never probed.
+    colored::control::set_override(false);
+
+    let (mut report, _) = run_scripted();
+    make_deterministic(&mut report);
+    let html = idnx::output::graph::topology_html(&report).expect("renders");
+
+    for fragment in [
+        "reachability: reachable",
+        "reachability: probed_unreachable",
+        "answered: 203.0.113.9",
+        "address(es) probed",
+        "discovered: advertised by 198.51.100.1",
+    ] {
+        assert!(
+            html.contains(fragment),
+            "the page must state {fragment:?} on its network nodes"
+        );
+    }
+}
+
+#[test]
+fn the_csv_carries_every_record_type_and_not_only_devices() {
+    // CSV was a device inventory while every other format carried the topology, which
+    // contradicted the contract that an export preserves what was discovered.
+    colored::control::set_override(false);
+
+    let (mut report, _) = run_scripted();
+    make_deterministic(&mut report);
+    let csv = render(&fixed_export(&report), OutputFormat::Csv).expect("renders");
+
+    let mut kinds: Vec<&str> = csv
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split(',').next())
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    for expected in [
+        "network",
+        "vlan",
+        "device",
+        "relationship",
+        "coverage",
+        "device_coverage",
+    ] {
+        assert!(
+            kinds.contains(&expected),
+            "the CSV must carry {expected} records: {kinds:?}"
+        );
+    }
+
+    // And the rows carry their own content, not just their type.
+    assert!(csv.contains("198.18.0.0/24"), "networks appear as rows");
+    assert!(
+        csv.contains("reachability=probed_unreachable"),
+        "with their reachability state"
+    );
+    assert!(csv.contains("VLAN 77"), "VLANs appear as rows");
+    assert!(csv.contains("carries"), "relationships appear as rows");
+}
+
+#[test]
+fn a_layer_three_switch_is_presented_as_one() {
+    // It carried spanning-tree and forwarding evidence and was rendered under "Routers &
+    // gateways", with no switch section anywhere: the switching evidence reached the graph
+    // and then vanished from every output.
+    colored::control::set_override(false);
+
+    let (mut report, _) = run_scripted();
+    make_deterministic(&mut report);
+
+    let mut terminal = String::new();
+    idnx::output::topology_view::render_to(&mut terminal, &report, &starting_scope());
+
+    assert!(
+        terminal.contains("Layer-3 switches (bridging and routing)"),
+        "it gets its own section:\n{terminal}"
+    );
+
+    // Under that section, and not under routers.
+    let section = terminal
+        .split("Layer-3 switches")
+        .nth(1)
+        .expect("the section exists");
+    assert!(
+        section.contains("198.51.100.1"),
+        "the device is listed there"
+    );
+    let routers = terminal
+        .split("Routers & gateways")
+        .nth(1)
+        .and_then(|rest| rest.split("Layer-3 switches").next())
+        .unwrap_or_default();
+    assert!(
+        !routers.contains("198.51.100.1"),
+        "and not also among the routers"
+    );
+
+    // One node, both signals, both routed edges.
+    let holders: Vec<_> = report
+        .graph
+        .nodes()
+        .filter(|node| {
+            node.addresses
+                .contains(&"198.51.100.1".parse().expect("a literal address"))
+        })
+        .collect();
+    assert_eq!(holders.len(), 1, "still one device");
+    let signals: Vec<&String> = holders[0].role_signals.iter().collect();
+    assert!(signals.iter().any(|s| s.contains("spanning-tree")));
+    assert!(signals.iter().any(|s| s.contains("forward")));
+
+    let data = fixed_export(&report);
+    assert_eq!(
+        data.summary.layer3_switches, 1,
+        "counted in its own category"
+    );
+    assert!(
+        data.devices
+            .iter()
+            .any(|device| device.category.contains("layer-3 switch")),
+        "and exported as one"
+    );
 }

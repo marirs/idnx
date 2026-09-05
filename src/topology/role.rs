@@ -14,6 +14,13 @@ use super::evidence::RoleSignal;
 pub enum DeviceRole {
     Router,
     Switch,
+    /// Bridges *and* routes: a layer-3 switch, or a router doing both jobs.
+    ///
+    /// Its own role rather than a router with a footnote. Reporting one as a plain router
+    /// discarded the switching evidence that put it on the map, and reporting it as a
+    /// switch would hide the boundary it defines between networks. Both are true of it,
+    /// and both matter to whoever reads the topology.
+    Layer3Switch,
     Host,
 }
 
@@ -37,9 +44,8 @@ pub fn score_role(signals: &BTreeSet<RoleSignal>) -> DeviceRole {
         return DeviceRole::Host;
     }
 
-    // Spanning-tree participation is bridge behaviour. A device that both bridges and
-    // routes is reported as a router, since routing is the more consequential role for
-    // topology: it defines a boundary between networks.
+    // Spanning-tree participation is bridge behaviour, and routing is a different claim.
+    // A device doing both is reported as doing both.
     let routes = signals.iter().any(|s| {
         matches!(
             s,
@@ -53,20 +59,17 @@ pub fn score_role(signals: &BTreeSet<RoleSignal>) -> DeviceRole {
         ) || matches!(s, RoleSignal::LinkLayerCapability(c) if c.contains("Router"))
     });
 
-    if routes {
-        return DeviceRole::Router;
-    }
-
     let bridges = signals.iter().any(|s| {
         matches!(s, RoleSignal::SpanningTreeBridge)
             || matches!(s, RoleSignal::LinkLayerCapability(c) if c.contains("Bridge"))
     });
 
-    if bridges {
-        return DeviceRole::Switch;
+    match (routes, bridges) {
+        (true, true) => DeviceRole::Layer3Switch,
+        (true, false) => DeviceRole::Router,
+        (false, true) => DeviceRole::Switch,
+        (false, false) => DeviceRole::Host,
     }
-
-    DeviceRole::Host
 }
 
 #[cfg(test)]
@@ -130,13 +133,31 @@ mod tests {
     }
 
     #[test]
-    fn a_bridging_router_is_reported_as_a_router() {
+    fn a_device_that_bridges_and_routes_is_reported_as_both() {
+        // Neither half may be dropped: the routing evidence defines a boundary between
+        // networks, and the switching evidence is what a station on the segment sees.
         assert_eq!(
             score_role(&signals(&[
                 RoleSignal::SpanningTreeBridge,
                 RoleSignal::DefaultGateway,
             ])),
+            DeviceRole::Layer3Switch
+        );
+        assert_eq!(
+            score_role(&signals(&[
+                RoleSignal::SpanningTreeBridge,
+                RoleSignal::SnmpForwarding,
+            ])),
+            DeviceRole::Layer3Switch
+        );
+        // And one of them alone is still what it was.
+        assert_eq!(
+            score_role(&signals(&[RoleSignal::DefaultGateway])),
             DeviceRole::Router
+        );
+        assert_eq!(
+            score_role(&signals(&[RoleSignal::SpanningTreeBridge])),
+            DeviceRole::Switch
         );
     }
 

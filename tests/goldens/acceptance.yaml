@@ -1,6 +1,6 @@
 tool: idNX
 version: 0.3.1
-generated_at: GENERATED-AT
+generated_at: 2020-01-01T00:00:00+00:00
 vantage:
   interface: test0
   kind: wired
@@ -162,8 +162,8 @@ devices:
     vantage: test0
     detail: null
 - id: 198.51.100.1
-  kind: router
-  category: router
+  kind: layer-3 switch
+  category: layer-3 switch (bridges and routes)
   addresses:
   - 198.51.100.1
   hostnames: []
@@ -293,14 +293,14 @@ coverage:
   providers:
   - provider: device-enrichment
     facts: 1
-    note: 1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    note: 1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
   networks_learned:
   - 198.51.100.0/24
 - scope: 198.51.100.1
   providers:
   - provider: device-enrichment
     facts: 1
-    note: 2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, DURATIONms
+    note: 2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms
   networks_learned:
   - 198.18.0.0/24
   - 203.0.113.0/24
@@ -308,7 +308,7 @@ coverage:
   providers:
   - provider: device-enrichment
     facts: 0
-    note: 2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, DURATIONms
+    note: 2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, 0ms
   networks_learned: []
 device_coverage:
 - device: 192.0.2.1
@@ -353,7 +353,7 @@ device_coverage:
   - '192.0.2.1: stage 2 (45 ports) not run: liveness never confirmed and no stage 1 port answered'
   skipped: null
   silent: false
-  elapsed_ms: DURATION
+  elapsed_ms: 0
 - device: 198.51.100.1
   addresses:
   - 198.51.100.1
@@ -440,7 +440,7 @@ device_coverage:
   omissions: []
   skipped: null
   silent: false
-  elapsed_ms: DURATION
+  elapsed_ms: 0
 - device: 203.0.113.254
   addresses:
   - 203.0.113.254
@@ -526,7 +526,7 @@ device_coverage:
   omissions: []
   skipped: null
   silent: false
-  elapsed_ms: DURATION
+  elapsed_ms: 0
 - device: 203.0.113.9
   addresses:
   - 203.0.113.9
@@ -612,11 +612,12 @@ device_coverage:
   omissions: []
   skipped: null
   silent: false
-  elapsed_ms: DURATION
+  elapsed_ms: 0
 summary:
   devices: 4
-  routers: 2
+  routers: 1
   switches: 0
+  layer3_switches: 1
   opaque_boundaries: 0
   forwarding_interfaces: 1
   ai_systems: 0
@@ -627,8 +628,9 @@ summary:
   interfaces: 0
   nodes_by_kind:
     host: 2
+    layer3_switch: 1
     network: 4
-    router: 2
+    router: 1
     vlan: 2
   observed: 4
   advertised: 6

@@ -355,13 +355,43 @@ impl SocketBinding {
         Ok(socket)
     }
 
-    /// Binds an already-open ICMP socket to the selected interface.
+    /// Binds an already-open ICMP socket to the selected interface *and* its source
+    /// address.
     ///
     /// Separate because an ICMP socket is created directly rather than through the
     /// constructors here: it needs a protocol the ordinary UDP path cannot ask for.
+    ///
+    /// The source bind is what actually constrains the traffic on platforms where
+    /// `SO_BINDTODEVICE` is unavailable or refused -- which is every macOS run and every
+    /// unprivileged Linux one. Without it an ICMP probe left through whatever interface the
+    /// routing table preferred, and its answer was then attributed to a vantage that never
+    /// carried it. A source this host does not hold fails here, and the caller reports the
+    /// probe as not sent rather than reporting the network as silent.
     #[cfg(unix)]
     pub fn bind_icmp(&self, socket: &tokio::net::UdpSocket) -> io::Result<()> {
-        self.bind_to_interface(socket, true)
+        self.bind_to_interface(socket, true)?;
+
+        let Some(source) = self.v4_source else {
+            return Ok(());
+        };
+        use std::os::fd::AsRawFd;
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_port = 0;
+        address.sin_addr.s_addr = u32::from_ne_bytes(source.octets());
+        // SAFETY: a bind(2) call with a correctly sized, fully initialised sockaddr_in for
+        // a descriptor this socket owns.
+        let result = unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                (&raw const address).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Asks the kernel to send this socket's traffic out of the selected interface.

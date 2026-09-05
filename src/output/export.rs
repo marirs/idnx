@@ -365,6 +365,8 @@ pub struct SummaryExport {
     pub devices: usize,
     pub routers: usize,
     pub switches: usize,
+    /// Devices that bridge and route at once, counted apart from both.
+    pub layer3_switches: usize,
     pub opaque_boundaries: usize,
     /// Interfaces observed forwarding traffic, with no evidence of who owns them.
     pub forwarding_interfaces: usize,
@@ -501,7 +503,11 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
     for node in graph.nodes() {
         if !matches!(
             node.kind,
-            NodeKind::Router | NodeKind::Switch | NodeKind::Host | NodeKind::OpaqueBoundary
+            NodeKind::Router
+                | NodeKind::Switch
+                | NodeKind::Layer3Switch
+                | NodeKind::Host
+                | NodeKind::OpaqueBoundary
         ) {
             continue;
         }
@@ -614,8 +620,10 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
 
     let mut nodes_by_kind: std::collections::BTreeMap<String, usize> = Default::default();
     for node in graph.nodes() {
+        // The wire name, not the display label: these become XML element names, which
+        // cannot contain the spaces a human-facing label has.
         *nodes_by_kind
-            .entry(node.kind.label().to_string())
+            .entry(node.kind.wire().to_string())
             .or_default() += 1;
     }
 
@@ -624,6 +632,7 @@ pub fn build_export(report: &DiscoveryReport) -> TopologyExport {
         devices: counts.devices(),
         routers: counts.routers,
         switches: counts.switches,
+        layer3_switches: counts.layer3_switches,
         opaque_boundaries: counts.opaque_boundaries,
         forwarding_interfaces: counts.forwarding_interfaces,
         ai_systems: counts.ai_systems,
@@ -721,9 +730,17 @@ pub fn render(data: &TopologyExport, format: OutputFormat) -> Result<String, Str
 }
 
 /// CSV is one row per device, carrying the evidence that classified it.
+/// CSV as typed records: one row per topology object, not one row per device.
+///
+/// It was a device inventory, which contradicted the contract every other format keeps --
+/// networks, VLANs, relationships and reachability existed in JSON and vanished here, so a
+/// consumer reading the CSV saw a device list and no topology at all. Each row now names
+/// its own record type in the first column, and the columns that do not apply to that type
+/// are left empty rather than repurposed.
 fn render_csv(data: &TopologyExport) -> Result<String, String> {
     let mut wtr = csv::Writer::from_writer(vec![]);
     wtr.write_record([
+        "Record",
         "Kind",
         "Name",
         "Addresses",
@@ -734,30 +751,182 @@ fn render_csv(data: &TopologyExport) -> Result<String, String> {
         "Role Evidence",
         "Evidence Sources",
         "Observed By",
-        "Opaque Reason",
+        "Detail",
     ])
     .map_err(|e| format!("CSV header error: {e}"))?;
 
-    for d in &data.devices {
-        let sources: Vec<String> = d.evidence.iter().map(|e| e.source.clone()).collect();
+    let flatten = |observers: &[ObserverExport]| {
+        observers
+            .iter()
+            .map(|observer| observer.flat())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    for network in &data.networks {
+        let sources: Vec<String> = network
+            .evidence
+            .iter()
+            .map(|item| item.source.clone())
+            .collect();
+        // Reachability travels with the network, in the same shape the other formats use:
+        // state, then the coverage that backs it.
+        let reachability = match &network.reachability {
+            Some(state) => format!(
+                "reachability={}; probed={}; responders={}; not_sent={}{}",
+                state.state,
+                state.attempted,
+                state.responders.join(" "),
+                state.not_sent,
+                if state.discovery.is_empty() {
+                    String::new()
+                } else {
+                    format!("; discovered={}", state.discovery.join(" | "))
+                }
+            ),
+            None => "reachability=not_probed".to_string(),
+        };
+        let detail = format!(
+            "{reachability}; enumerated={}; interfaces={}",
+            network.enumerated,
+            network.interfaces.join(" ")
+        );
         wtr.write_record([
-            &d.kind,
-            &d.id,
-            &d.addresses.join("; "),
-            &d.hostnames.join("; "),
-            d.vendor.as_deref().unwrap_or(""),
-            &d.confidence,
-            &d.capabilities.join("; "),
-            &d.role_evidence.join("; "),
+            "network",
+            &network.kind,
+            &network.cidr,
+            "",
+            "",
+            "",
+            &network.confidence,
+            "",
+            "",
+            &sources.join("; "),
+            &flatten(&network.observed_by),
+            &detail,
+        ])
+        .map_err(|e| format!("CSV write error: {e}"))?;
+    }
+
+    for vlan in &data.vlans {
+        let sources: Vec<String> = vlan
+            .evidence
+            .iter()
+            .map(|item| item.source.clone())
+            .collect();
+        wtr.write_record([
+            "vlan",
+            "vlan",
+            &format!("VLAN {}", vlan.id),
+            vlan.prefix.as_deref().unwrap_or(""),
+            "",
+            "",
+            "",
+            "",
+            "",
+            &sources.join("; "),
+            &vlan.observed_in.flat(),
+            &vlan.note,
+        ])
+        .map_err(|e| format!("CSV write error: {e}"))?;
+    }
+
+    for device in &data.devices {
+        let sources: Vec<String> = device
+            .evidence
+            .iter()
+            .map(|item| item.source.clone())
+            .collect();
+        wtr.write_record([
+            "device",
+            &device.kind,
+            &device.id,
+            &device.addresses.join("; "),
+            &device.hostnames.join("; "),
+            device.vendor.as_deref().unwrap_or(""),
+            &device.confidence,
+            &device.capabilities.join("; "),
+            &device.role_evidence.join("; "),
             &sources.join("; "),
             // Flattened, with full peer identities: the tabular formats have no place for
             // a structure, and a truncated identity would let two peers collide here.
-            &d.observed_by
-                .iter()
-                .map(|o| o.flat())
-                .collect::<Vec<_>>()
-                .join("; "),
-            d.opaque_reason.as_deref().unwrap_or(""),
+            &flatten(&device.observed_by),
+            device.opaque_reason.as_deref().unwrap_or(""),
+        ])
+        .map_err(|e| format!("CSV write error: {e}"))?;
+    }
+
+    for relationship in &data.relationships {
+        let sources: Vec<String> = relationship
+            .evidence
+            .iter()
+            .map(|item| item.source.clone())
+            .collect();
+        wtr.write_record([
+            "relationship",
+            &relationship.relationship,
+            &relationship.from,
+            &relationship.to,
+            "",
+            "",
+            &relationship.confidence,
+            "",
+            "",
+            &sources.join("; "),
+            "",
+            "",
+        ])
+        .map_err(|e| format!("CSV write error: {e}"))?;
+    }
+
+    for scope in &data.coverage {
+        let providers: Vec<String> = scope
+            .providers
+            .iter()
+            .map(|provider| provider.provider.clone())
+            .collect();
+        let notes: Vec<String> = scope
+            .providers
+            .iter()
+            .map(|provider| {
+                format!(
+                    "{}: {}",
+                    provider.provider,
+                    provider.note.as_deref().unwrap_or("no note")
+                )
+            })
+            .collect();
+        wtr.write_record([
+            "coverage",
+            "scope",
+            &scope.scope,
+            &scope.networks_learned.join("; "),
+            "",
+            "",
+            "",
+            "",
+            "",
+            &providers.join("; "),
+            "",
+            &notes.join(" | "),
+        ])
+        .map_err(|e| format!("CSV write error: {e}"))?;
+    }
+
+    for record in &data.device_coverage {
+        wtr.write_record([
+            "device_coverage",
+            &record.tier,
+            &record.device,
+            &record.addresses.join("; "),
+            "",
+            "",
+            "",
+            &record.protocols_confirmed.join("; "),
+            "",
+            &record.discovery_sources.join("; "),
+            "",
+            &record.skipped.clone().unwrap_or_default(),
         ])
         .map_err(|e| format!("CSV write error: {e}"))?;
     }

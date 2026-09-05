@@ -387,6 +387,10 @@ fn render_infrastructure(out: &mut dyn std::fmt::Write, graph: &TopologyGraph, v
     // rather than appearing in two sections.
     for (category, heading) in [
         (DeviceCategory::Router, "Routers & gateways"),
+        (
+            DeviceCategory::Layer3Switch,
+            "Layer-3 switches (bridging and routing)",
+        ),
         (DeviceCategory::Switch, "Switches & bridges"),
         // Named for what was established. These interfaces forwarded our traffic; who
         // administers them is a separate question that a hop count cannot answer, and
@@ -1199,6 +1203,7 @@ fn render_coverage(out: &mut dyn std::fmt::Write, report: &DiscoveryReport) {
     );
     emit!(out, "    {:<14}{}", "Routers", counts.routers);
     emit!(out, "    {:<14}{}", "Switches", counts.switches);
+    emit!(out, "    {:<14}{}", "L3 switches", counts.layer3_switches);
     if counts.opaque_boundaries > 0 {
         emit!(out, "    {:<14}{}", "Boundaries", counts.opaque_boundaries);
     }

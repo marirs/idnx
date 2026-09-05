@@ -147,15 +147,21 @@ impl NetworkReachability {
 
     /// Folds another pass's account of the same network into this one.
     ///
-    /// Everything accumulates. An earlier design kept only the strongest state, so one
-    /// responder among 254 attempts erased the 253 that answered nothing -- and the
-    /// coverage of the sweep, which is most of what the result is worth, went with it.
+    /// Responders and accounts accumulate: an earlier design kept only the strongest state,
+    /// so one responder among 254 attempts erased the 253 that answered nothing, and the
+    /// coverage of the sweep -- most of what the result is worth -- went with it.
+    ///
+    /// Coverage takes the widest pass rather than the sum. Several providers probe the same
+    /// network from this vantage -- an ARP sweep and a port sweep both cover the whole /24 --
+    /// and adding their counts claimed 508 addresses probed in a network holding 254.
+    /// Understating coverage is the safe error; overstating it is a false claim about how
+    /// thoroughly the network was examined.
     pub fn merge(&mut self, other: NetworkReachability) {
         self.responders.extend(other.responders);
         self.responders.sort();
         self.responders.dedup();
-        self.attempted += other.attempted;
-        self.not_sent += other.not_sent;
+        self.attempted = self.attempted.max(other.attempted);
+        self.not_sent = self.not_sent.max(other.not_sent);
         self.reasons.extend(other.reasons);
         self.reasons.dedup();
         self.discovery.extend(other.discovery);
@@ -453,18 +459,25 @@ mod reachability_tests {
         // The defect this replaced: a rank-based merge kept only the strongest state, so a
         // single answer erased the 253 addresses that answered nothing. "1 of 254" and
         // "1 of 1" are different results, and only the coverage tells them apart.
-        let mut held =
-            NetworkReachability::probed(Vec::new(), 253, 0, vec!["253 swept, silent".to_string()]);
+        let mut held = NetworkReachability::probed(
+            Vec::new(),
+            254,
+            0,
+            vec!["254 swept by the port sweep; silent".to_string()],
+        );
         held.merge(NetworkReachability::probed(
             vec![ip("192.0.2.5")],
-            1,
+            254,
             0,
-            vec!["one answered".to_string()],
+            vec!["254 asked by the ARP sweep; one answered".to_string()],
         ));
 
         assert_eq!(held.state(), ReachabilityState::Reachable);
         assert_eq!(held.responders, vec![ip("192.0.2.5")]);
-        assert_eq!(held.attempted, 254, "the whole sweep's coverage survives");
+        assert_eq!(
+            held.attempted, 254,
+            "the sweep's coverage survives, and two passes over the same /24 are not 508"
+        );
         assert_eq!(held.reasons.len(), 2, "both accounts are kept");
         assert!(held.describe().contains("1 of 254"));
     }
@@ -513,7 +526,7 @@ mod reachability_tests {
             Vec::new(),
         ));
         assert_eq!(held.responders, vec![ip("192.0.2.5"), ip("192.0.2.9")]);
-        assert_eq!(held.attempted, 3);
+        assert_eq!(held.attempted, 2, "the widest pass, not the sum");
     }
 
     #[test]

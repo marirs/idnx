@@ -330,23 +330,36 @@ pub fn is_exact_reply(
         && u16::from_be_bytes([icmp[6], icmp[7]]) == sequence
 }
 
-/// Probes one candidate and reports whether that exact address answered.
+/// What one echo established: unavailable, not sent, silent, or answered.
+pub type EchoOutcome = crate::probes::attempt::AttemptOutcome<Ipv4Addr>;
+
+/// Asks one address to answer for itself, over the interface-bound correlated ICMP path.
 ///
-/// Unix only, like every raw-ICMP path in this crate: elsewhere there is no socket to open,
-/// and the provider reports the probe as unavailable rather than reporting silence.
+/// Returns what actually happened rather than a bare bool. The distinction is the whole
+/// point: a socket that would not open, a send that failed and an address that stayed
+/// silent are three different findings, and collapsing them into `false` let a run report
+/// a quiet network when nothing had left this machine.
 #[cfg(unix)]
-pub async fn probe(
+pub async fn echo(
     target: Ipv4Addr,
     identifier: u16,
     sequence: u16,
     binding: &crate::net::socket::SocketBinding,
     budget: std::time::Duration,
-) -> bool {
+) -> EchoOutcome {
+    let sent = format!("ICMP echo request to {target}");
     let Some(socket) = crate::probes::path::icmp_socket() else {
-        return false;
+        return EchoOutcome::unavailable(
+            "an ICMP datagram socket could not be opened on this host".to_string(),
+        );
     };
+    // Bound to the selected interface, like every other active probe. An unbound socket
+    // follows ordinary routing and can leave through an interface the operator did not
+    // choose, which attributes the answer to a vantage that never carried it.
     if binding.bind_icmp(&socket).is_err() {
-        return false;
+        return EchoOutcome::not_sent(
+            "the ICMP socket could not be bound to the selected interface".to_string(),
+        );
     }
     let destination = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(target, 0));
     if socket
@@ -357,7 +370,7 @@ pub async fn probe(
         .await
         .is_err()
     {
-        return false;
+        return EchoOutcome::not_sent(format!("the echo request to {target} could not be sent"));
     }
 
     let deadline = tokio::time::Instant::now() + budget;
@@ -373,10 +386,41 @@ pub async fn probe(
             continue;
         };
         if is_exact_reply(&buffer[..length], identifier, sequence, from, target) {
-            return true;
+            return EchoOutcome::Answered {
+                sent,
+                result: target,
+            };
         }
     }
-    false
+    EchoOutcome::NoResponse { sent }
+}
+
+/// Where raw ICMP cannot be opened at all.
+#[cfg(not(unix))]
+pub async fn echo(
+    target: Ipv4Addr,
+    _identifier: u16,
+    _sequence: u16,
+    _binding: &crate::net::socket::SocketBinding,
+    _budget: std::time::Duration,
+) -> EchoOutcome {
+    let _ = target;
+    EchoOutcome::unavailable("raw ICMP is not available on this platform".to_string())
+}
+
+/// Probes one candidate and reports whether that exact address answered.
+#[cfg(unix)]
+pub async fn probe(
+    target: Ipv4Addr,
+    identifier: u16,
+    sequence: u16,
+    binding: &crate::net::socket::SocketBinding,
+    budget: std::time::Duration,
+) -> bool {
+    echo(target, identifier, sequence, binding, budget)
+        .await
+        .result()
+        .is_some()
 }
 
 /// Asks one candidate every cheap question and keeps every answer.

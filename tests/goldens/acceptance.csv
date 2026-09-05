@@ -1,5 +1,27 @@
-Kind,Name,Addresses,Hostnames,Vendor,Confidence,Capabilities,Role Evidence,Evidence Sources,Observed By,Opaque Reason
-router,192.0.2.1,192.0.2.1,,,observed,,is this machine's default gateway,kernel route; SNMP,local,
-router,198.51.100.1,198.51.100.1,,,advertised,,SNMP reports IP forwarding; emits spanning-tree BPDUs,SNMP,local,
-host,203.0.113.254,203.0.113.254,,,advertised,,observed forwarding traffic on a path,SNMP,local,
-host,203.0.113.9,203.0.113.9,,,advertised,,,SNMP,local,
+Record,Kind,Name,Addresses,Hostnames,Vendor,Confidence,Capabilities,Role Evidence,Evidence Sources,Observed By,Detail
+network,physical,192.0.2.0/24,,,,observed,,,kernel route; DHCP lease,local,reachability=reachable; probed=254; responders=192.0.2.1; not_sent=0; discovered=attached to this vantage; enumerated=true; interfaces=
+network,physical,198.18.0.0/24,,,,advertised,,,SNMP,local,reachability=probed_unreachable; probed=254; responders=; not_sent=0; discovered=advertised by 198.51.100.1; enumerated=true; interfaces=
+network,physical,198.51.100.0/24,,,,advertised,,,SNMP,local,reachability=reachable; probed=254; responders=198.51.100.1; not_sent=0; discovered=routed by 192.0.2.1; enumerated=true; interfaces=
+network,physical,203.0.113.0/24,,,,advertised,,,SNMP,local,reachability=reachable; probed=254; responders=203.0.113.9 203.0.113.254; not_sent=0; discovered=routed by 198.51.100.1; enumerated=true; interfaces=
+vlan,vlan,VLAN 42,,,,,,,,local,observed on the wire; no prefix evidence
+vlan,vlan,VLAN 77,192.0.2.0/24,,,,,,DHCP lease,local,one observation stated both the tag and the prefix
+device,router,192.0.2.1,192.0.2.1,,,observed,,is this machine's default gateway,kernel route; SNMP,local,
+device,layer-3 switch,198.51.100.1,198.51.100.1,,,advertised,,SNMP reports IP forwarding; emits spanning-tree BPDUs,SNMP,local,
+device,host,203.0.113.254,203.0.113.254,,,advertised,,observed forwarding traffic on a path,SNMP,local,
+device,host,203.0.113.9,203.0.113.9,,,advertised,,,SNMP,local,
+relationship,routes to,192.0.2.1,198.51.100.0/24,,,advertised,,,SNMP,,
+relationship,routes to,198.51.100.1,198.18.0.0/24,,,advertised,,,SNMP,,
+relationship,routes to,198.51.100.1,203.0.113.0/24,,,advertised,,,SNMP,,
+relationship,carries,VLAN 77,192.0.2.0/24,,,observed,,,DHCP lease,,
+coverage,scope,local machine,,,,,,,scripted-seed,,scripted-seed: seeded from scripted local state
+coverage,scope,192.0.2.0/24,,,,,,,scripted-network,,scripted-network: 192.0.2.0/24 examined; 1 occupant fact(s)
+coverage,scope,198.51.100.0/24,,,,,,,scripted-network,,scripted-network: 198.51.100.0/24 examined; 3 occupant fact(s)
+coverage,scope,198.18.0.0/24,,,,,,,scripted-network,,scripted-network: 198.18.0.0/24 examined; 0 occupant fact(s)
+coverage,scope,203.0.113.0/24,,,,,,,scripted-network,,scripted-network: 203.0.113.0/24 examined; 3 occupant fact(s)
+coverage,scope,192.0.2.1,198.51.100.0/24,,,,,,device-enrichment,,"device-enrichment: 1 stage(s), 0/17 tcp responsive; 17 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms"
+coverage,scope,198.51.100.1,198.18.0.0/24; 203.0.113.0/24,,,,,,device-enrichment,,"device-enrichment: 2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted; confirmed scripted-network, 0ms"
+coverage,scope,203.0.113.254,,,,,,,device-enrichment,,"device-enrichment: 2 stage(s), 0/62 tcp responsive; 62 not sent locally; 3 udp attempted, 0ms"
+device_coverage,pivot,192.0.2.1,192.0.2.1,,,,scripted-network,,kernel route,,
+device_coverage,pivot,198.51.100.1,198.51.100.1,,,,scripted-network,,SNMP,,
+device_coverage,pivot,203.0.113.254,203.0.113.254,,,,,,SNMP,,
+device_coverage,host,203.0.113.9,203.0.113.9,,,,,,SNMP,,

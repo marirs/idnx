@@ -26,6 +26,8 @@ pub enum DeviceCategory {
     OpaqueBoundary,
     Router,
     Switch,
+    /// Bridges and routes at once, with both kinds of evidence retained.
+    Layer3Switch,
     /// An interface observed forwarding traffic, whose owner is unknown.
     ///
     /// A TTL-limited probe expiring at an address proves that interface forwarded our
@@ -47,6 +49,7 @@ impl DeviceCategory {
             DeviceCategory::OpaqueBoundary => "opaque boundary",
             DeviceCategory::Router => "router",
             DeviceCategory::Switch => "switch",
+            DeviceCategory::Layer3Switch => "layer-3 switch (bridges and routes)",
             DeviceCategory::ForwardingInterface => "forwarding interface (ownership unknown)",
             DeviceCategory::AiSystem => "AI system",
             DeviceCategory::Host => "host",
@@ -86,6 +89,7 @@ pub fn categorize(node: &Node) -> Option<DeviceCategory> {
         // Infrastructure placement wins: a router hosting AI is still a router.
         NodeKind::Router => Some(DeviceCategory::Router),
         NodeKind::Switch => Some(DeviceCategory::Switch),
+        NodeKind::Layer3Switch => Some(DeviceCategory::Layer3Switch),
         // Confirmed forwarding outranks the AI and host readings: the strongest thing
         // known about such a node is that it moved our traffic.
         NodeKind::Host => Some(if forwards_traffic(node) {
@@ -104,6 +108,9 @@ pub fn categorize(node: &Node) -> Option<DeviceCategory> {
 pub struct TopologyCounts {
     pub routers: usize,
     pub switches: usize,
+    /// Devices that both bridge and route. Counted apart from routers and switches so the
+    /// sections stay mutually exclusive and still sum to the device total.
+    pub layer3_switches: usize,
     pub opaque_boundaries: usize,
     /// Interfaces observed forwarding traffic, with no evidence of who owns them.
     pub forwarding_interfaces: usize,
@@ -122,6 +129,7 @@ impl TopologyCounts {
     pub fn devices(&self) -> usize {
         self.routers
             + self.switches
+            + self.layer3_switches
             + self.opaque_boundaries
             + self.forwarding_interfaces
             + self.ai_systems
@@ -287,14 +295,37 @@ pub enum NodeKind {
     Vlan,
     Router,
     Switch,
+    /// Bridges and routes at once. A distinct kind because both facts are load-bearing and
+    /// folding it into either one discards evidence the device itself supplied.
+    Layer3Switch,
     Host,
     Service,
     OpaqueBoundary,
 }
 
 impl NodeKind {
+    /// A machine-readable name, safe to use as a map key or an XML element name.
+    ///
+    /// Separate from `label`, which is written for a person and contains spaces and
+    /// hyphens: XML names allow neither, so serialisation failed the moment a kind's label
+    /// grew a space.
+    pub fn wire(&self) -> &'static str {
+        match self {
+            NodeKind::Interface => "interface",
+            NodeKind::Network => "network",
+            NodeKind::Vlan => "vlan",
+            NodeKind::Router => "router",
+            NodeKind::Switch => "switch",
+            NodeKind::Layer3Switch => "layer3_switch",
+            NodeKind::Host => "host",
+            NodeKind::Service => "service",
+            NodeKind::OpaqueBoundary => "opaque_boundary",
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
+            NodeKind::Layer3Switch => "layer-3 switch",
             NodeKind::Interface => "interface",
             NodeKind::Network => "network",
             NodeKind::Vlan => "vlan",
@@ -918,6 +949,7 @@ impl TopologyGraph {
                 _ => match categorize(node) {
                     Some(DeviceCategory::Router) => counts.routers += 1,
                     Some(DeviceCategory::Switch) => counts.switches += 1,
+                    Some(DeviceCategory::Layer3Switch) => counts.layer3_switches += 1,
                     Some(DeviceCategory::OpaqueBoundary) => counts.opaque_boundaries += 1,
                     Some(DeviceCategory::ForwardingInterface) => counts.forwarding_interfaces += 1,
                     Some(DeviceCategory::AiSystem) => counts.ai_systems += 1,
@@ -1731,6 +1763,7 @@ impl TopologyGraph {
                 node.kind = match role {
                     DeviceRole::Router => NodeKind::Router,
                     DeviceRole::Switch => NodeKind::Switch,
+                    DeviceRole::Layer3Switch => NodeKind::Layer3Switch,
                     DeviceRole::Host => node.kind,
                 };
             }

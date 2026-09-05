@@ -49,6 +49,8 @@ fn colour_for(kind: NodeKind) -> &'static str {
     match kind {
         NodeKind::Router => "#38bdf8",
         NodeKind::Switch => "#a78bfa",
+        // Its own colour: it is neither purely a switch nor purely a router on the map.
+        NodeKind::Layer3Switch => "#c084fc",
         NodeKind::Network => "#22c55e",
         NodeKind::Vlan => "#eab308",
         NodeKind::OpaqueBoundary => "#f97316",
@@ -61,6 +63,7 @@ fn colour_for(kind: NodeKind) -> &'static str {
 fn radius_for(kind: NodeKind) -> f32 {
     match kind {
         NodeKind::Router | NodeKind::OpaqueBoundary => 24.0,
+        NodeKind::Layer3Switch => 22.0,
         NodeKind::Switch | NodeKind::Network => 20.0,
         NodeKind::Vlan => 16.0,
         _ => 12.0,
@@ -122,6 +125,31 @@ fn build_data(report: &DiscoveryReport) -> GraphData {
             }
             if report.oversized_scopes.contains(net) {
                 detail.push("too large to enumerate address by address".to_string());
+            }
+            // What the run established about reaching into it, with the coverage that
+            // backs the claim. The page showed a network node with no indication whether
+            // anything in it had ever answered, which is most of what an operator opens
+            // the map to find out.
+            if let Some(reachability) = report.network_reachability.get(&reference) {
+                detail.push(format!(
+                    "reachability: {}",
+                    safe(reachability.state().wire())
+                ));
+                detail.push(format!(
+                    "coverage: {} address(es) probed, {} responder(s), {} probe(s) not sent",
+                    reachability.attempted,
+                    reachability.responders.len(),
+                    reachability.not_sent
+                ));
+                for responder in &reachability.responders {
+                    detail.push(format!("answered: {responder}"));
+                }
+                for reason in &reachability.reasons {
+                    detail.push(format!("probe: {}", safe(reason)));
+                }
+                for how in &reachability.discovery {
+                    detail.push(format!("discovered: {}", safe(how)));
+                }
             }
             // The observation domain is part of this network's identity: two peers can
             // each hold a 10.0.0.0/24, and the page must show them as two.
