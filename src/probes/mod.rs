@@ -22,6 +22,7 @@ pub mod reach;
 pub mod rip;
 pub mod smb;
 pub mod snmp;
+pub mod snmp_v3;
 pub mod telnet;
 pub mod tls;
 pub mod upnp;

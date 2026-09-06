@@ -14,11 +14,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 // ASN.1 BER Universal and Context Tags
-const TAG_INTEGER: u8 = 0x02;
-const TAG_OCTET_STRING: u8 = 0x04;
-const TAG_NULL: u8 = 0x05;
-const TAG_OBJECT_IDENTIFIER: u8 = 0x06;
-const TAG_SEQUENCE: u8 = 0x30;
+pub(crate) const TAG_INTEGER: u8 = 0x02;
+pub(crate) const TAG_OCTET_STRING: u8 = 0x04;
+pub(crate) const TAG_NULL: u8 = 0x05;
+pub(crate) const TAG_OBJECT_IDENTIFIER: u8 = 0x06;
+pub(crate) const TAG_SEQUENCE: u8 = 0x30;
 
 // SNMP Application Tags
 const TAG_IP_ADDRESS: u8 = 0x40; // Application 0
@@ -219,7 +219,7 @@ fn encode_length(len: usize) -> Vec<u8> {
     }
 }
 
-fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + value.len());
     out.push(tag);
     out.extend(encode_length(value.len()));
@@ -227,7 +227,7 @@ fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
     out
 }
 
-fn encode_integer(val: i64) -> Vec<u8> {
+pub(crate) fn encode_integer(val: i64) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut v = val;
     loop {
@@ -243,15 +243,15 @@ fn encode_integer(val: i64) -> Vec<u8> {
     encode_tlv(TAG_INTEGER, &bytes)
 }
 
-fn encode_octet_string(val: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_octet_string(val: &[u8]) -> Vec<u8> {
     encode_tlv(TAG_OCTET_STRING, val)
 }
 
-fn encode_null() -> Vec<u8> {
+pub(crate) fn encode_null() -> Vec<u8> {
     vec![TAG_NULL, 0x00]
 }
 
-fn encode_oid(oid: &Oid) -> Vec<u8> {
+pub(crate) fn encode_oid(oid: &Oid) -> Vec<u8> {
     if oid.0.len() < 2 {
         return vec![TAG_OBJECT_IDENTIFIER, 0x00];
     }
