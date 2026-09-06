@@ -580,6 +580,28 @@ const MAX_RESPONSE_BYTES: usize = 8192;
 /// The most varbinds one response may carry.
 const MAX_VARBINDS: usize = 128;
 
+/// The one diagnostic for a datagram larger than this reader accepts.
+///
+/// Shared, because two platforms report the same event differently and no caller should have
+/// to know which one it is running on.
+fn oversized_response() -> String {
+    format!("response exceeds the {MAX_RESPONSE_BYTES}-byte bound this reads")
+}
+
+/// Whether a receive error means the datagram was larger than the buffer.
+///
+/// Unix truncates and reports the bytes it copied, so the length check catches it there.
+/// Winsock refuses instead: the receive fails with WSAEMSGSIZE and the remainder is
+/// discarded. Same event, reported as an error rather than as a short read -- in both cases
+/// the agent sent more than this reads, and in both cases it must be refused with the same
+/// words. Anything comparing against a platform's error text is code that behaves
+/// differently on Windows, which is what this normalisation exists to prevent.
+fn oversized_datagram(error: &std::io::Error) -> bool {
+    /// `WSAEMSGSIZE`. Named here because no `ErrorKind` variant covers it on any platform.
+    const WSAEMSGSIZE: i32 = 10040;
+    error.raw_os_error() == Some(WSAEMSGSIZE)
+}
+
 /// Sends one request and validates the answer against it.
 ///
 /// Everything checked here is something an unvalidated implementation would accept from any
@@ -631,6 +653,7 @@ async fn snmp_request(
         }
         let (len, from) = match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
             Ok(Ok(received)) => received,
+            Ok(Err(e)) if oversized_datagram(&e) => return Err(oversized_response()),
             Ok(Err(e)) => return Err(format!("UDP recv error: {}", e)),
             Err(_) => return Err("SNMP request timed out".to_string()),
         };
@@ -642,9 +665,7 @@ async fn snmp_request(
         }
 
         if len > MAX_RESPONSE_BYTES {
-            return Err(format!(
-                "response exceeds the {MAX_RESPONSE_BYTES}-byte bound this reads"
-            ));
+            return Err(oversized_response());
         }
         let message = decode_snmp_response(&buf[..len])?;
         // Version 1 on the wire is SNMPv2c, which is what was asked.
@@ -1776,6 +1797,30 @@ mod lifecycle {
             error.contains("varbind"),
             "the diagnostic names the varbind count: {error}"
         );
+    }
+
+    #[test]
+    fn an_oversized_datagram_reads_the_same_on_every_platform() {
+        // Unix truncates and reports a short read, which the length check catches. Winsock
+        // fails the receive with WSAEMSGSIZE instead. The refusal must be worded identically
+        // either way: the lifecycle test below asserts on that wording, and a platform whose
+        // error text differs is a platform where this reader behaves differently.
+        let winsock = std::io::Error::from_raw_os_error(10040);
+        assert!(oversized_datagram(&winsock));
+        assert!(oversized_response().contains("exceeds"));
+
+        // Every other receive error keeps its own diagnostic. A refused connection or an
+        // unreachable host is not an agent sending too much.
+        for other in [
+            std::io::Error::from_raw_os_error(10054), // WSAECONNRESET
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        ] {
+            assert!(
+                !oversized_datagram(&other),
+                "{other:?} is not an oversized datagram"
+            );
+        }
     }
 
     #[test]
