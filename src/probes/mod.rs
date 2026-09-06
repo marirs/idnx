@@ -25,3 +25,4 @@ pub mod snmp;
 pub mod telnet;
 pub mod tls;
 pub mod upnp;
+pub mod usm;

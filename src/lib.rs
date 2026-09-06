@@ -11,5 +11,6 @@ pub mod net;
 pub mod output;
 pub mod probes;
 pub mod providers;
+pub mod secret;
 pub mod text;
 pub mod topology;
