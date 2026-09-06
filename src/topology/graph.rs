@@ -678,6 +678,33 @@ impl std::fmt::Display for NetworkRef {
     }
 }
 
+/// The physical bridge a spanning-tree identifier names.
+///
+/// A bridge identifier is structured: two bytes of priority and system-id extension, then
+/// the bridge's MAC. Only the MAC identifies the device. The priority is configurable and
+/// changes without the switch changing, and under PVST+ or MSTP the extension carries the
+/// VLAN or instance number -- so a switch running one instance per VLAN emits a *different*
+/// identifier per VLAN. Keying a node by the whole string therefore produced one node per
+/// VLAN for a single physical switch, and a second node whenever an administrator changed a
+/// priority.
+///
+/// Returns `None` for a string that does not carry a MAC, so a malformed identifier creates
+/// no device rather than a node named after the malformation.
+pub fn bridge_identity(bridge_id: &str) -> Option<DeviceKey> {
+    let (_, mac) = bridge_id.split_once('.')?;
+    // Exactly six colon-separated hex octets, and nothing else: the identifier is protocol
+    // data, and anything that is not a hardware address is not an identity.
+    let octets: Vec<&str> = mac.split(':').collect();
+    if octets.len() != 6
+        || !octets
+            .iter()
+            .all(|octet| octet.len() == 2 && octet.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    Some(DeviceKey::mac(mac))
+}
+
 /// A directed relationship between two nodes.
 #[derive(Debug, Clone)]
 pub struct Edge {
@@ -1505,8 +1532,21 @@ impl TopologyGraph {
                 root_id,
                 port,
             } => {
-                let bridge = NodeId::Device(DeviceKey::mac(&bridge_id));
-                let root = NodeId::Device(DeviceKey::mac(&root_id));
+                // The MAC inside each identifier is the device; the priority, the VLAN or
+                // MST instance and the identifier as a whole stay in the provenance the
+                // evidence already carries. Realm qualification is applied to the parsed
+                // identity rather than to the string, so a locally administered bridge MAC
+                // -- which is not globally unique and so must not merge across peers --
+                // keeps its observation domain exactly as every other MAC identity does.
+                let (Some(bridge_key), Some(root_key)) = (
+                    bridge_identity(&bridge_id).map(|key| qualify_device(key, &realm)),
+                    bridge_identity(&root_id).map(|key| qualify_device(key, &realm)),
+                ) else {
+                    // An identifier with no hardware address in it names no device.
+                    return;
+                };
+                let bridge = NodeId::Device(bridge_key);
+                let root = NodeId::Device(root_key);
                 self.upsert(
                     bridge.clone(),
                     NodeKind::Switch,
@@ -1978,13 +2018,17 @@ fn qualify_fact(fact: Fact, realm: &Realm) -> Fact {
         },
         // A bridge identifier is already a spanning-tree identity, unique within the tree
         // it belongs to; the realm distinguishes trees.
+        // A bridge identifier is protocol data, not an identity: the realm is applied to
+        // the MAC parsed out of it when the node is created, which is where every other
+        // hardware identity is qualified. Appending the domain to the string made the
+        // identifier unparseable and moved scoping somewhere it could not be checked.
         Fact::BridgeLink {
             bridge_id,
             root_id,
             port,
         } => Fact::BridgeLink {
-            bridge_id: format!("{bridge_id}{}", realm.suffix()),
-            root_id: format!("{root_id}{}", realm.suffix()),
+            bridge_id,
+            root_id,
             port,
         },
         // Networks, services, VLANs and resolutions carry no device identity; the network
@@ -1996,6 +2040,265 @@ fn qualify_fact(fact: Fact, realm: &Realm) -> Fact {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One BPDU's worth of evidence, as the passive provider emits it.
+    fn bpdu(
+        source_mac: &str,
+        bridge_id: &str,
+        root_id: &str,
+        port: &str,
+        vlan: Option<u16>,
+    ) -> Vec<TopologyEvidence> {
+        let instance = match vlan {
+            Some(id) => format!(", VLAN instance {id}"),
+            None => String::new(),
+        };
+        let device = bridge_identity(bridge_id).expect("the fixtures carry hardware addresses");
+        vec![
+            ev(
+                Fact::DeviceRoleSignal {
+                    device,
+                    signal: RoleSignal::SpanningTreeBridge,
+                },
+                EvidenceSource::Stp,
+                Confidence::Observed,
+            )
+            .with_detail(format!(
+                "BPDU from bridge {bridge_id} via port {port} (source {source_mac}){instance}"
+            )),
+            ev(
+                Fact::BridgeLink {
+                    bridge_id: bridge_id.to_string(),
+                    root_id: root_id.to_string(),
+                    port: Some(port.to_string()),
+                },
+                EvidenceSource::Stp,
+                Confidence::Advertised,
+            )
+            .with_detail(format!(
+                "bridge {bridge_id} names spanning-tree root {root_id}{instance}"
+            )),
+        ]
+    }
+
+    fn absorb_all(records: Vec<TopologyEvidence>) -> TopologyGraph {
+        let mut graph = TopologyGraph::new();
+        for record in records {
+            graph.absorb(record);
+        }
+        graph.finalize_roles();
+        graph
+    }
+
+    fn switches(graph: &TopologyGraph) -> Vec<&Node> {
+        graph.devices_in(DeviceCategory::Switch)
+    }
+
+    #[test]
+    fn a_self_root_bpdu_produces_one_switch_and_no_self_edge() {
+        // The bridge naming itself as root is one device. Keying a node by the whole
+        // identifier made it two -- one by hardware address, one by "32768.<mac>" -- and the
+        // second was a switch that does not exist.
+        let graph = absorb_all(bpdu(
+            "02:00:5e:00:00:02",
+            "32768.02:00:5e:00:00:02",
+            "32768.02:00:5e:00:00:02",
+            "0x8001",
+            None,
+        ));
+
+        assert_eq!(switches(&graph).len(), 1, "{:?}", switches(&graph));
+        assert!(
+            !graph
+                .edges()
+                .any(|edge| edge.relationship == Relationship::PossibleUplink),
+            "a bridge is not its own uplink"
+        );
+    }
+
+    #[test]
+    fn per_vlan_bpdus_from_one_switch_are_one_switch() {
+        // PVST+ runs an instance per VLAN, and MSTP puts the instance number in the
+        // identifier's system-id extension. Both make the identifier differ per VLAN while
+        // the switch stays the same switch: a trunk carrying forty VLANs produced forty
+        // nodes for one box.
+        let mut records = Vec::new();
+        for vlan in [10u16, 20, 30] {
+            // The extension lives in the priority field, exactly as a real switch sends it.
+            let bridge = format!("{}.02:00:5e:00:00:02", 32768 + vlan);
+            let root = format!("{}.02:00:5e:00:00:09", 32768 + vlan);
+            records.extend(bpdu(
+                "02:00:5e:00:00:03",
+                &bridge,
+                &root,
+                "0x8002",
+                Some(vlan),
+            ));
+        }
+        let graph = absorb_all(records);
+
+        assert_eq!(
+            switches(&graph).len(),
+            2,
+            "one sender and one root, not one pair per VLAN: {:?}",
+            switches(&graph)
+                .iter()
+                .map(|node| &node.id)
+                .collect::<Vec<_>>()
+        );
+
+        // Every instance is still recorded, on the one node.
+        let sender = switches(&graph)
+            .into_iter()
+            .find(|node| {
+                node.role_signals
+                    .iter()
+                    .any(|s| s.contains("spanning-tree"))
+            })
+            .expect("the sender is on the graph");
+        for vlan in ["VLAN instance 10", "VLAN instance 20", "VLAN instance 30"] {
+            assert!(
+                sender
+                    .provenance
+                    .iter()
+                    .any(|p| p.detail.as_deref().is_some_and(|d| d.contains(vlan))),
+                "{vlan} is retained as evidence: {:?}",
+                sender.provenance
+            );
+        }
+    }
+
+    #[test]
+    fn a_priority_change_does_not_create_a_second_switch() {
+        // Priority is configuration. An administrator lowering it to move the root election
+        // must not appear as a new device.
+        let mut records = bpdu(
+            "02:00:5e:00:00:02",
+            "32768.02:00:5e:00:00:02",
+            "32768.02:00:5e:00:00:09",
+            "0x8001",
+            None,
+        );
+        records.extend(bpdu(
+            "02:00:5e:00:00:02",
+            "4096.02:00:5e:00:00:02",
+            "4096.02:00:5e:00:00:09",
+            "0x8001",
+            None,
+        ));
+        let graph = absorb_all(records);
+
+        assert_eq!(
+            switches(&graph).len(),
+            2,
+            "one sender and one root across both priorities: {:?}",
+            switches(&graph)
+                .iter()
+                .map(|node| &node.id)
+                .collect::<Vec<_>>()
+        );
+        // And both identifiers survive as evidence of what was actually sent.
+        let details: Vec<String> = graph
+            .nodes()
+            .flat_map(|node| node.provenance.iter())
+            .filter_map(|p| p.detail.clone())
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("32768.02:00:5e:00:00:02"))
+        );
+        assert!(details.iter().any(|d| d.contains("4096.02:00:5e:00:00:02")));
+    }
+
+    #[test]
+    fn a_non_root_bpdu_links_two_switches_by_a_possible_uplink() {
+        let graph = absorb_all(bpdu(
+            "02:00:5e:00:00:03",
+            "32768.02:00:5e:00:00:02",
+            "32768.02:00:5e:00:00:09",
+            "0x8002",
+            None,
+        ));
+
+        assert_eq!(switches(&graph).len(), 2, "{:?}", switches(&graph));
+        let uplinks: Vec<&Edge> = graph
+            .edges()
+            .filter(|edge| edge.relationship == Relationship::PossibleUplink)
+            .collect();
+        assert_eq!(uplinks.len(), 1, "{uplinks:?}");
+        assert_eq!(
+            uplinks[0].from,
+            NodeId::Device(DeviceKey::mac("02:00:5e:00:00:02")),
+            "the advertising bridge's physical node"
+        );
+        assert_eq!(
+            uplinks[0].to,
+            NodeId::Device(DeviceKey::mac("02:00:5e:00:00:09")),
+            "the root bridge's physical node"
+        );
+    }
+
+    #[test]
+    fn a_port_mac_that_differs_from_the_bridge_mac_creates_no_orphan() {
+        // A switch derives a MAC per port, so the Ethernet source of a BPDU routinely is not
+        // the bridge's own address. It is evidence about the frame, not a device.
+        let graph = absorb_all(bpdu(
+            "02:00:5e:00:00:77",
+            "32768.02:00:5e:00:00:02",
+            "32768.02:00:5e:00:00:02",
+            "0x8001",
+            None,
+        ));
+
+        assert_eq!(switches(&graph).len(), 1, "{:?}", switches(&graph));
+        assert!(
+            !graph
+                .nodes()
+                .any(|node| format!("{:?}", node.id).contains("02:00:5e:00:00:77")),
+            "the port address creates no device of its own"
+        );
+        // It is still recorded, because it is what the frame carried.
+        assert!(
+            graph.nodes().any(|node| node.provenance.iter().any(|p| p
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("source 02:00:5e:00:00:77")))),
+            "and the source address stays in the evidence"
+        );
+    }
+
+    #[test]
+    fn spanning_tree_creates_no_network_and_binds_no_vlan() {
+        let graph = absorb_all(bpdu(
+            "02:00:5e:00:00:03",
+            "32768.02:00:5e:00:00:02",
+            "32768.02:00:5e:00:00:09",
+            "0x8002",
+            Some(20),
+        ));
+
+        assert!(graph.networks().is_empty(), "{:?}", graph.networks());
+        assert!(
+            graph.vlan_networks().is_empty(),
+            "{:?}",
+            graph.vlan_networks()
+        );
+    }
+
+    #[test]
+    fn an_identifier_with_no_hardware_address_names_no_device() {
+        // A malformed identifier must not become a node named after the malformation.
+        assert!(bridge_identity("32768.not-a-mac").is_none());
+        assert!(bridge_identity("no-separator").is_none());
+        assert!(bridge_identity("32768.02:00:5e:00:00").is_none());
+        assert_eq!(
+            bridge_identity("32768.02:00:5E:00:00:02"),
+            Some(DeviceKey::mac("02:00:5e:00:00:02")),
+            "case is normalised, as everywhere else a MAC is an identity"
+        );
+    }
+
     use crate::topology::evidence::EvidenceSource;
     use std::net::Ipv4Addr;
     use std::str::FromStr;

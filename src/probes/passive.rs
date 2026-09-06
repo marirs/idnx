@@ -53,11 +53,19 @@ pub enum FrameFact {
     Vlan { id: u16 },
 
     /// A spanning-tree BPDU. Only a bridge emits these.
+    ///
+    /// `source_mac` is the *port's* hardware address, which is frequently not the bridge's
+    /// own: a switch derives per-port MACs from a base address. The identity of the bridge
+    /// is inside `bridge_id`, and treating the Ethernet source as a device of its own
+    /// invents one switch per port.
     Bridge {
         source_mac: String,
         bridge_id: String,
         root_id: String,
         port_id: u16,
+        /// The VLAN this spanning-tree instance is for, where the BPDU said so (PVST+).
+        /// Protocol evidence: it never becomes part of any device's identity.
+        vlan: Option<u16>,
     },
 
     /// An ARP sender's address binding.
@@ -409,13 +417,20 @@ fn decode_pvst(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
     }
 
     let body = &payload[SNAP_HEADER..];
-    let Some(bridge) = decode_bpdu(source_mac, body) else {
+    let Some(mut bridge) = decode_bpdu(source_mac, body) else {
         return;
     };
+
+    let vlan = pvst_originating_vlan(body);
+    if let (FrameFact::Bridge { vlan: slot, .. }, Some(id)) = (&mut bridge, vlan) {
+        // Which instance this BPDU belongs to, kept with the BPDU. One physical switch runs
+        // one instance per VLAN and is still one switch.
+        *slot = Some(id);
+    }
     facts.push(bridge);
 
-    if let Some(vlan) = pvst_originating_vlan(body) {
-        facts.push(FrameFact::Vlan { id: vlan });
+    if let Some(id) = vlan {
+        facts.push(FrameFact::Vlan { id });
     }
 }
 
@@ -480,6 +495,7 @@ pub fn decode_bpdu(source_mac: &str, body: &[u8]) -> Option<FrameFact> {
         bridge_id,
         root_id,
         port_id,
+        vlan: None,
     })
 }
 

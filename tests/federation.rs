@@ -871,6 +871,69 @@ mod observation_domains {
             "and the local observation is what makes it reachable"
         );
     }
+
+    #[test]
+    fn two_peers_reporting_the_same_bridge_identifier_are_two_switches() {
+        // A bridge identifier carries a MAC, and a switch's base address is frequently
+        // locally administered -- which means it is unique on one link and nowhere else.
+        // The identity now comes from that MAC, so the scoping that keeps two peers' devices
+        // apart has to apply to it exactly as it applies to every other hardware identity.
+        use idnx::topology::graph::DeviceCategory;
+
+        let bridge = "32768.02:00:5e:00:00:02";
+        let root = "32768.02:00:5e:00:00:09";
+        let graph = merged(|vantage| {
+            vec![
+                TopologyEvidence::new(
+                    Fact::DeviceRoleSignal {
+                        device: idnx::topology::graph::bridge_identity(bridge)
+                            .expect("the identifier carries a MAC"),
+                        signal: RoleSignal::SpanningTreeBridge,
+                    },
+                    EvidenceSource::Stp,
+                    Confidence::Observed,
+                    vantage,
+                ),
+                TopologyEvidence::new(
+                    Fact::BridgeLink {
+                        bridge_id: bridge.to_string(),
+                        root_id: root.to_string(),
+                        port: Some("0x8002".to_string()),
+                    },
+                    EvidenceSource::Stp,
+                    Confidence::Advertised,
+                    vantage,
+                ),
+            ]
+        });
+
+        let switches = graph.devices_in(DeviceCategory::Switch);
+        assert_eq!(
+            switches.len(),
+            4,
+            "two peers, each with its own bridge and root: {:?}",
+            switches.iter().map(|node| &node.id).collect::<Vec<_>>()
+        );
+
+        // Each peer's uplink stays inside that peer's domain.
+        let uplinks: Vec<_> = graph
+            .edges()
+            .filter(|edge| edge.relationship == idnx::topology::graph::Relationship::PossibleUplink)
+            .collect();
+        assert_eq!(uplinks.len(), 2, "{uplinks:?}");
+        for edge in uplinks {
+            let (idnx::topology::NodeId::Device(from), idnx::topology::NodeId::Device(to)) =
+                (&edge.from, &edge.to)
+            else {
+                panic!("a spanning-tree uplink joins two devices");
+            };
+            assert_eq!(
+                format!("{from:?}").split('@').nth(1),
+                format!("{to:?}").split('@').nth(1),
+                "an uplink never crosses observation domains: {from:?} -> {to:?}"
+            );
+        }
+    }
 }
 
 /// Lookups, probing and outputs must all respect the observation domain.

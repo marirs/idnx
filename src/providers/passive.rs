@@ -419,8 +419,19 @@ fn convert(
                 bridge_id,
                 root_id,
                 port_id,
+                vlan,
             } => {
-                let device = DeviceKey::mac(source_mac);
+                // The bridge's own identifier names the device; the Ethernet source is the
+                // port it left through, and a switch derives a different one per port.
+                // Keying the role signal by the source created a switch per port, and on a
+                // trunk a switch per VLAN as well.
+                let device = crate::topology::graph::bridge_identity(bridge_id)
+                    .unwrap_or_else(|| DeviceKey::mac(source_mac));
+                let instance = match vlan {
+                    Some(id) => format!(", VLAN instance {id}"),
+                    None => String::new(),
+                };
+
                 // Only a bridge emits BPDUs, so this is observed bridge behaviour. It is
                 // deliberately not router evidence and implies nothing about subnets.
                 out.push(
@@ -433,7 +444,13 @@ fn convert(
                         Confidence::Observed,
                         interface,
                     )
-                    .with_detail(format!("BPDU from bridge {bridge_id}, port {port_id:#06x}")),
+                    // The full identifier, the port it arrived on and the source address are
+                    // all retained here: identity is the MAC inside the bridge id, and
+                    // everything else the protocol stated stays as evidence.
+                    .with_detail(format!(
+                        "BPDU from bridge {bridge_id} via port {port_id:#06x} \
+                         (source {source_mac}){instance}"
+                    )),
                 );
                 out.push(
                     TopologyEvidence::new(
@@ -447,7 +464,9 @@ fn convert(
                         Confidence::Advertised,
                         interface,
                     )
-                    .with_detail(format!("spanning-tree root {root_id}")),
+                    .with_detail(format!(
+                        "bridge {bridge_id} names spanning-tree root {root_id}{instance}"
+                    )),
                 );
             }
 
@@ -1062,6 +1081,7 @@ mod tests {
                 bridge_id: "32768.44:d9:e7:1c:88:40".into(),
                 root_id: "32768.bc:24:11:9a:02:01".into(),
                 port_id: 0x8003,
+                vlan: None,
             }],
             "test0",
             &ctx(),
