@@ -365,17 +365,17 @@ fn decode_integer_value(data: &[u8]) -> i64 {
 /// enclosing object and the next `data[offset]` could panic or read a neighbouring field as
 /// its own. A declared length is a claim by the sender, and every one of them is now
 /// checked against the container it appears in.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, at: 0 }
     }
 
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.at >= self.bytes.len()
     }
 
@@ -384,7 +384,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads one tag-length-value, returning the tag and a reader bounded to its contents.
-    fn tlv(&mut self, what: &str) -> Result<(u8, Reader<'a>), String> {
+    pub(crate) fn tlv(&mut self, what: &str) -> Result<(u8, Reader<'a>), String> {
         let tag = *self
             .bytes
             .get(self.at)
@@ -407,7 +407,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads one tag-length-value and requires the tag.
-    fn expect(&mut self, tag: u8, what: &str) -> Result<Reader<'a>, String> {
+    pub(crate) fn expect(&mut self, tag: u8, what: &str) -> Result<Reader<'a>, String> {
         let (found, value) = self.tlv(what)?;
         if found != tag {
             return Err(format!(
@@ -451,7 +451,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The whole of what remains, for a primitive value.
-    fn rest(&self) -> &'a [u8] {
+    pub(crate) fn rest(&self) -> &'a [u8] {
         &self.bytes[self.at..]
     }
 
@@ -460,7 +460,7 @@ impl<'a> Reader<'a> {
     /// Trailing bytes inside a container mean the message is not what it declares itself to
     /// be: something is being smuggled past the fields this decoder knows, and a decoder
     /// that ignores them accepts two readings of one message.
-    fn finished(&self, what: &str) -> Result<(), String> {
+    pub(crate) fn finished(&self, what: &str) -> Result<(), String> {
         if self.done() {
             return Ok(());
         }
@@ -491,9 +491,24 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
     let (pdu_type, mut pdu) = message.tlv("the PDU")?;
     message.finished("the message")?;
 
-    let request_id = integer(&mut pdu, "the request id")? as i32;
-    let error_status = integer(&mut pdu, "the error status")? as i32;
-    let error_index = integer(&mut pdu, "the error index")? as i32;
+    let pdu = decode_pdu_body(pdu_type, &mut pdu)?;
+
+    Ok(SnmpMessage {
+        version,
+        community,
+        pdu,
+    })
+}
+
+/// Reads a PDU's fields and varbinds out of an already-opened reader.
+///
+/// Shared with the v3 scoped PDU, which carries the same structure inside a different
+/// envelope. One implementation, so a varbind cannot be read two subtly different ways
+/// depending on which version delivered it.
+pub(crate) fn decode_pdu_body(pdu_type: u8, pdu: &mut Reader<'_>) -> Result<SnmpPdu, String> {
+    let request_id = integer(pdu, "the request id")? as i32;
+    let error_status = integer(pdu, "the error status")? as i32;
+    let error_index = integer(pdu, "the error index")? as i32;
 
     let mut list = pdu.expect(TAG_SEQUENCE, "the varbind list")?;
     pdu.finished("the PDU")?;
@@ -533,16 +548,12 @@ pub fn decode_snmp_response(data: &[u8]) -> Result<SnmpMessage, String> {
         }
     }
 
-    Ok(SnmpMessage {
-        version,
-        community,
-        pdu: SnmpPdu {
-            pdu_type,
-            request_id,
-            error_status,
-            error_index,
-            varbinds,
-        },
+    Ok(SnmpPdu {
+        pdu_type,
+        request_id,
+        error_status,
+        error_index,
+        varbinds,
     })
 }
 

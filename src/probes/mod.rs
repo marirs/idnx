@@ -27,3 +27,4 @@ pub mod telnet;
 pub mod tls;
 pub mod upnp;
 pub mod usm;
+pub mod usm_state;

@@ -401,6 +401,48 @@ pub fn encode_scoped_pdu(
     )
 }
 
+/// A scoped PDU: the context it applies to, and the PDU itself.
+#[derive(Debug, Clone)]
+pub struct ScopedPdu {
+    pub context_engine_id: Vec<u8>,
+    pub context_name: Vec<u8>,
+    pub pdu: crate::probes::snmp::SnmpPdu,
+}
+
+/// Decodes a scoped PDU, plaintext or freshly decrypted.
+///
+/// The PDU body is read by the same code that reads a v2c PDU, so a varbind cannot be
+/// interpreted two subtly different ways depending on which version delivered it. The
+/// context fields are read strictly and the structure must be consumed exactly: a decrypted
+/// buffer whose trailing bytes happen to parse is a buffer that decrypted wrongly, and
+/// padding an attacker controls is not something to skip past.
+pub fn decode_scoped_pdu(bytes: &[u8]) -> Result<ScopedPdu, String> {
+    use crate::probes::snmp::Reader;
+
+    let mut outer = Reader::new(bytes);
+    let mut scoped = outer.expect(TAG_SEQUENCE, "the scoped PDU")?;
+    outer.finished("the scoped PDU")?;
+
+    let context_engine_id = scoped
+        .expect(TAG_OCTET_STRING, "contextEngineID")?
+        .rest()
+        .to_vec();
+    let context_name = scoped
+        .expect(TAG_OCTET_STRING, "contextName")?
+        .rest()
+        .to_vec();
+
+    let (pdu_type, mut pdu) = scoped.tlv("the PDU")?;
+    scoped.finished("the scoped PDU")?;
+    let pdu = crate::probes::snmp::decode_pdu_body(pdu_type, &mut pdu)?;
+
+    Ok(ScopedPdu {
+        context_engine_id,
+        context_name,
+        pdu,
+    })
+}
+
 /// One TLV read at an absolute offset, with its content located rather than copied.
 ///
 /// Offsets, not slices, because the digest has to be located in the buffer the datagram
