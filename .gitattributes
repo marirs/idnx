@@ -1,0 +1,10 @@
+# Line endings are content here, not formatting.
+#
+# The golden files are byte-for-byte snapshots of rendered output, and the renderer emits
+# LF. A Windows checkout with core.autocrlf=true rewrites them to CRLF, so the comparison
+# fails against output the code never produced -- and the diff reads as "848 lines versus
+# 848 lines", because nothing on any line differs.
+* text=auto eol=lf
+
+# Captured frames are bytes. Any end-of-line translation corrupts them silently.
+*.pcap binary

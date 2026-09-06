@@ -95,6 +95,10 @@ fn assert_golden(name: &str, rendered: &str) {
         return;
     }
 
+    // A checkout may have translated line endings whatever .gitattributes asks -- a
+    // contributor's global core.autocrlf, an archive download, an editor. The renderer emits
+    // LF, so the golden is compared as LF: the snapshot is about what the code produced, and
+    // a checkout artefact must not read as a change in the output.
     let expected = std::fs::read_to_string(&path).unwrap_or_else(|error| {
         panic!(
             "{}: {error}. Run UPDATE_GOLDENS=1 cargo test --test golden_outputs to create it.",
@@ -102,6 +106,7 @@ fn assert_golden(name: &str, rendered: &str) {
         )
     });
 
+    let expected = expected.replace("\r\n", "\n");
     if expected != normalised {
         // The first differing line, which is what a reviewer needs to see first.
         let mismatch = expected
@@ -111,10 +116,16 @@ fn assert_golden(name: &str, rendered: &str) {
             .find(|(_, (want, got))| want != got)
             .map(|(at, (want, got))| format!("line {}:\n  golden: {want}\n  now:    {got}", at + 1))
             .unwrap_or_else(|| {
+                // Equal line counts with no differing line means the bytes between the lines
+                // differ -- in practice a checkout that translated line endings.
                 format!(
-                    "length differs: golden has {} line(s), this run produced {}",
+                    "no line differs, but the bytes do: golden has {} line(s) and {} bytes, \
+                     this run produced {} line(s) and {} bytes. Equal counts here usually \
+                     mean line-ending translation in the checkout.",
                     expected.lines().count(),
-                    normalised.lines().count()
+                    expected.len(),
+                    normalised.lines().count(),
+                    normalised.len()
                 )
             });
         panic!(

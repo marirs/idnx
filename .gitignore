@@ -1,6 +1,9 @@
 target/
 .*
 !.gitignore
+# Tracked deliberately: it decides how every checkout materialises the golden files and
+# the packet fixtures, so a repository without it produces different bytes on Windows.
+!.gitattributes
 !.github/
 !.github/**
 data/
