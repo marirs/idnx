@@ -42,6 +42,14 @@ pub const OID_SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
 pub const OID_IP_NET_TO_MEDIA_TABLE: &str = "1.3.6.1.2.1.4.22.1"; // ARP table
 pub const OID_IP_ROUTE_TABLE: &str = "1.3.6.1.2.1.4.21.1"; // Route table
 /// `ipForwarding.0`: 1 means this device forwards, 2 means it does not.
+/// `inetCidrRouteEntry` (RFC 4292): the version-neutral routing table.
+///
+/// Not `1.3.6.1.2.1.4.24.4.1`, which is `ipCidrRouteEntry` -- the IPv4-only table RFC 4292
+/// deprecated. The two differ in more than their number: the deprecated one indexes by mask
+/// and describes no IPv6 route, and reading it would leave half of a dual-stack device's
+/// forwarding state unseen.
+pub const OID_INET_CIDR_ROUTE_TABLE: &str = "1.3.6.1.2.1.4.24.7.1";
+
 pub const OID_IP_FORWARDING: &str = "1.3.6.1.2.1.4.1.0";
 pub const OID_IP_ADDR_TABLE: &str = "1.3.6.1.2.1.4.20.1"; // Interface addresses
 
@@ -944,6 +952,19 @@ pub async fn harvest_snmp_device(
     .await
 }
 
+/// Everything one device disclosed, including what the public device model cannot carry.
+///
+/// `SnmpDeviceInfo` is public API and its routing rows are IPv4-and-mask shaped, which the
+/// version-neutral table is not. Rather than change a published struct -- which would break
+/// every caller that constructs one -- the modern rows travel beside it, and the crate's own
+/// providers read both.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SnmpHarvest {
+    pub device: SnmpDeviceInfo,
+    /// Rows from `inetCidrRouteTable`, in the order the walk returned them.
+    pub inet_routes: Vec<crate::probes::inet_route::InetRoute>,
+}
+
 /// One bounded walk's rows, with the reason it stopped discarded.
 ///
 /// The harvesters want the table; the reason a walk ended matters to the caller that is
@@ -1187,6 +1208,110 @@ pub(crate) async fn harvest_snmp_target(
     }
 
     Some(info)
+}
+
+/// Harvests a device and, independently, its version-neutral routing table.
+///
+/// The two walks are independent on purpose. An agent may implement either table, both, or
+/// neither: a device that answers MIB-II and not RFC 4292 must still contribute its legacy
+/// routes, and one that answers only the modern table must not be reported as having no
+/// routing state. Each table's completion is recorded under its own name.
+pub(crate) async fn harvest_snmp_harvest(
+    target: &SnmpTarget,
+    binding: &SocketBinding,
+    timeout: Duration,
+) -> Option<SnmpHarvest> {
+    let mut device = harvest_snmp_target(target, binding, timeout).await?;
+    let inet_routes = harvest_inet_routes(target, binding, timeout, &mut device).await;
+    Some(SnmpHarvest {
+        device,
+        inet_routes,
+    })
+}
+
+/// Walks `inetCidrRouteTable` and assembles its rows.
+///
+/// Every field that identifies a route is in the instance OID rather than in a value: RFC
+/// 4292 makes the six index objects not-accessible, so an agent returns only columns 7
+/// upward and the index is the only place the destination, prefix length, policy and next
+/// hop appear. A row whose index does not parse exactly is dropped rather than guessed at.
+async fn harvest_inet_routes(
+    target: &SnmpTarget,
+    binding: &SocketBinding,
+    timeout: Duration,
+    info: &mut SnmpDeviceInfo,
+) -> Vec<crate::probes::inet_route::InetRoute> {
+    use crate::probes::inet_route::{Column, InetRoute, RouteType, parse_index};
+
+    let Ok(root) = Oid::from_str(OID_INET_CIDR_ROUTE_TABLE) else {
+        return Vec::new();
+    };
+    let rows = walk_table(target, &root, binding, timeout, "inetCidrRouteTable", info).await;
+
+    // Keyed by the index subidentifiers, so two rows to one prefix -- a different next hop,
+    // a different policy -- stay two rows. Ordered, so the result does not depend on hashing.
+    let mut assembled: std::collections::BTreeMap<Vec<u32>, InetRoute> =
+        std::collections::BTreeMap::new();
+
+    for (oid, value) in rows {
+        // <table>.<column>.<index...>
+        let Some(column) = oid.0.get(root.0.len()).copied() else {
+            continue;
+        };
+        let index_subids = &oid.0[(root.0.len() + 1).min(oid.0.len())..];
+        let Some(index) = parse_index(index_subids) else {
+            continue;
+        };
+
+        let entry = assembled
+            .entry(index_subids.to_vec())
+            .or_insert_with(|| InetRoute {
+                index,
+                instance: oid.clone(),
+                if_index: None,
+                route_type: Column::Missing,
+                proto: None,
+                metric: None,
+                status: Column::Missing,
+            });
+
+        // The two columns that decide whether a row may be promoted are read strictly: a
+        // value of the wrong syntax, or outside the enumeration, is recorded as unreadable
+        // rather than dropped -- dropping it would leave the column looking merely absent,
+        // and absence takes a different path.
+        let number = match value {
+            BerValue::Integer(number) => Some(number),
+            _ => None,
+        };
+        match (column, number) {
+            (7, Some(number)) => entry.if_index = Some(number),
+            (9, Some(number)) => entry.proto = Some(number),
+            (12, Some(number)) => entry.metric = Some(number),
+            (8, Some(number)) => {
+                entry.route_type = match RouteType::from_value(number) {
+                    Some(kind) => Column::Valid(kind),
+                    None => Column::Invalid(format!("inetCidrRouteType {number}")),
+                };
+            }
+            (8, None) => {
+                entry.route_type = Column::Invalid("inetCidrRouteType was not an integer".into());
+            }
+            (17, Some(number)) => {
+                // RowStatus enumerates 1..=6; anything else is not one.
+                entry.status = if (1..=6).contains(&number) {
+                    Column::Valid(number)
+                } else {
+                    Column::Invalid(format!("inetCidrRouteStatus {number}"))
+                };
+            }
+            (17, None) => {
+                entry.status = Column::Invalid("inetCidrRouteStatus was not an integer".into());
+            }
+            _ => {}
+        }
+    }
+
+    assembled.into_values().collect()
 }
 
 // ---------------------------------------------------------------------------

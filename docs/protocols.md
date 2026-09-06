@@ -40,7 +40,65 @@ The **Status** column below is authoritative: ✅ means the OID is walked and it
 | `1.3.6.1.2.1.4.21.1.11` | `ipRouteMask` | ✅ | Subnet mask for the destination network |
 | `1.3.6.1.2.1.4.21.1.8` | `ipRouteType` | ✅ | Route type. `invalid(2)` creates nothing at all; `direct(3)` is attachment, `indirect(4)` is forwarding, and a row with no stated type keeps the weaker claim |
 | `1.3.6.1.2.1.4.1.0` | `ipForwarding` | ✅ | Whether the device forwards. Required — with usable routing rows — before the SNMP forwarding role signal is emitted |
-| `1.3.6.1.2.1.4.24.4.1` | `inetCidrRouteTable` | 📋 | Modern CIDR routing table (supports IPv4 & IPv6) |
+| `1.3.6.1.2.1.4.24.7.1` | `inetCidrRouteEntry` | ✅ | The version-neutral routing table (RFC 4292). IPv4 and IPv6, indexed by prefix length rather than mask |
+| `1.3.6.1.2.1.4.24.4.1` | `ipCidrRouteEntry` | ❌ | The IPv4-only table RFC 4292 deprecated. Not walked: it describes no IPv6 route, so on a dual-stack device it shows half the forwarding state |
+
+### 1.2a `inetCidrRouteTable` (RFC 4292)
+
+Every field identifying a route is in the instance OID, not in a value: RFC 4292 makes the
+six index objects not-accessible, so an agent returns only columns 7 upward and the index is
+the sole source of the destination, prefix length, policy and next hop. Reading that index
+wrongly does not fail loudly -- it produces a plausible route to a network nobody mentioned --
+so it is parsed exactly and refused where it does not account for every subidentifier.
+
+Index layout, each variable-length element preceded by its length (no `IMPLIED` element
+exists in this table): destination type, destination, prefix length, policy OID, next-hop
+type, next-hop address.
+
+Address encodings are RFC 4001, with the length fixed by the type: `ipv4(1)` 4 octets,
+`ipv6(2)` 16, `ipv4z(3)` 8 (address and a four-octet zone index), `ipv6z(4)` 20, `unknown(0)`
+zero. `dns(16)` is refused, since a name in a routing table cannot be resolved to a route.
+
+| Column | Name | Status | What it contributes |
+|---|---|---|---|
+| `.7` | `inetCidrRouteIfIndex` | ✅ | Retained in provenance |
+| `.8` | `inetCidrRouteType` | ✅ | Decides what the row may state, below |
+| `.9` | `inetCidrRouteProto` | ✅ | Retained in provenance |
+| `.12` | `inetCidrRouteMetric1` | ✅ | Retained in provenance |
+| `.17` | `inetCidrRouteStatus` | ✅ | An explicitly decoded `active(1)` is required before anything is promoted |
+
+What each `inetCidrRouteType` is allowed to establish:
+
+* `local(3)` -- attachment. The destination is on one of the device's own interfaces.
+* `remote(4)` -- a route, with a next hop this crate can identify.
+* `reject(2)` and `blackhole(5)` -- policy evidence only. Matching traffic is discarded, so
+  no network, no attachment and no route: the prefix may not exist anywhere.
+* `other(1)`, or no type returned -- a route with its directness unstated. It never claims
+  attachment.
+* A type outside the enumeration, or of the wrong syntax -- nothing. A value this code cannot
+  interpret is a statement it failed to read, not one the agent declined to make, so it does
+  not take the directness-unstated path.
+
+`remote(4)`, `other(1)` and an absent type promote a route **only** where the next hop is an
+address this crate can identify. A zoned, unknown or unspecified hop names nobody to relate
+the network to, so the network stands on its own and the hop stays in provenance.
+
+Absence is never consent. A walk over this table is column-major and bounded: a table larger
+than the step limit, or an agent that stops answering, returns earlier columns for many rows
+and the status column for none of them. Those rows are reported as rows whose status was not
+established, and create no network, no relationship and no role evidence -- which is what
+RowStatus is for.
+
+A zoned address (`ipv4z`/`ipv6z`) carries an interface index belonging to the polled device.
+This crate scopes an address by an interface name on the observing vantage, which is a
+different namespace, so a zoned next hop creates no node and a zoned destination names no
+network -- both are retained in the route's provenance instead.
+
+Answering this table is not by itself router evidence. As with `ipRouteTable`, the role
+signal needs `ipForwarding(1)` or a row that actually describes forwarding; a device's own
+connected networks are not that. The two tables are walked independently and their
+completion is reported separately, so an agent implementing one and not the other loses
+nothing and is not reported as having no routing state.
 
 ### 1.3 ARP / Neighbor Cache MIBs
 | OID | Name | Status | Description |

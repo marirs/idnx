@@ -381,23 +381,21 @@ impl DiscoveryProvider for SnmpProvider {
 
             let communities = Self::communities(context);
             let tried = communities.len();
-            let mut info = None;
+            let mut harvest = None;
             for community in communities {
-                if let Some(found) = crate::probes::snmp::harvest_snmp_device(
-                    target,
-                    161,
-                    &community,
+                if let Some(found) = crate::probes::snmp::harvest_snmp_harvest(
+                    &crate::probes::snmp::SnmpTarget::direct(target, 161, &community),
                     &context.binding,
                     context.timeout.max(Duration::from_millis(350)),
                 )
                 .await
                 {
-                    info = Some(found);
+                    harvest = Some(found);
                     break;
                 }
             }
 
-            let Some(info) = info else {
+            let Some(harvest) = harvest else {
                 // Community strings are never named in diagnostics: the notes reach exported
                 // reports, and a credential does not belong in one.
                 return ProviderOutput {
@@ -414,13 +412,16 @@ impl DiscoveryProvider for SnmpProvider {
             // contributes its validated rows, but the report must not let a truncated table
             // look like an exhaustive one -- absence of a row is otherwise read as absence
             // of the route or neighbour it would have described.
+            let info = &harvest.device;
             let mut notes = vec![format!("{target}:161 answered SNMP")];
+            // Each table's coverage under its own name: an agent implementing one and not
+            // the other must not have its silence about one read as the state of both.
             for (table, status) in &info.table_status {
                 notes.push(format!("{target}:161 {table}: {status}"));
             }
 
             ProviderOutput {
-                evidence: snmp_evidence(&info, target, vantage),
+                evidence: snmp_harvest_evidence(info, &harvest.inet_routes, target, vantage),
                 notes,
                 attempted: true,
                 reachability: Vec::new(),
@@ -901,6 +902,228 @@ fn describe_resolution(resolution: &crate::probes::arp::ArpResolution) -> String
     }
 }
 
+/// Turns the version-neutral routing table into evidence.
+///
+/// What each row is allowed to state, and nothing beyond it:
+///
+/// * `local(3)` -- the destination is on one of this device's own interfaces, so the row is
+///   attachment. No next hop is needed or expected.
+/// * `remote(4)` -- forwarded through a next hop, so the row is a route, and only where the
+///   next hop is an address this crate can identify.
+/// * `reject(2)` and `blackhole(5)` -- matching traffic is discarded. That is a real
+///   statement about the device's policy and none about topology: the prefix may not exist
+///   anywhere, so no network, no attachment and no route come from it.
+/// * `other(1)`, or no type at all -- a route with its directness unstated. It may name a
+///   network and a forwarding relationship where a next hop is given; it may never claim
+///   the device is attached to the prefix.
+///
+/// A zoned next hop (`ipv4z`/`ipv6z`) names an interface index on the polled device. This
+/// crate identifies a scoped address by an interface name on the *observing* vantage, which
+/// is a different namespace, so no node is created for one -- the address and its zone stay
+/// in the route's provenance where they can be read.
+fn inet_route_evidence(
+    routes: &[crate::probes::inet_route::InetRoute],
+    device: &DeviceKey,
+    vantage: &str,
+) -> Vec<TopologyEvidence> {
+    use crate::probes::inet_route::{Column, RouteType};
+
+    let mut out = Vec::new();
+    for route in routes {
+        let detail = route.describe();
+
+        // Nothing is promoted without an explicit active(1). A bounded or truncated walk
+        // over this table returns earlier columns for many rows and the status column for
+        // none of them, so treating absence as active would build topology out of rows the
+        // agent never finished describing. The row is still reported -- as a row whose
+        // status was not established.
+        if !route.active() {
+            out.push(
+                TopologyEvidence::new(
+                    Fact::DeviceDescription {
+                        device: device.clone(),
+                        text: format!(
+                            "routing row for {}/{} not promoted: {}",
+                            route.index.destination.describe(),
+                            route.index.prefix_len,
+                            match &route.status {
+                                Column::Valid(status) => format!("row status {status}"),
+                                other => other.describe("row status"),
+                            }
+                        ),
+                    },
+                    EvidenceSource::Snmp,
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(detail),
+            );
+            continue;
+        }
+
+        // A type this code could not read is a statement it failed to interpret, not one the
+        // agent declined to make. It creates nothing either way.
+        if let Column::Invalid(reason) = &route.route_type {
+            out.push(
+                TopologyEvidence::new(
+                    Fact::DeviceDescription {
+                        device: device.clone(),
+                        text: format!(
+                            "routing row for {}/{} not promoted: {reason}",
+                            route.index.destination.describe(),
+                            route.index.prefix_len
+                        ),
+                    },
+                    EvidenceSource::Snmp,
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(detail),
+            );
+            continue;
+        }
+
+        // Policy rows first: they are evidence about the device, and they must never reach
+        // the topology facts below.
+        if route.route_type.valid().is_some_and(|kind| kind.discards()) {
+            out.push(
+                TopologyEvidence::new(
+                    Fact::DeviceDescription {
+                        device: device.clone(),
+                        text: format!(
+                            "discards traffic to {}/{} ({})",
+                            route.index.destination.describe(),
+                            route.index.prefix_len,
+                            route
+                                .route_type
+                                .valid()
+                                .map(|kind| kind.label())
+                                .unwrap_or("unstated")
+                        ),
+                    },
+                    EvidenceSource::Snmp,
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(detail),
+            );
+            continue;
+        }
+
+        let Some(prefix) = route.index.prefix() else {
+            // A zoned or absent destination names no network reachable from here. The row
+            // is still recorded, as what the device said about itself.
+            out.push(
+                TopologyEvidence::new(
+                    Fact::DeviceDescription {
+                        device: device.clone(),
+                        text: format!(
+                            "routes to {} within its own scope",
+                            route.index.destination.describe()
+                        ),
+                    },
+                    EvidenceSource::Snmp,
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(detail),
+            );
+            continue;
+        };
+
+        // The same bounds the rest of this crate applies: a default route names no network
+        // to examine, and a host route is an address rather than a network.
+        if !usable_route_prefix(&prefix) {
+            continue;
+        }
+
+        out.push(
+            TopologyEvidence::new(
+                Fact::Network { prefix },
+                EvidenceSource::Snmp,
+                Confidence::Advertised,
+                vantage,
+            )
+            .with_detail(detail.clone()),
+        );
+
+        match route.route_type.valid() {
+            Some(RouteType::Local) => out.push(
+                TopologyEvidence::new(
+                    Fact::AttachedTo {
+                        device: device.clone(),
+                        network: prefix,
+                    },
+                    EvidenceSource::Snmp,
+                    Confidence::Advertised,
+                    vantage,
+                )
+                .with_detail(detail),
+            ),
+            // remote(4), other(1), or a type the agent did not return: a forwarding claim,
+            // and only where the next hop is one this crate can identify. A zoned, unknown
+            // or unspecified hop names nobody, and "routes toward this network through
+            // something unnameable" is not a relationship anything can use -- the row is
+            // still evidence, and stays in the network's provenance.
+            _ => {
+                if let Some(next_hop) = route.usable_next_hop() {
+                    out.push(
+                        TopologyEvidence::new(
+                            Fact::RoutesTo {
+                                device: device.clone(),
+                                network: prefix,
+                                next_hop: Some(next_hop),
+                            },
+                            EvidenceSource::Snmp,
+                            Confidence::Advertised,
+                            vantage,
+                        )
+                        .with_detail(detail),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a prefix from a routing table is a network this run examines.
+///
+/// Unchanged from the legacy path deliberately: a default route names everything and so
+/// names nothing to sweep, and a host route names one address rather than a network. This
+/// feature is not the place to revisit either.
+fn usable_route_prefix(prefix: &IpNet) -> bool {
+    let length = prefix.prefix_len();
+    match prefix {
+        IpNet::V4(_) => (1..=31).contains(&length),
+        IpNet::V6(_) => (1..=127).contains(&length),
+    }
+}
+
+/// Whether a modern row is evidence that the device forwards.
+///
+/// The same rule the legacy table gets: being *on* a network is not forwarding between
+/// networks, so a `local(3)` row contributes nothing here, and a row with no stated type
+/// counts only when it names a next hop.
+fn inet_route_implies_forwarding(route: &crate::probes::inet_route::InetRoute) -> bool {
+    use crate::probes::inet_route::{Column, RouteType};
+    if !route.active() {
+        return false;
+    }
+    match &route.route_type {
+        Column::Valid(RouteType::Remote) | Column::Valid(RouteType::Other) => {
+            route.usable_next_hop().is_some()
+        }
+        Column::Valid(RouteType::Local)
+        | Column::Valid(RouteType::Reject)
+        | Column::Valid(RouteType::Blackhole) => false,
+        // A type the agent did not return may still describe forwarding, but only with a
+        // next hop. A type this code could not read describes nothing.
+        Column::Missing => route.usable_next_hop().is_some(),
+        Column::Invalid(_) => false,
+    }
+}
+
 /// Turns one device's harvested MIB-II state into evidence.
 ///
 /// Separated from the provider so the whole path -- agent, walk, harvest, evidence, graph --
@@ -969,8 +1192,15 @@ fn promotable_route(entry: &crate::probes::snmp::SnmpRouteEntry) -> Option<Promo
     })
 }
 
-pub(crate) fn snmp_evidence(
+/// The version-neutral routing table alongside the MIB-II state.
+///
+/// One function rather than two, because the forwarding role is one decision: a device whose
+/// only routing evidence is in `inetCidrRouteTable` forwards exactly as much as one whose
+/// evidence is in `ipRouteTable`, and scoring them separately would make the role depend on
+/// which table an agent happens to implement.
+pub(crate) fn snmp_harvest_evidence(
     info: &crate::probes::snmp::SnmpDeviceInfo,
+    inet_routes: &[crate::probes::inet_route::InetRoute],
     target: std::net::Ipv4Addr,
     vantage: &str,
 ) -> Vec<TopologyEvidence> {
@@ -1001,20 +1231,32 @@ pub(crate) fn snmp_evidence(
     // malformed to place on the map can no longer make a device a router either. Direct
     // rows are excluded from the count on purpose: every host's table lists its own
     // connected networks, so counting those would restore exactly the defect above.
-    let forwarding_rows = info
+    let legacy_rows = info
         .routes
         .iter()
         .filter_map(promotable_route)
         .filter(|route| route.implies_forwarding())
         .count();
+    let modern_rows = inet_routes
+        .iter()
+        .filter(|route| inet_route_implies_forwarding(route))
+        .count();
+    let forwarding_rows = legacy_rows + modern_rows;
+    // Named by where the rows actually came from. Attributing a modern row to ipRouteTable
+    // would send an operator to a table that never mentioned it.
+    let rows_from = match (legacy_rows, modern_rows) {
+        (legacy, 0) => format!("{legacy} forwarding route(s) from ipRouteTable"),
+        (0, modern) => format!("{modern} forwarding route(s) from inetCidrRouteTable"),
+        (legacy, modern) => format!(
+            "{} forwarding route(s) across SNMP routing tables ({legacy} from ipRouteTable, \
+             {modern} from inetCidrRouteTable)",
+            legacy + modern
+        ),
+    };
     let forwarding_basis = match (info.forwarding, forwarding_rows) {
         (Some(true), 0) => Some("reports ipForwarding(1)".to_string()),
-        (Some(true), rows) => Some(format!(
-            "reports ipForwarding(1) and {rows} forwarding route(s)"
-        )),
-        (_, rows) if rows > 0 => Some(format!(
-            "returned {rows} forwarding route(s) from ipRouteTable"
-        )),
+        (Some(true), _) => Some(format!("reports ipForwarding(1) and {rows_from}")),
+        (_, rows) if rows > 0 => Some(format!("returned {rows_from}")),
         _ => None,
     };
     if let Some(basis) = forwarding_basis {
@@ -1145,6 +1387,8 @@ pub(crate) fn snmp_evidence(
             ),
         }
     }
+
+    out.extend(inet_route_evidence(inet_routes, &device, vantage));
 
     // The router's ARP cache lists devices that answered it even if they answer
     // nothing of ours.
@@ -2214,7 +2458,7 @@ mod tests {
         assert_eq!(info.routes.len(), 1, "{:?}", info.routes);
         assert_eq!(info.arp_cache.len(), 1, "{:?}", info.arp_cache);
 
-        let evidence = snmp_evidence(&info, device, "test0");
+        let evidence = snmp_harvest_evidence(&info, &[], device, "test0");
         let mut graph = TopologyGraph::new();
         for item in evidence {
             graph.absorb(item);
@@ -2480,7 +2724,7 @@ mod tests {
     fn graph_of(info: &crate::probes::snmp::SnmpDeviceInfo) -> crate::topology::TopologyGraph {
         let device = info.device.expect("the fixtures all name their device");
         let mut graph = crate::topology::TopologyGraph::new();
-        for item in snmp_evidence(info, device, "test0") {
+        for item in snmp_harvest_evidence(info, &[], device, "test0") {
             graph.absorb(item);
         }
         graph.finalize_roles();
@@ -2493,6 +2737,829 @@ mod tests {
             .into_iter()
             .map(|net| net.prefix.to_string())
             .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // inetCidrRouteTable (RFC 4292), against the scripted agent.
+    // -----------------------------------------------------------------------
+
+    /// The instance OID of one column of one row: table, column, then the composite index.
+    fn inet_instance(column: u32, index: &[u32]) -> String {
+        let mut parts = vec!["1.3.6.1.2.1.4.24.7.1".to_string(), column.to_string()];
+        parts.extend(index.iter().map(|subid| subid.to_string()));
+        parts.join(".")
+    }
+
+    /// Index subidentifiers, encoded as an agent encodes them.
+    fn inet_index(
+        dest_type: u32,
+        dest: &[u32],
+        prefix_len: u32,
+        policy: &[u32],
+        hop_type: u32,
+        hop: &[u32],
+    ) -> Vec<u32> {
+        let mut out = vec![dest_type, dest.len() as u32];
+        out.extend_from_slice(dest);
+        out.push(prefix_len);
+        out.push(policy.len() as u32);
+        out.extend_from_slice(policy);
+        out.push(hop_type);
+        out.push(hop.len() as u32);
+        out.extend_from_slice(hop);
+        out
+    }
+
+    fn v6_octets(address: &str) -> Vec<u32> {
+        let parsed: std::net::Ipv6Addr = address.parse().expect("a literal address");
+        parsed.octets().iter().map(|byte| *byte as u32).collect()
+    }
+
+    /// Harvests a scripted agent, including the modern routing table.
+    ///
+    /// The script's first four replies are the fixed opening of every harvest: sysDescr,
+    /// sysName, ipForwarding, then the three legacy tables ending immediately.
+    fn harvest_with_inet_rows(
+        forwarding: i64,
+        legacy_route_rows: Vec<crate::probes::snmp::fake_agent::Reply>,
+        inet_rows: Vec<(u32, Vec<u32>, i64)>,
+    ) -> crate::probes::snmp::SnmpHarvest {
+        use crate::probes::snmp::fake_agent::{FakeAgent, Reply};
+        use crate::probes::snmp::{BerValue, Oid, harvest_snmp_harvest};
+        use std::str::FromStr;
+
+        let oid = |text: &str| Oid::from_str(text).expect("a literal OID");
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+
+        let mut script = vec![
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.1.1.0"),
+                BerValue::OctetString(b"Synthetic dual-stack router, fixture only".to_vec()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.1.5.0"),
+                BerValue::OctetString(b"fixture-border".to_vec()),
+            ),
+            Reply::Varbind(oid("1.3.6.1.2.1.4.1.0"), BerValue::Integer(forwarding)),
+            // ipNetToMediaTable: empty.
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.23")),
+        ];
+        // ipRouteTable, then ipAddrTable.
+        script.extend(legacy_route_rows);
+        script.push(Reply::EndOfMibView(oid("1.3.6.1.2.1.4.21.2")));
+        script.push(Reply::EndOfMibView(oid("1.3.6.1.2.1.4.20.2")));
+
+        for (column, index, value) in inet_rows {
+            script.push(Reply::Varbind(
+                oid(&inet_instance(column, &index)),
+                BerValue::Integer(value),
+            ));
+        }
+        script.push(Reply::EndOfMibView(oid("1.3.6.1.2.1.4.24.7.2")));
+
+        let agent = FakeAgent::start("fixture-community", script);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(harvest_snmp_harvest(
+                &agent.target_for(device, "fixture-community"),
+                &crate::net::socket::SocketBinding::unbound(),
+                Duration::from_millis(400),
+            ))
+            .expect("the agent answered sysDescr")
+    }
+
+    fn graph_from(harvest: &crate::probes::snmp::SnmpHarvest) -> crate::topology::TopologyGraph {
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let mut graph = crate::topology::TopologyGraph::new();
+        for item in snmp_harvest_evidence(&harvest.device, &harvest.inet_routes, device, "test0") {
+            graph.absorb(item);
+        }
+        graph.finalize_roles();
+        graph
+    }
+
+    fn prefixes(graph: &crate::topology::TopologyGraph) -> Vec<String> {
+        graph
+            .network_refs()
+            .into_iter()
+            .map(|reference| reference.prefix.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_modern_table_carries_ipv4_and_ipv6_local_and_remote_routes() {
+        // The whole reason for RFC 4292: a dual-stack device's forwarding state cannot be
+        // read from ipRouteTable, which has no way to express an IPv6 route at all.
+        let attached = inet_index(1, &[192, 0, 2, 0], 24, &[0], 0, &[]);
+        let routed = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+        let v6_attached = inet_index(2, &v6_octets("2001:db8::"), 64, &[0], 0, &[]);
+        let v6_routed = inet_index(
+            2,
+            &v6_octets("2001:db8:1::"),
+            48,
+            &[0],
+            2,
+            &v6_octets("2001:db8::1"),
+        );
+
+        let harvest = harvest_with_inet_rows(
+            2, // not forwarding, so the role can only come from the routes themselves
+            Vec::new(),
+            vec![
+                // ifIndex, then type, then status: column-major, as a walk returns them.
+                (7, attached.clone(), 1),
+                (7, routed.clone(), 2),
+                (7, v6_attached.clone(), 1),
+                (7, v6_routed.clone(), 2),
+                (8, attached.clone(), 3), // local
+                (8, routed.clone(), 4),   // remote
+                (8, v6_attached.clone(), 3),
+                (8, v6_routed.clone(), 4),
+                (17, attached, 1),
+                (17, routed, 1),
+                (17, v6_attached, 1),
+                (17, v6_routed, 1),
+            ],
+        );
+
+        assert_eq!(harvest.inet_routes.len(), 4, "{:?}", harvest.inet_routes);
+        let graph = graph_from(&harvest);
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+
+        for prefix in [
+            "192.0.2.0/24",
+            "198.51.100.0/24",
+            "2001:db8::/64",
+            "2001:db8:1::/48",
+        ] {
+            assert!(
+                prefixes(&graph).contains(&prefix.to_string()),
+                "{prefix} is missing: {:?}",
+                prefixes(&graph)
+            );
+        }
+
+        // local(3) is attachment; remote(4) is forwarding. Both families, same rule.
+        let related = |relationship: crate::topology::graph::Relationship, prefix: &str| {
+            let wanted: IpNet = prefix.parse().expect("a literal prefix");
+            graph.edges().any(|edge| {
+                edge.relationship == relationship
+                    && matches!(&edge.to, crate::topology::NodeId::Network(net, _) if *net == wanted)
+            })
+        };
+        use crate::topology::graph::Relationship;
+        assert!(related(Relationship::AttachedTo, "192.0.2.0/24"));
+        assert!(related(Relationship::AttachedTo, "2001:db8::/64"));
+        assert!(related(Relationship::RoutesTo, "198.51.100.0/24"));
+        assert!(related(Relationship::RoutesTo, "2001:db8:1::/48"));
+        assert!(!related(Relationship::AttachedTo, "198.51.100.0/24"));
+
+        // And a device that says it does not forward is still a router by its own routes.
+        assert!(
+            graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&IpAddr::V4(device))),
+            "two remote rows with next hops are forwarding evidence"
+        );
+    }
+
+    #[test]
+    fn rows_differing_only_in_policy_or_next_hop_both_survive() {
+        // Multipath. Two next hops to one prefix is two routes, and a table indexed by the
+        // whole tuple says so; collapsing them would report one path where two exist.
+        let first = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[192, 0, 2, 1]);
+        let second = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[192, 0, 2, 2]);
+        // The same prefix and next hop again, under a different policy.
+        let policy = inet_index(
+            1,
+            &[198, 51, 100, 0],
+            24,
+            &[1, 3, 6, 1, 4, 1, 9],
+            1,
+            &[192, 0, 2, 1],
+        );
+
+        let harvest = harvest_with_inet_rows(
+            1,
+            Vec::new(),
+            vec![
+                (8, first.clone(), 4),
+                (8, second.clone(), 4),
+                (8, policy.clone(), 4),
+                (17, first, 1),
+                (17, second, 1),
+                (17, policy, 1),
+            ],
+        );
+
+        assert_eq!(
+            harvest.inet_routes.len(),
+            3,
+            "three distinct rows: {:?}",
+            harvest.inet_routes
+        );
+        let hops: std::collections::BTreeSet<String> = harvest
+            .inet_routes
+            .iter()
+            .filter_map(|route| route.usable_next_hop().map(|hop| hop.to_string()))
+            .collect();
+        assert_eq!(hops.len(), 2, "both next hops survive: {hops:?}");
+    }
+
+    #[test]
+    fn discarding_inactive_and_zoned_rows_create_no_topology() {
+        let rejected = inet_index(1, &[198, 18, 0, 0], 24, &[0], 0, &[]);
+        let blackholed = inet_index(1, &[198, 18, 1, 0], 24, &[0], 0, &[]);
+        let inactive = inet_index(1, &[198, 18, 2, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+        // A destination inside one interface's own scope, with no next hop: the device is
+        // describing its own plumbing, and nothing about it is reachable from here.
+        let zoned = inet_index(3, &[10, 0, 0, 0, 0, 0, 0, 7], 8, &[0], 0, &[]);
+
+        let harvest = harvest_with_inet_rows(
+            2,
+            Vec::new(),
+            vec![
+                (8, rejected.clone(), 2),   // reject
+                (8, blackholed.clone(), 5), // blackhole
+                (8, inactive.clone(), 4),
+                (8, zoned.clone(), 3),
+                (17, rejected, 1),
+                (17, blackholed, 1),
+                (17, inactive, 2), // notInService
+                (17, zoned, 1),
+            ],
+        );
+
+        let graph = graph_from(&harvest);
+        assert!(
+            prefixes(&graph).is_empty(),
+            "none of these name a network: {:?}",
+            prefixes(&graph)
+        );
+        assert!(
+            !graph.edges().any(|edge| matches!(
+                edge.relationship,
+                crate::topology::graph::Relationship::RoutesTo
+                    | crate::topology::graph::Relationship::AttachedTo
+            )),
+            "and none of them attaches or routes"
+        );
+
+        // A discarding row is still recorded, as policy.
+        let device = graph
+            .nodes()
+            .find(|node| node.addresses.contains(&"192.0.2.1".parse().unwrap()))
+            .expect("the polled device is on the graph");
+        assert!(
+            device
+                .descriptions
+                .iter()
+                .any(|text| text.contains("discards")),
+            "reject and blackhole are described: {:?}",
+            device.descriptions
+        );
+
+        // A device whose only rows discard traffic, wait to be activated, or describe its
+        // own scope is not forwarding anything anyone can observe.
+        assert!(
+            !graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&"192.0.2.1".parse().unwrap())),
+            "discarding traffic is not forwarding it"
+        );
+    }
+
+    #[test]
+    fn an_agent_without_the_modern_table_still_reports_its_legacy_routes() {
+        // The two walks are independent. An agent that ends the modern table immediately --
+        // or does not implement it -- must not lose the legacy rows, and the reverse must
+        // hold as well.
+        use crate::probes::snmp::fake_agent::Reply;
+        use crate::probes::snmp::{BerValue, Oid};
+        use std::str::FromStr;
+
+        let oid = |text: &str| Oid::from_str(text).expect("a literal OID");
+        let legacy = vec![
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.1.203.0.113.0"),
+                BerValue::IpAddress("203.0.113.0".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.7.203.0.113.0"),
+                BerValue::IpAddress("192.0.2.254".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.8.203.0.113.0"),
+                BerValue::Integer(4),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.11.203.0.113.0"),
+                BerValue::IpAddress("255.255.255.0".parse().unwrap()),
+            ),
+        ];
+
+        let harvest = harvest_with_inet_rows(2, legacy, Vec::new());
+        assert!(harvest.inet_routes.is_empty(), "the modern table was empty");
+        assert_eq!(harvest.device.routes.len(), 1, "the legacy row survives");
+
+        let graph = graph_from(&harvest);
+        assert!(
+            prefixes(&graph).contains(&"203.0.113.0/24".to_string()),
+            "{:?}",
+            prefixes(&graph)
+        );
+
+        // Each table's coverage is reported under its own name.
+        let tables: Vec<&str> = harvest
+            .device
+            .table_status
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(tables.contains(&"ipRouteTable"));
+        assert!(tables.contains(&"inetCidrRouteTable"));
+    }
+
+    #[test]
+    fn the_same_route_in_both_tables_is_one_relationship() {
+        // A dual-stack agent commonly implements both tables and lists the same IPv4 route
+        // in each. That is one route observed twice, not two routes.
+        use crate::probes::snmp::fake_agent::Reply;
+        use crate::probes::snmp::{BerValue, Oid};
+        use std::str::FromStr;
+
+        let oid = |text: &str| Oid::from_str(text).expect("a literal OID");
+        let legacy = vec![
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.1.198.51.100.0"),
+                BerValue::IpAddress("198.51.100.0".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.7.198.51.100.0"),
+                BerValue::IpAddress("192.0.2.254".parse().unwrap()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.8.198.51.100.0"),
+                BerValue::Integer(4),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.4.21.1.11.198.51.100.0"),
+                BerValue::IpAddress("255.255.255.0".parse().unwrap()),
+            ),
+        ];
+        let modern = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+
+        let harvest =
+            harvest_with_inet_rows(1, legacy, vec![(8, modern.clone(), 4), (17, modern, 1)]);
+        let graph = graph_from(&harvest);
+
+        assert_eq!(
+            prefixes(&graph)
+                .iter()
+                .filter(|prefix| *prefix == "198.51.100.0/24")
+                .count(),
+            1,
+            "one network node: {:?}",
+            prefixes(&graph)
+        );
+        let routes: Vec<_> = graph
+            .edges()
+            .filter(|edge| {
+                edge.relationship == crate::topology::graph::Relationship::RoutesTo
+                    && matches!(&edge.to, crate::topology::NodeId::Network(net, _)
+                        if net.to_string() == "198.51.100.0/24")
+            })
+            .collect();
+        assert_eq!(routes.len(), 1, "one relationship: {routes:?}");
+        assert!(
+            routes[0].provenance.len() >= 2,
+            "observed twice, and both observations are kept: {:?}",
+            routes[0].provenance
+        );
+    }
+
+    #[test]
+    fn a_zoned_next_hop_keeps_its_zone_in_provenance_and_creates_no_node() {
+        // The zone is an interface index on the polled device. This crate scopes an address
+        // by an interface name on the observing vantage, which is a different namespace, so
+        // the hop is recorded rather than resolved.
+        let routed = inet_index(1, &[198, 51, 100, 0], 24, &[0], 4, &{
+            let mut hop = v6_octets("fe80::1");
+            hop.extend_from_slice(&[0, 0, 0, 9]);
+            hop
+        });
+
+        let harvest =
+            harvest_with_inet_rows(1, Vec::new(), vec![(8, routed.clone(), 4), (17, routed, 1)]);
+        assert_eq!(harvest.inet_routes.len(), 1);
+        assert!(
+            harvest.inet_routes[0].usable_next_hop().is_none(),
+            "a zoned hop is not an identity"
+        );
+
+        let graph = graph_from(&harvest);
+        assert!(
+            prefixes(&graph).contains(&"198.51.100.0/24".to_string()),
+            "the destination is still a network: {:?}",
+            prefixes(&graph)
+        );
+        assert!(
+            !graph
+                .nodes()
+                .any(|node| node.addresses.contains(&"fe80::1".parse().unwrap())),
+            "and the hop creates no device"
+        );
+        // No relationship, because there is nobody to relate to: a zoned hop names an
+        // interface index on the polled device, not an address anything here can resolve.
+        assert!(
+            !graph
+                .edges()
+                .any(|edge| edge.relationship == crate::topology::graph::Relationship::RoutesTo),
+            "an unidentifiable next hop is not a forwarding relationship"
+        );
+
+        // The row is still evidence, on the network it named.
+        let carried = graph
+            .nodes()
+            .flat_map(|node| node.provenance.iter())
+            .filter_map(|p| p.detail.clone())
+            .any(|detail| detail.contains("fe80::1 zone 9"));
+        assert!(carried, "the address and its zone are kept in provenance");
+    }
+
+    #[test]
+    fn a_walk_that_stops_before_the_status_column_promotes_nothing() {
+        // The defect this closes. A walk over this table is column-major: every row's
+        // ifIndex, then every row's type, and only later every row's status. A table larger
+        // than the step limit -- or an agent that stops answering -- therefore ends with rows
+        // that look complete except for the one column that says whether they are in force.
+        // Reading that absence as active manufactured topology from an unfinished walk.
+        let routed = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+        let attached = inet_index(1, &[192, 0, 2, 0], 24, &[0], 0, &[]);
+
+        let harvest = harvest_with_inet_rows(
+            2,
+            Vec::new(),
+            vec![
+                // Ascending within each column, as a walk returns them: 192.0.2.0 before
+                // 198.51.100.0.
+                (7, attached.clone(), 1),
+                (7, routed.clone(), 1),
+                (8, attached, 3),
+                (8, routed, 4),
+                // and the walk ends here, before column 17.
+            ],
+        );
+
+        assert_eq!(harvest.inet_routes.len(), 2, "both rows were read");
+        assert!(
+            harvest.inet_routes.iter().all(|route| !route.active()),
+            "neither row is in force: {:?}",
+            harvest.inet_routes
+        );
+
+        let graph = graph_from(&harvest);
+        assert!(
+            prefixes(&graph).is_empty(),
+            "an unfinished row names no network: {:?}",
+            prefixes(&graph)
+        );
+        assert!(
+            !graph.edges().any(|edge| matches!(
+                edge.relationship,
+                crate::topology::graph::Relationship::RoutesTo
+                    | crate::topology::graph::Relationship::AttachedTo
+            )),
+            "and creates no relationship"
+        );
+        assert!(
+            !graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&"192.0.2.1".parse().unwrap())),
+            "and contributes nothing to the forwarding role"
+        );
+
+        // It is still reported, as exactly what it is.
+        let device = graph
+            .nodes()
+            .find(|node| node.addresses.contains(&"192.0.2.1".parse().unwrap()))
+            .expect("the polled device is on the graph");
+        assert!(
+            device
+                .descriptions
+                .iter()
+                .any(|text| text.contains("not promoted") && text.contains("row status")),
+            "{:?}",
+            device.descriptions
+        );
+    }
+
+    #[test]
+    fn a_status_of_the_wrong_syntax_promotes_nothing() {
+        // An agent answering the status column with something that is not an integer has not
+        // said the row is active. Dropping the value would leave the column looking merely
+        // absent; it is recorded as unreadable instead, and neither state promotes.
+        use crate::probes::snmp::BerValue;
+        use crate::probes::snmp::fake_agent::Reply;
+        use crate::probes::snmp::{Oid, harvest_snmp_harvest};
+        use std::str::FromStr;
+
+        let oid = |text: &str| Oid::from_str(text).expect("a literal OID");
+        let routed = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+
+        let mut script = vec![
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.1.1.0"),
+                BerValue::OctetString(b"Synthetic router, fixture only".to_vec()),
+            ),
+            Reply::Varbind(
+                oid("1.3.6.1.2.1.1.5.0"),
+                BerValue::OctetString(b"fixture-border".to_vec()),
+            ),
+            Reply::Varbind(oid("1.3.6.1.2.1.4.1.0"), BerValue::Integer(2)),
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.23")),
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.21.2")),
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.20.2")),
+            Reply::Varbind(oid(&inet_instance(8, &routed)), BerValue::Integer(4)),
+            // A RowStatus that is not an integer at all.
+            Reply::Varbind(
+                oid(&inet_instance(17, &routed)),
+                BerValue::OctetString(b"active".to_vec()),
+            ),
+            Reply::EndOfMibView(oid("1.3.6.1.2.1.4.24.7.2")),
+        ];
+        script.push(Reply::EndOfMibView(oid("1.3.6.1.2.1.4.24.7.2")));
+
+        let agent = crate::probes::snmp::fake_agent::FakeAgent::start("fixture-community", script);
+        let harvest = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(harvest_snmp_harvest(
+                &agent.target_for(device, "fixture-community"),
+                &crate::net::socket::SocketBinding::unbound(),
+                Duration::from_millis(400),
+            ))
+            .expect("the agent answered sysDescr");
+
+        assert_eq!(harvest.inet_routes.len(), 1);
+        assert!(!harvest.inet_routes[0].active());
+        assert!(
+            harvest.inet_routes[0].describe().contains("unreadable"),
+            "the row says why it could not be read: {}",
+            harvest.inet_routes[0].describe()
+        );
+        assert!(prefixes(&graph_from(&harvest)).is_empty());
+    }
+
+    #[test]
+    fn a_route_type_outside_the_enumeration_promotes_nothing() {
+        // A value this code cannot interpret is a statement it failed to read, not one the
+        // agent declined to make -- so it must not take the directness-unstated path, which
+        // exists for a column that genuinely was not returned.
+        let routed = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+        let harvest =
+            harvest_with_inet_rows(2, Vec::new(), vec![(8, routed.clone(), 9), (17, routed, 1)]);
+
+        assert!(harvest.inet_routes[0].active(), "the row is in force");
+        let graph = graph_from(&harvest);
+        assert!(
+            prefixes(&graph).is_empty(),
+            "an unreadable type names no network: {:?}",
+            prefixes(&graph)
+        );
+        assert!(
+            !graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&"192.0.2.1".parse().unwrap())),
+            "and is not forwarding evidence"
+        );
+
+        // A row whose type was genuinely absent, with a next hop, still takes the weaker
+        // path -- the two states are not the same and are not treated the same.
+        let unstated = inet_index(1, &[203, 0, 113, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+        let harvest = harvest_with_inet_rows(2, Vec::new(), vec![(17, unstated, 1)]);
+        let graph = graph_from(&harvest);
+        assert!(
+            prefixes(&graph).contains(&"203.0.113.0/24".to_string()),
+            "{:?}",
+            prefixes(&graph)
+        );
+    }
+
+    #[test]
+    fn a_forwarding_row_without_an_identifiable_next_hop_creates_no_route() {
+        // "Routes toward this network through something unnameable" is not a relationship
+        // anything can use. The network stays, because the row named it; the relationship
+        // does not, because the row named nobody to relate it to.
+        // In ascending index order: 198.18.0.0, then 198.51.100.0, then 203.0.113.0.
+        let zoned_hop = inet_index(
+            1,
+            &[198, 18, 0, 0],
+            24,
+            &[0],
+            3,
+            &[192, 0, 2, 254, 0, 0, 0, 4],
+        );
+        let unspecified = inet_index(1, &[198, 51, 100, 0], 24, &[0], 1, &[0, 0, 0, 0]);
+        let unknown_hop = inet_index(1, &[203, 0, 113, 0], 24, &[0], 0, &[]);
+
+        let harvest = harvest_with_inet_rows(
+            2,
+            Vec::new(),
+            vec![
+                (8, zoned_hop.clone(), 1), // other(1), also a forwarding claim
+                (8, unspecified.clone(), 4),
+                (8, unknown_hop.clone(), 4),
+                (17, zoned_hop, 1),
+                (17, unspecified, 1),
+                (17, unknown_hop, 1),
+            ],
+        );
+
+        let graph = graph_from(&harvest);
+        assert_eq!(
+            prefixes(&graph).len(),
+            3,
+            "each row named its network: {:?}",
+            prefixes(&graph)
+        );
+        assert!(
+            !graph
+                .edges()
+                .any(|edge| edge.relationship == crate::topology::graph::Relationship::RoutesTo),
+            "and none of them named a next hop that can be identified"
+        );
+        assert!(
+            !graph
+                .devices_in(crate::topology::graph::DeviceCategory::Router)
+                .iter()
+                .any(|node| node.addresses.contains(&"192.0.2.1".parse().unwrap())),
+            "nor is any of them forwarding evidence"
+        );
+    }
+
+    #[test]
+    fn a_prefix_from_the_modern_table_moves_the_engine_s_frontier() {
+        // The point of reading the table at all: a network disclosed only by RFC 4292 must
+        // enter the work queue and receive the same scope pass as one from any other source.
+        // Run through the real engine, not by inspecting the graph.
+        use crate::engine::orchestrator::DiscoveryEngine;
+        use crate::providers::{DiscoveryProvider, ProviderFuture, ProviderOutput};
+
+        let routed = inet_index(1, &[203, 0, 113, 0], 24, &[0], 1, &[192, 0, 2, 254]);
+        let harvest =
+            harvest_with_inet_rows(1, Vec::new(), vec![(8, routed.clone(), 4), (17, routed, 1)]);
+        let device: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let evidence =
+            snmp_harvest_evidence(&harvest.device, &harvest.inet_routes, device, "test0");
+        assert!(
+            evidence
+                .iter()
+                .any(|item| matches!(&item.fact, Fact::Network { prefix }
+                    if prefix.to_string() == "203.0.113.0/24")),
+            "the harvest named the network: {evidence:?}"
+        );
+
+        /// Hands the engine one harvest's worth of evidence on the seed pass.
+        struct Harvested(std::sync::Mutex<Vec<TopologyEvidence>>);
+        impl DiscoveryProvider for Harvested {
+            fn name(&self) -> &'static str {
+                "harvested-snmp"
+            }
+            fn applies(&self, context: &DiscoveryContext) -> bool {
+                context.scope.is_none() && context.target.is_none()
+            }
+            fn discover<'a>(&'a self, _context: &'a DiscoveryContext) -> ProviderFuture<'a> {
+                Box::pin(async move {
+                    ProviderOutput {
+                        evidence: std::mem::take(&mut *self.0.lock().expect("the evidence")),
+                        notes: vec!["scripted SNMP harvest".to_string()],
+                        attempted: true,
+                        reachability: Vec::new(),
+                    }
+                })
+            }
+        }
+
+        let engine = DiscoveryEngine::new(
+            vec![Box::new(Harvested(std::sync::Mutex::new(evidence)))],
+            Vec::new(),
+        );
+        let report = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(engine.run(ctx(VantageKind::Wired, false), None));
+
+        let examined: Vec<String> = report
+            .scope_runs
+            .iter()
+            .filter_map(|run| run.scope.map(|scope| scope.to_string()))
+            .collect();
+        assert!(
+            examined.contains(&"203.0.113.0/24".to_string()),
+            "the disclosed prefix entered the frontier and was examined: {examined:?}"
+        );
+        assert_eq!(
+            examined
+                .iter()
+                .filter(|scope| *scope == "203.0.113.0/24")
+                .count(),
+            1,
+            "once"
+        );
+        assert!(report.converged);
+    }
+
+    #[test]
+    fn exports_keep_the_address_family_the_policy_and_the_provenance() {
+        // The export schema does not change for this feature: an IPv6 route is a network and
+        // a relationship like any other, and everything the table stated travels in the
+        // evidence detail rather than in new fields.
+        let routed = inet_index(
+            2,
+            &v6_octets("2001:db8:1::"),
+            48,
+            &[1, 3, 6, 1, 4, 1, 9],
+            2,
+            &v6_octets("2001:db8::1"),
+        );
+        let harvest = harvest_with_inet_rows(
+            1,
+            Vec::new(),
+            vec![
+                (8, routed.clone(), 4),
+                (9, routed.clone(), 13),
+                (17, routed, 1),
+            ],
+        );
+        let graph = graph_from(&harvest);
+
+        let report = crate::engine::orchestrator::DiscoveryReport {
+            graph,
+            scope_runs: Vec::new(),
+            pivot_runs: Vec::new(),
+            coverage: Vec::new(),
+            enrichment_elapsed: Duration::ZERO,
+            enrichment_sequential_equivalent: Duration::ZERO,
+            probes_attempted: 0,
+            network_reachability: Default::default(),
+            visibility: crate::engine::orchestrator::VisibilityReport {
+                vantage: crate::providers::Vantage {
+                    interface: "test0".to_string(),
+                    kind: VantageKind::Wired,
+                    index: 0,
+                    capture_available: false,
+                },
+                blind_to: Vec::new(),
+                unavailable: Vec::new(),
+                binding_mode: crate::net::socket::BindingMode::Unbound,
+                observed_frames: None,
+                accepted_facts: None,
+                routing_updates: None,
+                control_plane: None,
+            },
+            oversized_scopes: Vec::new(),
+            converged: true,
+        };
+
+        let data = crate::output::export::build_export(&report);
+        let json = serde_json::to_string_pretty(&data).expect("the export serialises");
+
+        assert!(
+            json.contains("2001:db8:1::/48"),
+            "the IPv6 prefix is exported"
+        );
+        assert!(
+            json.contains("policy 1.3.6.1.4.1.9"),
+            "the policy that produced the row travels with it"
+        );
+        assert!(
+            json.contains("proto 13"),
+            "and so does the protocol that installed it"
+        );
+        assert!(
+            json.contains("instance 1.3.6.1.2.1.4.24.7.1"),
+            "with the exact object the claim came from"
+        );
+
+        // The schema is unchanged: the same type still reads it back.
+        let parsed: crate::output::export::TopologyExport =
+            serde_json::from_str(&json).expect("the export round-trips");
+        assert!(
+            parsed
+                .networks
+                .iter()
+                .any(|network| network.cidr == "2001:db8:1::/48")
+        );
     }
 
     #[test]
@@ -2883,7 +3950,7 @@ mod tests {
         assert_eq!(info.local_ips.len(), 2, "{:?}", info.local_ips);
         assert_eq!(info.routes.len(), 4, "{:?}", info.routes);
 
-        let evidence = snmp_evidence(&info, device, "test0");
+        let evidence = snmp_harvest_evidence(&info, &[], device, "test0");
         assert!(
             !evidence
                 .iter()
@@ -2990,7 +4057,7 @@ mod tests {
             },
         ];
 
-        let evidence = snmp_evidence(&info, device, "test0");
+        let evidence = snmp_harvest_evidence(&info, &[], device, "test0");
         assert!(
             !evidence.iter().any(|item| matches!(
                 item.fact,
@@ -3017,7 +4084,7 @@ mod tests {
             route_type: Some(3), // direct
         }];
 
-        let evidence = snmp_evidence(&info, device, "test0");
+        let evidence = snmp_harvest_evidence(&info, &[], device, "test0");
         assert!(
             !evidence.iter().any(|item| matches!(
                 item.fact,

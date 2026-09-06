@@ -45,7 +45,7 @@ This document outlines the milestones and release goals for the **idNX** project
   guess list, and no community is ever named in a diagnostic or an export.
 - [x] Interface IP Table (`ipAddrTable`) walking for multi-homed VLAN detection.
 - [x] Routing Table (`ipRouteTable`, OID `1.3.6.1.2.1.4.21.1`) extraction to uncover remote subnets.
-- [ ] `inetCidrRouteTable` (OID `1.3.6.1.2.1.4.24.4.1`) — the modern CIDR/IPv6 routing table. Not implemented; only the legacy `ipRouteTable` is walked today.
+- [x] `inetCidrRouteTable` (OID `1.3.6.1.2.1.4.24.7.1`, RFC 4292) — the version-neutral routing table, walked independently of the legacy `ipRouteTable` so an agent implementing either one loses nothing. The composite index is decoded in full (destination type and address, prefix length, policy OID, next-hop type and address) with RFC 4001 lengths enforced exactly. Note the OID: `1.3.6.1.2.1.4.24.4.1` is `ipCidrRouteEntry`, the IPv4-only table RFC 4292 deprecated, and is deliberately not walked.
 - [x] Remote ARP Cache (`ipNetToMediaTable`) harvesting for silent / firewalled stealth devices.
 
 ---

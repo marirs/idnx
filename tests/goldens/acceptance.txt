@@ -1,4 +1,4 @@
-idNX 0.3.1 - topology from test0 (wired)
+idNX 0.3.2 - topology from test0 (wired)
 Generated: 2020-01-01T00:00:00+00:00
 
 Not visible from this vantage: switched unicast between other hosts (without a mirror port)

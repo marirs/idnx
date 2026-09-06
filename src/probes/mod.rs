@@ -7,6 +7,7 @@ pub mod dhcp_inform;
 pub mod dns;
 pub mod http;
 pub mod icmp_mask;
+pub mod inet_route;
 pub mod isis;
 pub mod lldp;
 pub mod management;
