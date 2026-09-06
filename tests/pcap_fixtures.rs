@@ -22,6 +22,7 @@ use idnx::probes::passive::decode_frame;
 use idnx::providers::passive::convert_unscoped;
 use idnx::topology::TopologyGraph;
 use idnx::topology::evidence::Fact;
+use idnx::topology::graph::DeviceCategory;
 
 const VANTAGE: &str = "test0";
 
@@ -381,6 +382,78 @@ fn a_relayed_ack_leaves_the_tag_unassociated() {
     assert!(
         networks(&graph).contains(&"203.0.113.0/24".to_string()),
         "and option 1 still names the client's network: {:?}",
+        networks(&graph)
+    );
+}
+
+#[test]
+fn per_vlan_bpdus_name_one_bridge_and_the_vlans_they_carry() {
+    // A Cisco trunk's spanning tree, which the IEEE-only decoder could not see: two BPDUs
+    // for two VLANs from one switch, under SNAP to Cisco's per-VLAN address.
+    let (graph, _) = absorb("pvst_bpdu.pcap");
+
+    // One *sender*, however many VLANs it runs an instance for. The graph also carries the
+    // root bridge as a node keyed by its bridge identifier, which here is the same physical
+    // switch reached by a different name -- pre-existing behaviour of BridgeLink, unchanged
+    // by per-VLAN decoding and equally true of an ordinary IEEE BPDU.
+    let senders: Vec<_> = graph
+        .devices_in(DeviceCategory::Switch)
+        .into_iter()
+        .filter(|node| {
+            node.role_signals
+                .iter()
+                .any(|s| s.contains("spanning-tree"))
+        })
+        .collect();
+    assert_eq!(
+        senders.len(),
+        1,
+        "two per-VLAN BPDUs from one switch are one sender: {senders:?}"
+    );
+
+    let mut vlans: Vec<u16> = graph.vlans_without_prefix().map(|vlan| vlan.id).collect();
+    vlans.sort();
+    assert_eq!(vlans, vec![20, 30], "each frame names its own VLAN");
+
+    // And the hard limit: spanning tree states no prefix, whatever else it carries.
+    assert!(
+        networks(&graph).is_empty(),
+        "a BPDU never creates a network: {:?}",
+        networks(&graph)
+    );
+    assert!(
+        graph.vlan_networks().is_empty(),
+        "and never binds a VLAN to one: {:?}",
+        graph.vlan_networks()
+    );
+}
+
+#[test]
+fn an_mndp_broadcast_names_a_device_and_no_network() {
+    // The last decoder without a byte-level fixture. A MikroTik neighbour announcement
+    // carries an identity, a board and an address; it states nothing about any prefix, and
+    // the address it carries must not be widened into one.
+    let (graph, _) = absorb("mndp_neighbor.pcap");
+
+    let router = graph
+        .nodes()
+        .find(|node| format!("{:?}", node.id).contains("02:00:5e:00:00:01"))
+        .expect("the announcing device is on the graph");
+    assert!(
+        router.hostnames.iter().any(|name| name == "fixture-router"),
+        "its advertised identity is recorded: {:?}",
+        router.hostnames
+    );
+    assert!(
+        router
+            .addresses
+            .contains(&"192.0.2.1".parse().expect("a literal address")),
+        "and the address the packet carried: {:?}",
+        router.addresses
+    );
+    assert!(
+        networks(&graph).is_empty(),
+        "an announcement is not a prefix: {:?}",
         networks(&graph)
     );
 }

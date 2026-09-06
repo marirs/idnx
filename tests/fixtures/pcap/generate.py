@@ -365,6 +365,31 @@ write("stp_bpdu.pcap", [bpdu(0x00)])
 write("rstp_bpdu.pcap", [bpdu(0x02)])
 
 
+# --- PVST+ ---------------------------------------------------------------------------------
+# Cisco sends one BPDU per VLAN to 01:00:0c:cc:cc:cd under SNAP, carrying the originating
+# VLAN in a trailing TLV. Only VLAN 1's BPDU uses the IEEE address and the LLC form above, so
+# a decoder that handles only that one sees a single bridge on a trunk carrying many.
+def pvst(vlan_id: int, bpdu_type: int = 0x02) -> bytes:
+    body = struct.pack("!HBB", 0x0000, 0x02, bpdu_type)
+    body += bytes([0x00])  # flags
+    body += struct.pack("!H", 32768) + SWITCH_MAC  # root id
+    body += struct.pack("!I", 4)  # root path cost
+    body += struct.pack("!H", 32768) + SWITCH_MAC  # bridge id
+    body += struct.pack("!H", 0x8002)  # port id
+    body += struct.pack("!HHHH", 0, 20 * 256, 2 * 256, 15 * 256)
+    body += b"\x00\x00"  # padding before the TLV, as senders emit
+    body += struct.pack("!HHH", 0x0000, 0x0002, vlan_id)  # originating VLAN TLV
+
+    llc = bytes([0xAA, 0xAA, 0x03]) + bytes.fromhex("00000c") + struct.pack("!H", 0x010B) + body
+    frame = bytes.fromhex("01000ccccccd") + SWITCH_MAC
+    frame += struct.pack("!H", len(llc)) + llc
+    return frame + b"\x00" * max(0, 60 - len(frame))
+
+
+# Two VLANs from one switch: the bridge is one device, and each frame names its own VLAN.
+write("pvst_bpdu.pcap", [pvst(20), pvst(30)])
+
+
 # --- Tagged DHCP -------------------------------------------------------------------------
 # A VLAN tag and a prefix disclosure in one frame: the tag is evidence of the VLAN, the
 # option is evidence of the network, and neither implies the other.
@@ -407,6 +432,39 @@ write(
 write(
     "vlan_tagged_dhcp_relayed.pcap",
     [vlan(HOST_MAC, ROUTER_MAC, 31, 0x0800, dhcp_ack_to_client("203.0.113.50", "203.0.113.1", client_options))],
+)
+
+
+# --- MNDP ----------------------------------------------------------------------------------
+# MikroTik neighbour discovery: a UDP 5678 broadcast carrying the sender's identity and
+# board. It names a device and, where the packet carries one, an address. It never names a
+# network -- an MNDP packet states nothing about any prefix.
+def mndp(identity, board, version, address):
+    def tlv(kind: int, value: bytes) -> bytes:
+        return struct.pack("!HH", kind, len(value)) + value
+
+    body = b"\x00\x00\x00\x00"  # sequence / reserved header
+    body += tlv(0x0001, ROUTER_MAC)
+    body += tlv(0x0005, identity)
+    body += tlv(0x0007, version)
+    body += tlv(0x0008, b"MikroTik")
+    body += tlv(0x000C, board)
+    body += tlv(0x0010, b"ether1")
+    if address is not None:
+        body += tlv(0x0011, bytes(int(o) for o in address.split(".")))
+    return udp4("192.0.2.1", "255.255.255.255", 5678, 5678, body)
+
+
+write(
+    "mndp_neighbor.pcap",
+    [
+        ethernet(
+            bytes.fromhex("ffffffffffff"),
+            ROUTER_MAC,
+            0x0800,
+            mndp(b"fixture-router", b"RB5009", b"7.14.2", "192.0.2.1"),
+        )
+    ],
 )
 
 

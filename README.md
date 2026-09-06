@@ -4,8 +4,20 @@
 [![CI](https://github.com/marirs/idnx/actions/workflows/ci.yml/badge.svg)](https://github.com/marirs/idnx/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-windows%20|%20macos%20|%20linux-blue?logo=gnubash&logoColor=white)
 
-**idNX** maps the network topology observable from a chosen vantage point, tells you how it
-knows each thing, and states plainly what it could not see.
+**idNX** maps the complete topology evidenced from the selected vantage, boundedly pursues
+every discovered boundary, and explicitly identifies what remains unresolved.
+
+That is the whole promise, and each clause is a limit as much as a claim. *Evidenced* means
+nothing appears without a source that stated it. *Boundedly* means every boundary is
+pursued with a small, ordered set of probes rather than a sweep. And *unresolved* is a
+reported outcome, not a gap: where a device forwards and nothing discloses what is behind
+it, that is what the run says.
+
+One limitation is not removable by better engineering. If a prefix sits behind a device that
+exposes no route, no control-plane advertisement, no management table and no reachable
+interface, no black-box program running from one endpoint can establish it. idNX reports the
+forwarding boundary and says the prefixes behind it are unresolved. It does not guess, and
+it does not quietly omit the device.
 
 It is not a port scanner. Port sweeping happens last, to enrich and validate devices
 discovery has already found; it never finds them.
@@ -107,6 +119,24 @@ from `available_parallelism()`.
 
 `sudo` adds sources; it never changes scope. Running unprivileged is fully supported and
 reports which sources were unavailable.
+
+### ICMP on Linux
+
+Echo probes use an unprivileged ICMP datagram socket, bound to the selected interface and
+its source address. On macOS any user may open one. On Linux the kernel permits it only for
+groups inside `net.ipv4.ping_group_range`, which several distributions leave empty:
+
+```bash
+sysctl net.ipv4.ping_group_range              # "1 0" means no group may open one
+sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+# or, per-binary, instead of the sysctl:
+sudo setcap cap_net_raw+ep /usr/local/bin/idnx
+```
+
+Without one of those, every echo is reported as **not sent**, and the networks it would have
+covered are reported as `not_enumerated`. That is the honest outcome and not a silent one:
+a probe that never left this machine is never rendered as a network that stayed quiet.
+Coverage from TCP, ARP and every other source is unaffected.
 
 ---
 

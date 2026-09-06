@@ -131,10 +131,10 @@ This document outlines the milestones and release goals for the **idNX** project
 - [ ] VLAN and trunk relationships.
 - [ ] SNMPv3 (authentication and privacy).
 - [ ] Snapshot save/diff (`idnx snapshot save`, `idnx snapshot diff`) — new device, new subnet, changed switch port, disappeared host, newly exposed service.
-- [ ] An MNDP PCAP fixture. LLDP, CDP, STP/RSTP, ARP/NDP, DHCP, RA, RIP, OSPFv2/v3 and IS-IS
-  fixtures exist (`tests/fixtures/pcap/`), and SNMP is covered by a scripted agent on
-  loopback rather than by recorded responses; MikroTik MNDP is the remaining decoder with no
-  byte-level fixture.
+- [x] Byte-level fixtures for every passive decoder, MNDP included. SNMP is covered by a
+  scripted agent on loopback rather than by recorded responses.
+- [x] Cisco PVST+ / Rapid PVST+ decoding, so a trunk's per-VLAN spanning tree is visible
+  rather than only VLAN 1's IEEE BPDU.
 
 ---
 

@@ -94,6 +94,23 @@ Decoded passively where they ride the link, and never answered.
 
 ## 2. Layer 2 Discovery Reference
 
+### 2.0a Spanning tree
+
+| Form | Destination | Encapsulation | Status |
+|---|---|---|---|
+| IEEE STP / RSTP | `01:80:c2:00:00:00` | 802.2 LLC, SAP `0x42` | ✅ |
+| Cisco PVST+ / Rapid PVST+ | `01:00:0c:cc:cc:cd` | SNAP, OUI `00:00:0c`, PID `0x010b` | ✅ |
+
+A Cisco switch sends one BPDU per VLAN to the second address; only VLAN 1 uses the first.
+All four conditions are required before a PVST+ frame is read -- the destination, the OUI,
+the protocol id and a structurally valid BPDU -- because three other Cisco protocols share
+that OUI and CDP's address differs by one bit.
+
+A per-VLAN BPDU may establish two things: that the sender bridges, and, where the trailing
+originating-VLAN TLV (type `0x0000`, length `0x0002`) carries one, that the VLAN exists in
+this switched domain. It never creates a network and never binds a VLAN to a prefix; a
+spanning tree describes a topology, not an address space.
+
 ### 2.1 LLDP (IEEE 802.1AB)
 - **Destination MAC**: `01:80:c2:00:00:0e`
 - **EtherType**: `0x88CC`

@@ -143,5 +143,10 @@ response", which is only true when something was actually sent.
    * **Privileged Mode (`sudo idnx`)**: Adds raw Berkeley Packet Filter (macOS) and
      `AF_PACKET` (Linux) capture, and raw ARP/NDP transmission. Privileges only ever add
      sources; the workflow and its scope are identical.
+   * **ICMP on Linux**: the echo path uses an unprivileged ICMP datagram socket, which the
+     kernel gates on `net.ipv4.ping_group_range`. Where that excludes the running user and
+     the binary holds no `CAP_NET_RAW`, the socket does not open, every echo is recorded as
+     `NotSent`, and the affected networks are `not_enumerated` rather than
+     `probed_unreachable`. A local restriction must never be rendered as remote silence.
 2. **Resource Throttling**:
    * All network operations use `tokio::sync::Semaphore` to cap in-flight sockets and prevent file descriptor exhaustion or switch buffer overruns.

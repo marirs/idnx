@@ -27,6 +27,17 @@ const ETHERTYPE_QINQ_LEGACY: u16 = 0x9100;
 const LLC_SAP_STP: u8 = 0x42;
 const STP_MULTICAST_MAC: [u8; 6] = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x00];
 const CDP_MULTICAST_MAC: [u8; 6] = [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC];
+/// Cisco per-VLAN spanning tree (PVST+ / Rapid PVST+).
+///
+/// One address away from CDP's, and nothing like the IEEE group address: a switch running
+/// PVST+ sends its per-VLAN BPDUs here under SNAP, and only VLAN 1's BPDU goes to the IEEE
+/// address in the ordinary LLC form. A decoder that accepts only the IEEE form sees one
+/// bridge on a trunk carrying dozens.
+const PVST_MULTICAST_MAC: [u8; 6] = [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCD];
+/// SNAP OUI and protocol id for PVST+. Both are required: the OUI alone is Cisco's and
+/// carries CDP, VTP, DTP and UDLD as well.
+const CISCO_SNAP_OUI: [u8; 3] = [0x00, 0x00, 0x0C];
+const PVST_SNAP_PID: u16 = 0x010B;
 
 /// Largest 802.3 length value; anything above is an EtherType.
 const MAX_802_3_LENGTH: u16 = 1500;
@@ -362,7 +373,83 @@ fn decode_llc(
         && let Some(n) = crate::probes::lldp::parse_lldp_frame(frame)
     {
         facts.push(FrameFact::LinkLayerNeighbor(n));
+        return;
     }
+
+    // PVST+ / Rapid PVST+: the same BPDU body, carried under SNAP to Cisco's per-VLAN
+    // address. All four of the destination, the SNAP OUI, the protocol id and the BPDU
+    // structure must hold -- three of Cisco's other protocols share this OUI, and one of
+    // them shares an address one bit away.
+    if dsap == 0xAA && ssap == 0xAA && destination == PVST_MULTICAST_MAC {
+        decode_pvst(source_mac, payload, facts);
+    }
+}
+
+/// Decodes a Cisco per-VLAN BPDU, and the VLAN it names where it names one.
+///
+/// What this may establish and what it may not: a valid BPDU is bridge behaviour, and the
+/// PVID TLV is the sender stating which VLAN this instance is for -- a VLAN identifier
+/// observed on the link. Neither is a prefix. Nothing here creates a network, and the tag it
+/// yields binds to no prefix: that binding requires one frame stating both, which a BPDU
+/// never does.
+fn decode_pvst(source_mac: &str, payload: &[u8], facts: &mut Vec<FrameFact>) {
+    // AA AA 03 | OUI (3) | PID (2) = 8 bytes before the BPDU.
+    const SNAP_HEADER: usize = 8;
+    if payload.len() < SNAP_HEADER {
+        return;
+    }
+    if payload[3..6] != CISCO_SNAP_OUI {
+        return;
+    }
+    let Some(pid) = read_u16(payload, 6) else {
+        return;
+    };
+    if pid != PVST_SNAP_PID {
+        return;
+    }
+
+    let body = &payload[SNAP_HEADER..];
+    let Some(bridge) = decode_bpdu(source_mac, body) else {
+        return;
+    };
+    facts.push(bridge);
+
+    if let Some(vlan) = pvst_originating_vlan(body) {
+        facts.push(FrameFact::Vlan { id: vlan });
+    }
+}
+
+/// The originating-VLAN TLV that follows the BPDU in a PVST+ frame.
+///
+/// Type `0x0000`, length `0x0002`, then the VLAN id. Senders pad between the BPDU and the
+/// TLV, so a fixed offset does not work; the search is instead bounded to a few two-byte
+/// words and skips only zero padding, because scanning further into a frame for a
+/// two-zero-byte pattern would find one in almost any trailing data.
+fn pvst_originating_vlan(body: &[u8]) -> Option<u16> {
+    /// The BPDU proper, before any padding or TLV.
+    const BPDU_LEN: usize = 35;
+    /// Padding words tolerated before the TLV must appear.
+    const MAX_PADDING_WORDS: usize = 8;
+
+    let mut at = BPDU_LEN;
+    for _ in 0..=MAX_PADDING_WORDS {
+        let tlv_type = read_u16(body, at)?;
+        if tlv_type != 0x0000 {
+            return None;
+        }
+        let length = read_u16(body, at + 2)?;
+        match length {
+            // A zero-length field here is padding, not a TLV: step over it and keep looking.
+            0x0000 => at += 2,
+            0x0002 => {
+                let vlan = read_u16(body, at + 4)?;
+                // 0 and 4095 are reserved, exactly as in an 802.1Q tag.
+                return (vlan != 0 && vlan != 0x0FFF).then_some(vlan);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Decodes a Configuration BPDU (STP or RSTP).
@@ -1154,6 +1241,151 @@ mod tests {
         body.extend_from_slice(&[0u8; 10]);
 
         assert!(decode_bpdu("00:11:22:33:44:55", &body).is_some());
+    }
+
+    /// A PVST+ frame: SNAP to Cisco's per-VLAN address, the ordinary BPDU body, and the
+    /// originating-VLAN TLV after two words of padding.
+    fn pvst_frame(destination: [u8; 6], oui: [u8; 3], pid: u16, vlan: Option<u16>) -> Vec<u8> {
+        let mut body = vec![0x00, 0x00, 0x02, 0x02, 0x00];
+        body.extend_from_slice(&[0x80, 0x00]);
+        body.extend_from_slice(&[0x02, 0x00, 0x5e, 0x00, 0x00, 0x01]); // root id
+        body.extend_from_slice(&4u32.to_be_bytes()); // root path cost
+        body.extend_from_slice(&[0x80, 0x00]);
+        body.extend_from_slice(&[0x02, 0x00, 0x5e, 0x00, 0x00, 0x01]); // bridge id
+        body.extend_from_slice(&0x8001u16.to_be_bytes()); // port id
+        // message age, max age, hello time, forward delay -- each 1/256 second.
+        body.extend_from_slice(&[0x00, 0x00, 0x14, 0x00, 0x02, 0x00, 0x0F, 0x00]);
+        assert!(
+            body.len() >= 35,
+            "the BPDU body is complete: {}",
+            body.len()
+        );
+
+        if let Some(vlan) = vlan {
+            body.extend_from_slice(&[0x00, 0x00]); // padding word
+            body.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // TLV type and length
+            body.extend_from_slice(&vlan.to_be_bytes());
+        }
+
+        let mut llc = vec![0xAA, 0xAA, 0x03];
+        llc.extend_from_slice(&oui);
+        llc.extend_from_slice(&pid.to_be_bytes());
+        llc.extend_from_slice(&body);
+
+        let mut frame = destination.to_vec();
+        frame.extend_from_slice(&[0x02, 0x00, 0x5e, 0x00, 0x00, 0x01]);
+        frame.extend_from_slice(&(llc.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&llc);
+        frame
+    }
+
+    const PVST_DEST: [u8; 6] = [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCD];
+
+    #[test]
+    fn a_pvst_bpdu_establishes_a_bridge_and_the_vlan_it_names() {
+        // A Cisco trunk carries one BPDU per VLAN to this address under SNAP; only VLAN 1
+        // goes to the IEEE group address in the LLC form. Decoding the IEEE form alone saw
+        // one bridge on a link carrying dozens.
+        let facts = decode_frame(&pvst_frame(PVST_DEST, [0x00, 0x00, 0x0C], 0x010B, Some(20)));
+
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact, FrameFact::Bridge { .. })),
+            "a valid per-VLAN BPDU is bridge behaviour: {facts:?}"
+        );
+        assert!(
+            facts.contains(&FrameFact::Vlan { id: 20 }),
+            "and the originating-VLAN TLV names the VLAN: {facts:?}"
+        );
+        // What it must never do.
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| matches!(fact, FrameFact::Dhcp { .. } | FrameFact::VlanNetwork { .. })),
+            "a BPDU states no prefix and binds no VLAN to one: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn a_pvst_bpdu_without_the_tlv_is_still_a_bridge_and_names_no_vlan() {
+        let facts = decode_frame(&pvst_frame(PVST_DEST, [0x00, 0x00, 0x0C], 0x010B, None));
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact, FrameFact::Bridge { .. }))
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| matches!(fact, FrameFact::Vlan { .. })),
+            "no VLAN is invented when none was carried: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn pvst_requires_the_destination_the_oui_the_pid_and_a_valid_bpdu() {
+        // Each condition on its own. Cisco's OUI also carries CDP, VTP, DTP and UDLD, and
+        // the CDP address is one bit away from this one -- so accepting any subset of these
+        // would read an unrelated protocol's payload as a spanning-tree frame.
+        let cdp_address = [0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC];
+        for (frame, why) in [
+            (
+                pvst_frame(cdp_address, [0x00, 0x00, 0x0C], 0x010B, Some(20)),
+                "the CDP address is not the PVST+ address",
+            ),
+            (
+                pvst_frame(PVST_DEST, [0x00, 0x00, 0x0D], 0x010B, Some(20)),
+                "another vendor's OUI",
+            ),
+            (
+                pvst_frame(PVST_DEST, [0x00, 0x00, 0x0C], 0x2000, Some(20)),
+                "Cisco's OUI with CDP's protocol id",
+            ),
+        ] {
+            let facts = decode_frame(&frame);
+            assert!(
+                !facts
+                    .iter()
+                    .any(|fact| matches!(fact, FrameFact::Bridge { .. })),
+                "{why}: {facts:?}"
+            );
+        }
+
+        // Truncated after the SNAP header, and truncated mid-BPDU.
+        let complete = pvst_frame(PVST_DEST, [0x00, 0x00, 0x0C], 0x010B, Some(20));
+        for cut in [22, 30, 40] {
+            let facts = decode_frame(&complete[..cut]);
+            assert!(
+                !facts
+                    .iter()
+                    .any(|fact| matches!(fact, FrameFact::Bridge { .. })),
+                "a frame cut at {cut} bytes decodes no bridge: {facts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pvst_frame_with_a_malformed_tlv_yields_the_bridge_and_no_vlan() {
+        // The TLV is the sender's statement, and a statement that does not parse is not one.
+        // The BPDU before it is unaffected: two separate claims, judged separately.
+        let mut frame = pvst_frame(PVST_DEST, [0x00, 0x00, 0x0C], 0x010B, Some(20));
+        let length = frame.len();
+        frame[length - 4] = 0x00;
+        frame[length - 3] = 0x09; // a length no PVID TLV has
+
+        let facts = decode_frame(&frame);
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact, FrameFact::Bridge { .. }))
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| matches!(fact, FrameFact::Vlan { .. })),
+            "{facts:?}"
+        );
     }
 
     #[test]
