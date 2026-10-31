@@ -18,10 +18,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: true
           - target: x86_64-apple-darwin
             os: macos-15
@@ -38,8 +38,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -80,25 +79,22 @@ jobs:
         shell: pwsh
 
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: idnx-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
-
   publish-release:
     name: Publish GitHub Release
     needs: build-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v7
       - name: Download all built artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: all-dist
-
       - name: Flatten release artifacts
         run: |
           mkdir -p release-assets
@@ -106,7 +102,7 @@ jobs:
           ls -lh release-assets
 
       - name: Create / Update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release-assets/*
           draft: false
